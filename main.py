@@ -3,16 +3,20 @@ import json
 import logging
 import re
 import signal
+import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 import config
 from agent import handle_message
+from approval import ApprovalManager
 from commands import handle_command
 from database import Database
 from heartbeat import run_heartbeat, should_heartbeat
+from maintenance import run_maintenance, should_run_maintenance
 from whatsapp import WhatsAppClient
 
 # ---------------------------------------------------------------------------
@@ -29,6 +33,83 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("molly")
+
+
+# ---------------------------------------------------------------------------
+# Service startup checks
+# ---------------------------------------------------------------------------
+def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+def ensure_docker():
+    """Verify the Docker daemon is reachable."""
+    result = _run(["docker", "info"])
+    if result.returncode != 0:
+        log.error("Docker daemon is not running. Start Docker Desktop and retry.")
+        sys.exit(1)
+    log.info("Docker daemon: running")
+
+
+def ensure_neo4j():
+    """Ensure the Neo4j container is running, starting or creating it as needed."""
+    # Check if container exists
+    result = _run(["docker", "inspect", "--format", "{{.State.Status}}", "neo4j"])
+
+    if result.returncode != 0:
+        # Container doesn't exist — create and start it
+        log.info("Neo4j container not found. Creating...")
+        result = _run([
+            "docker", "run", "-d", "--name", "neo4j",
+            "-p", "7474:7474", "-p", "7687:7687",
+            "-e", f"NEO4J_AUTH={config.NEO4J_USER}/{config.NEO4J_PASSWORD}",
+            "-v", f"{Path.home() / '.molly' / 'neo4j'}:/data",
+            "--restart", "unless-stopped",
+            "neo4j:latest",
+        ])
+        if result.returncode != 0:
+            log.error("Failed to create Neo4j container: %s", result.stderr.strip())
+            sys.exit(1)
+        log.info("Neo4j container created and started")
+    else:
+        status = result.stdout.strip()
+        if status == "running":
+            log.info("Neo4j container: already running")
+        else:
+            log.info("Neo4j container status: %s — starting...", status)
+            result = _run(["docker", "start", "neo4j"])
+            if result.returncode != 0:
+                log.error("Failed to start Neo4j: %s", result.stderr.strip())
+                sys.exit(1)
+            log.info("Neo4j container started")
+
+    # Wait for Neo4j to accept bolt connections
+    _wait_for_neo4j()
+
+
+def _wait_for_neo4j(timeout: int = 30):
+    """Block until Neo4j responds on bolt://localhost:7687."""
+    import socket
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("localhost", 7687), timeout=2):
+                log.info("Neo4j bolt port: ready")
+                return
+        except OSError:
+            time.sleep(1)
+
+    log.error("Neo4j did not become ready within %ds", timeout)
+    sys.exit(1)
+
+
+def preflight_checks():
+    """Run all service checks before Molly starts."""
+    log.info("Running preflight checks...")
+    ensure_docker()
+    ensure_neo4j()
+    log.info("Preflight checks passed")
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +144,9 @@ class Molly:
         self.running = True
         self.start_time: datetime | None = None
         self.last_heartbeat: datetime | None = None
+        self.last_maintenance: datetime | None = None
         self._sent_ids: set[str] = set()  # message IDs Molly sent (avoid echo loop)
+        self.approvals = ApprovalManager()
 
     # --- State persistence ---
 
@@ -143,6 +226,11 @@ class Molly:
         if not self._is_owner(msg_data["sender_jid"]):
             return
 
+        # Check if this is a yes/no reply to a pending approval.
+        # This runs before trigger checks so a bare "yes" is accepted.
+        if self.approvals.try_resolve(content.strip(), chat_jid):
+            return
+
         # Self-chat: no @Molly needed. All other chats: require it.
         is_self_chat = chat_jid.split("@")[0] in config.OWNER_IDS
         has_trigger = config.TRIGGER_PATTERN.search(content)
@@ -182,8 +270,27 @@ class Molly:
                 self.sessions[chat_jid] = new_session_id
                 self.save_sessions()
 
-            if response:
+            if not response:
+                return
+
+            # Check if the response contains an approval request
+            tag = self.approvals.find_approval_tag(response)
+            if tag:
+                category, description = tag
+                visible = self.approvals.strip_approval_tag(response)
+
+                # Send the visible part of the response (Molly's explanation)
+                if visible:
+                    self._track_send(self.wa.send_message(chat_jid, visible))
+
+                # Run the approval flow as a background task so the main
+                # loop keeps processing messages (including the yes/no reply)
+                asyncio.create_task(
+                    self._approval_flow(category, description, chat_jid, new_session_id)
+                )
+            else:
                 self._track_send(self.wa.send_message(chat_jid, response))
+
         except Exception:
             log.error("Error processing message in %s", chat_jid, exc_info=True)
             self._track_send(
@@ -193,6 +300,41 @@ class Molly:
             )
         finally:
             self.wa.send_typing_stopped(chat_jid)
+
+    # --- Approval flow ---
+
+    async def _approval_flow(
+        self, category: str, description: str, chat_jid: str, session_id: str | None,
+    ):
+        """Background task: wait for approval, then resume the agent session."""
+        approved = await self.approvals.request(
+            category, description, chat_jid, session_id, self,
+        )
+
+        if approved:
+            self.wa.send_typing(chat_jid)
+            try:
+                response, new_session_id = await handle_message(
+                    f"Approved. Proceed with: {description}",
+                    chat_jid,
+                    session_id,
+                )
+                if new_session_id:
+                    self.sessions[chat_jid] = new_session_id
+                    self.save_sessions()
+                if response:
+                    self._track_send(self.wa.send_message(chat_jid, response))
+            except Exception:
+                log.error("Post-approval execution failed in %s", chat_jid, exc_info=True)
+                self._track_send(
+                    self.wa.send_message(chat_jid, "Something went wrong executing that action.")
+                )
+            finally:
+                self.wa.send_typing_stopped(chat_jid)
+        else:
+            self._track_send(
+                self.wa.send_message(chat_jid, "Got it, I won't do that.")
+            )
 
     # --- Main loop ---
 
@@ -226,11 +368,14 @@ class Molly:
                 )
                 await self.process_message(msg_data)
             except asyncio.TimeoutError:
-                # No message in queue — check if heartbeat is due
+                # No message in queue — check scheduled tasks
                 if self.wa and self.wa.connected:
                     if should_heartbeat(self.last_heartbeat):
                         self.last_heartbeat = datetime.now()
                         await run_heartbeat(self)
+                    if should_run_maintenance(self.last_maintenance):
+                        self.last_maintenance = datetime.now()
+                        await run_maintenance()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -238,6 +383,11 @@ class Molly:
 
         # Cleanup
         self.db.close()
+        try:
+            from memory.graph import close as close_graph
+            close_graph()
+        except Exception:
+            pass
         log.info("Molly shut down.")
 
     def shutdown(self, *_args):
@@ -249,6 +399,8 @@ class Molly:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    preflight_checks()
+
     molly = Molly()
 
     # Handle graceful shutdown

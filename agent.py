@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import date, timedelta
 
@@ -10,6 +11,8 @@ from claude_agent_sdk import (
 )
 
 import config
+from memory.processor import process_conversation
+from memory.retriever import retrieve_context
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +42,10 @@ async def handle_message(
     """Send a message through Claude and return (response_text, new_session_id)."""
     system_prompt = load_identity_stack()
 
-    # Phase 2 adds: memory retrieval injected here
+    # Layer 2: semantic memory retrieval
+    memory_context = retrieve_context(user_message)
+    if memory_context:
+        system_prompt += "\n\n---\n\n" + memory_context
 
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -69,7 +75,11 @@ async def handle_message(
         if not response_text:
             response_text = "Something went wrong on my end. Try again in a moment."
 
-    # Phase 2 adds: async post-processing here
+    # Async post-processing: embed + store conversation turn
+    if response_text and not response_text.startswith("Something went wrong"):
+        asyncio.create_task(
+            process_conversation(user_message, response_text, chat_id)
+        )
 
     log.info(
         "Response for %s: %d chars, session=%s",
