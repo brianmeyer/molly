@@ -17,6 +17,8 @@ VALID_REL_TYPES = {
     "WORKS_ON", "WORKS_AT", "KNOWS", "USES", "LOCATED_IN",
     "DISCUSSED_WITH", "INTERESTED_IN", "CREATED", "MANAGES",
     "DEPENDS_ON", "RELATED_TO",
+    "CLASSMATE_OF", "STUDIED_AT", "ALUMNI_OF",
+    "MENTORS", "MENTORED_BY", "REPORTS_TO", "COLLABORATES_WITH",
 }
 
 
@@ -403,3 +405,24 @@ def relationship_count() -> int:
     with driver.session() as session:
         result = session.run("MATCH ()-[r]->() RETURN count(r) AS c")
         return result.single()["c"]
+
+
+def get_top_entities(limit: int = 20) -> list[dict[str, Any]]:
+    """Return top entities ordered by strength (mentions * recency).
+
+    Used by triage to build context about what Brian tracks.
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (e:Entity)
+            WHERE e.strength IS NOT NULL
+            RETURN e.name AS name, e.entity_type AS type,
+                   e.strength AS strength, e.mention_count AS mentions
+            ORDER BY e.strength DESC
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        return [dict(record) for record in result]

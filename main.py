@@ -104,11 +104,106 @@ def _wait_for_neo4j(timeout: int = 30):
     sys.exit(1)
 
 
+def ensure_ollama():
+    """Ensure Ollama is running and the triage model is available.
+
+    Non-blocking on failure — triage is optional, Molly works without it.
+    """
+    import urllib.request
+    import urllib.error
+
+    def _ollama_api_up() -> bool:
+        try:
+            req = urllib.request.Request(f"{config.OLLAMA_BASE_URL}/api/tags")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except (urllib.error.URLError, OSError):
+            return False
+
+    def _model_available() -> bool:
+        try:
+            req = urllib.request.Request(f"{config.OLLAMA_BASE_URL}/api/tags")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                import json as _json
+                data = _json.loads(resp.read())
+                model_names = [m.get("name", "") for m in data.get("models", [])]
+                # Match both "qwen3:4b" and "qwen3:4b-<hash>" variants
+                target = config.TRIAGE_MODEL.split(":")[0]
+                return any(target in name for name in model_names)
+        except Exception:
+            return False
+
+    # Check if Ollama binary exists
+    result = _run(["which", "ollama"])
+    if result.returncode != 0:
+        log.warning("Ollama not found. Installing via Homebrew...")
+        result = _run(["brew", "install", "ollama"])
+        if result.returncode != 0:
+            log.warning("Ollama install failed — triage will be unavailable")
+            return
+
+    # Check if Ollama API is up
+    if not _ollama_api_up():
+        log.info("Ollama not running — starting...")
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait up to 15 seconds
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if _ollama_api_up():
+                break
+            time.sleep(1)
+        else:
+            log.warning("Ollama failed to start within 15s — triage will be unavailable")
+            return
+
+    log.info("Ollama: running")
+
+    # Check if triage model is pulled
+    if not _model_available():
+        log.info("Pulling triage model %s (this may take a few minutes)...", config.TRIAGE_MODEL)
+        result = _run(["ollama", "pull", config.TRIAGE_MODEL], timeout=600)
+        if result.returncode != 0:
+            log.warning("Failed to pull %s — triage will be unavailable", config.TRIAGE_MODEL)
+            return
+        log.info("Triage model %s pulled successfully", config.TRIAGE_MODEL)
+    else:
+        log.info("Triage model %s: available", config.TRIAGE_MODEL)
+
+
+def ensure_google_auth():
+    """Ensure Google OAuth token exists, triggering browser flow if needed.
+
+    Runs synchronously at startup (before the async loop) so the browser
+    OAuth consent screen opens immediately on first run.
+    """
+    if not config.GOOGLE_CLIENT_SECRET.exists():
+        log.warning(
+            "Google client_secret.json not found at %s — "
+            "Calendar and Gmail tools will be unavailable. "
+            "See ~/.molly/docs/PHASE-3B.md for setup instructions.",
+            config.GOOGLE_CLIENT_SECRET,
+        )
+        return
+
+    try:
+        from tools.google_auth import get_credentials
+        creds = get_credentials()
+        log.info("Google OAuth: authenticated (%s)", "valid" if creds.valid else "refreshed")
+    except Exception:
+        log.error("Google OAuth failed — Calendar and Gmail tools will be unavailable", exc_info=True)
+
+
 def preflight_checks():
     """Run all service checks before Molly starts."""
     log.info("Running preflight checks...")
     ensure_docker()
     ensure_neo4j()
+    ensure_ollama()
+    ensure_google_auth()
     log.info("Preflight checks passed")
 
 
@@ -154,6 +249,17 @@ class Molly:
         self.sessions = load_json(config.SESSIONS_FILE, {})
         self.registered_chats = load_json(config.REGISTERED_CHATS_FILE, {})
         self.state = load_json(config.STATE_FILE, {})
+
+        # Migrate: add "mode" field to existing registered chat entries
+        migrated = False
+        for jid, info in self.registered_chats.items():
+            if "mode" not in info:
+                info["mode"] = "respond"
+                migrated = True
+        if migrated:
+            self.save_registered_chats()
+            log.info("Migrated registered_chats: added 'mode' field")
+
         log.info(
             "State loaded: %d sessions, %d registered chats",
             len(self.sessions),
@@ -174,15 +280,24 @@ class Molly:
         user = sender_jid.split("@")[0]
         return user in config.OWNER_IDS
 
-    def _auto_register(self, chat_jid: str, sender_name: str):
-        """Register a new chat and persist it."""
-        slug = re.sub(r"[^a-z0-9]+", "-", (sender_name or chat_jid.split("@")[0]).lower()).strip("-")
-        self.registered_chats[chat_jid] = {
-            "name": sender_name or chat_jid.split("@")[0],
-            "chat_id": slug,
-        }
-        self.save_registered_chats()
-        log.info("Auto-registered chat: %s as '%s'", chat_jid, slug)
+    def _get_chat_mode(self, chat_jid: str) -> str:
+        """Determine the processing tier for a chat.
+
+        owner_dm   — DMs where chat JID matches an OWNER_ID
+        respond    — registered group, full processing + respond to @Molly
+        listen     — monitored group, embed + selective graph, no responses
+        store_only — everything else, embed only
+        """
+        # Owner DMs (self-chat): always full processing
+        if chat_jid.split("@")[0] in config.OWNER_IDS:
+            return "owner_dm"
+
+        # Check registered chats
+        chat_info = self.registered_chats.get(chat_jid)
+        if chat_info:
+            return chat_info.get("mode", "respond")
+
+        return "store_only"
 
     # --- WhatsApp callback (runs on neonize thread) ---
 
@@ -201,19 +316,19 @@ class Molly:
     async def process_message(self, msg_data: dict):
         chat_jid = msg_data["chat_jid"]
         content = msg_data["content"]
-        is_from_me = msg_data["is_from_me"]
-        is_group = msg_data["is_group"]
-        sender_name = msg_data["sender_name"]
+        sender_jid = msg_data["sender_jid"]
+        sender_name = msg_data.get("sender_name", "Unknown")
+        group_name = self.registered_chats.get(chat_jid, {}).get("name", chat_jid.split("@")[0])
 
-        # Store every message in the database
+        # Store ALL messages in SQLite — every group, every DM
         self.db.store_message(
             msg_id=msg_data["msg_id"],
             chat_jid=chat_jid,
-            sender=msg_data["sender_jid"],
+            sender=sender_jid,
             sender_name=sender_name,
             content=content,
             timestamp=msg_data["timestamp"],
-            is_from_me=is_from_me,
+            is_from_me=msg_data["is_from_me"],
         )
 
         # Skip messages Molly sent (avoid echo loop)
@@ -222,48 +337,69 @@ class Molly:
             self._sent_ids.discard(msg_id)
             return
 
-        # Only the owner can trigger Molly
-        if not self._is_owner(msg_data["sender_jid"]):
+        # Determine chat processing tier
+        chat_mode = self._get_chat_mode(chat_jid)
+        is_owner = self._is_owner(sender_jid)
+
+        # Non-owner messages: passive processing only, never respond
+        if not is_owner:
+            if content.strip():
+                asyncio.create_task(
+                    self._process_passive(
+                        content, chat_jid, chat_mode, sender_jid,
+                        sender_name=sender_name, group_name=group_name,
+                    )
+                )
             return
 
-        # Check if this is a yes/no reply to a pending approval.
-        # This runs before trigger checks so a bare "yes" is accepted.
+        # --- Owner messages from here ---
+
+        # Check if this is a yes/no reply to a pending approval
         if self.approvals.try_resolve(content.strip(), chat_jid):
             return
 
-        # Self-chat: no @Molly needed. All other chats: require it.
-        is_self_chat = chat_jid.split("@")[0] in config.OWNER_IDS
+        # Check for @Molly trigger
         has_trigger = config.TRIGGER_PATTERN.search(content)
+        clean_content = (
+            config.TRIGGER_PATTERN.sub("", content).strip()
+            if has_trigger else content.strip()
+        )
 
-        if not is_self_chat and not has_trigger:
+        # Commands: always available from owner with @Molly, any chat
+        if has_trigger and clean_content:
+            first_word = clean_content.split()[0]
+            if first_word in config.COMMANDS:
+                response = await handle_command(clean_content, chat_jid, self)
+                if response:
+                    self._track_send(self.wa.send_message(chat_jid, response))
+                return
+
+        # Determine if Molly should respond
+        should_respond = (
+            chat_mode == "owner_dm"  # Self-chat: always respond
+            or (chat_mode == "respond" and has_trigger)  # Registered group + @Molly
+        )
+
+        if not should_respond or not clean_content:
+            # Owner message but not triggering a response — passive processing
+            if content.strip():
+                asyncio.create_task(
+                    self._process_passive(
+                        content, chat_jid, chat_mode, sender_jid,
+                        sender_name=sender_name, group_name=group_name,
+                    )
+                )
             return
 
-        # Auto-register unknown chats when the owner @Molly's from them
-        if chat_jid not in self.registered_chats:
-            if not has_trigger:
-                return  # first contact with a new chat still requires @Molly
-            self._auto_register(chat_jid, sender_name)
-
-        # Strip the @Molly prefix if present
-        clean_content = config.TRIGGER_PATTERN.sub("", content).strip() if has_trigger else content.strip()
-        if not clean_content:
-            return
-
-        # Handle slash commands
-        first_word = clean_content.split()[0]
-        if first_word in config.COMMANDS:
-            response = await handle_command(clean_content, chat_jid, self)
-            if response:
-                self._track_send(self.wa.send_message(chat_jid, response))
-            return
-
-        # Send typing indicator
+        # --- Molly is going to respond ---
         self.wa.send_typing(chat_jid)
 
         try:
             session_id = self.sessions.get(chat_jid)
             response, new_session_id = await handle_message(
-                clean_content, chat_jid, session_id
+                clean_content, chat_jid, session_id,
+                approval_manager=self.approvals,
+                molly_instance=self,
             )
 
             if new_session_id:
@@ -273,18 +409,16 @@ class Molly:
             if not response:
                 return
 
-            # Check if the response contains an approval request
+            # Check if the response contains a prompt-level approval tag
+            # (belt-and-suspenders fallback — code-enforced can_use_tool is primary)
             tag = self.approvals.find_approval_tag(response)
             if tag:
                 category, description = tag
                 visible = self.approvals.strip_approval_tag(response)
 
-                # Send the visible part of the response (Molly's explanation)
                 if visible:
                     self._track_send(self.wa.send_message(chat_jid, visible))
 
-                # Run the approval flow as a background task so the main
-                # loop keeps processing messages (including the yes/no reply)
                 asyncio.create_task(
                     self._approval_flow(category, description, chat_jid, new_session_id)
                 )
@@ -300,6 +434,103 @@ class Molly:
             )
         finally:
             self.wa.send_typing_stopped(chat_jid)
+
+    # --- Passive processing (all messages Molly doesn't respond to) ---
+
+    async def _process_passive(
+        self, content: str, chat_jid: str, chat_mode: str, sender_jid: str,
+        sender_name: str = "Unknown", group_name: str = "Unknown",
+    ):
+        """Background processing for messages Molly doesn't respond to.
+
+        owner_dm / respond: always full processing (embed + graph)
+        listen / store_only: run through triage model first
+          - urgent: notify Brian via WhatsApp + full extraction
+          - relevant: full extraction (embed + graph)
+          - background: embed only
+          - noise: skip (already stored in SQLite)
+        """
+        from memory.processor import embed_and_store, extract_to_graph
+
+        # DMs and respond groups: always full processing, skip triage
+        if chat_mode in ("owner_dm", "respond"):
+            await embed_and_store(content, chat_jid)
+            await extract_to_graph(content, chat_jid)
+            return
+
+        # listen / store_only: triage first
+        from memory.triage import triage_message
+
+        result = await triage_message(content, sender_name, group_name)
+
+        if result is None:
+            # Triage unavailable — fall back to old behavior
+            await embed_and_store(content, chat_jid)
+            if chat_mode == "listen":
+                await self._selective_extract(content, chat_jid)
+            return
+
+        log.debug(
+            "Triage [%s] %s (%.2f): %s",
+            chat_mode, result.classification, result.score, result.reason,
+        )
+
+        if result.classification == "urgent":
+            # Notify Brian + full extraction
+            await embed_and_store(content, chat_jid)
+            await extract_to_graph(content, chat_jid)
+            # Send notification to Brian's DM
+            owner_jid = self._get_owner_dm_jid()
+            if owner_jid and self.wa:
+                preview = content[:200] + "..." if len(content) > 200 else content
+                notify_msg = (
+                    f"Flagged message in {group_name}\n"
+                    f"From: {sender_name}\n"
+                    f"{preview}\n\n"
+                    f"Reason: {result.reason}"
+                )
+                self._track_send(self.wa.send_message(owner_jid, notify_msg))
+
+        elif result.classification == "relevant":
+            await embed_and_store(content, chat_jid)
+            await extract_to_graph(content, chat_jid)
+
+        elif result.classification == "background":
+            await embed_and_store(content, chat_jid)
+
+        # noise: already stored in SQLite, skip embed and graph
+
+    def _get_owner_dm_jid(self) -> str | None:
+        """Find the owner's DM JID for sending notifications."""
+        for jid in self.registered_chats:
+            if jid.split("@")[0] in config.OWNER_IDS:
+                return jid
+        # Fallback: construct from first owner ID
+        for owner_id in config.OWNER_IDS:
+            return f"{owner_id}@s.whatsapp.net"
+        return None
+
+    async def _selective_extract(self, content: str, chat_jid: str):
+        """L3: Selective extraction for listen-only chats.
+
+        Only runs full extraction if the message mentions entities
+        already tracked in the knowledge graph.
+        """
+        try:
+            from memory.extractor import extract_entities
+            from memory.graph import find_matching_entity
+            from memory.processor import extract_to_graph
+
+            entities = extract_entities(content)
+            if not entities:
+                return
+
+            for ent in entities:
+                if find_matching_entity(ent["text"], ent["label"]):
+                    await extract_to_graph(content, chat_jid)
+                    return
+        except Exception:
+            log.error("Selective extraction failed for %s", chat_jid, exc_info=True)
 
     # --- Approval flow ---
 
@@ -336,6 +567,15 @@ class Molly:
                 self.wa.send_message(chat_jid, "Got it, I won't do that.")
             )
 
+    # --- Safe message processing wrapper ---
+
+    async def _safe_process(self, msg_data: dict):
+        """Wrapper around process_message that catches and logs exceptions."""
+        try:
+            await self.process_message(msg_data)
+        except Exception:
+            log.error("Unhandled error processing message", exc_info=True)
+
     # --- Main loop ---
 
     async def run(self):
@@ -360,13 +600,14 @@ class Molly:
         log.info("Molly is starting up. Waiting for WhatsApp connection...")
         log.info("Scan the QR code with your phone to pair.")
 
-        # Main processing loop
+        # Main processing loop — uses create_task so the queue keeps draining
+        # while can_use_tool awaits approval responses from WhatsApp
         while self.running:
             try:
                 msg_data = await asyncio.wait_for(
                     self.queue.get(), timeout=config.POLL_INTERVAL
                 )
-                await self.process_message(msg_data)
+                asyncio.create_task(self._safe_process(msg_data))
             except asyncio.TimeoutError:
                 # No message in queue — check scheduled tasks
                 if self.wa and self.wa.connected:
