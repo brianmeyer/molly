@@ -7,11 +7,11 @@ ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Molly")
 TRIGGER_PATTERN = re.compile(rf"(?:^|\s)@{ASSISTANT_NAME}\b", re.IGNORECASE)
 
 # Commands
-COMMANDS = {"/clear", "/memory", "/graph", "/forget", "/status"}
+COMMANDS = {"/help", "/clear", "/memory", "/graph", "/forget", "/status"}
 
 # Claude
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "opus")
-ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"]
+ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"]
 
 # Owner — only this user can trigger Molly (phone + LID)
 OWNER_IDS = {
@@ -47,3 +47,24 @@ IDENTITY_FILES = [
     WORKSPACE / "MEMORY.md",
 ]
 HEARTBEAT_FILE = WORKSPACE / "HEARTBEAT.md"
+
+# Approval system
+REQUIRES_APPROVAL = {
+    "send_email",           # Sending emails or messages to external recipients
+    "send_message_external",# Sending messages to people other than Brian
+    "api_write",            # POST/PUT/DELETE to external APIs
+    "bash_destructive",     # rm, kill, drop, truncate, or other destructive commands
+    "modify_identity",      # Editing SOUL.md, AGENTS.md, or other identity files
+    "install_package",      # Installing or removing system packages
+    "file_delete",          # Deleting files outside the workspace
+    "calendar_modify",      # Creating, updating, or deleting calendar events
+}
+
+APPROVED_ACTIONS: set[str] = set()  # Pre-approved categories (bypass approval)
+
+APPROVAL_TIMEOUT = 300  # seconds (5 minutes)
+
+# Neo4j
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "mollygraph")

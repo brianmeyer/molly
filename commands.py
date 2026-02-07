@@ -12,6 +12,18 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
     cmd = parts[0]
     args = parts[1] if len(parts) > 1 else ""
 
+    if cmd == "/help":
+        return (
+            "Molly Commands\n"
+            "\n"
+            "/help - Show this list\n"
+            "/clear - Reset conversation session\n"
+            "/memory - Show what Molly remembers (MEMORY.md)\n"
+            "/graph <entity> - Look up a person, project, or topic in the knowledge graph\n"
+            "/forget <topic> - Remove an entity and its relationships from the graph\n"
+            "/status - Show uptime, model, connection info, and message stats"
+        )
+
     if cmd == "/clear":
         molly.sessions.pop(chat_jid, None)
         molly.save_sessions()
@@ -27,12 +39,44 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
     if cmd == "/graph":
         if not args:
             return "Usage: /graph <entity name>"
-        return f"Graph queries available in Phase 2. (searched: {args})"
+        try:
+            from memory.graph import query_entity, entity_count, relationship_count
+
+            entity = query_entity(args)
+            if not entity:
+                total_e = entity_count()
+                return f"No entity found for '{args}'. ({total_e} entities in graph)"
+
+            lines = [f"*{entity['name']}* ({entity.get('entity_type', '?')})"]
+            lines.append(f"Mentions: {entity.get('mention_count', 0)}")
+            lines.append(f"First seen: {entity.get('first_mentioned', '?')[:10]}")
+            lines.append(f"Last seen: {entity.get('last_mentioned', '?')[:10]}")
+            if entity.get("aliases"):
+                lines.append(f"Aliases: {', '.join(entity['aliases'])}")
+            for rel in entity.get("relationships", []):
+                rtype = rel["type"].replace("_", " ").lower()
+                if rel["direction"] == "outgoing":
+                    lines.append(f"  → {rtype} {rel['target']}")
+                else:
+                    lines.append(f"  ← {rel['source']} {rtype}")
+            return "\n".join(lines)
+        except Exception as e:
+            log.error("/graph failed", exc_info=True)
+            return f"Graph query failed: {e}"
 
     if cmd == "/forget":
         if not args:
             return "Usage: /forget <topic>"
-        return f"Forget functionality available in Phase 2. (topic: {args})"
+        try:
+            from memory.graph import delete_entity
+
+            deleted = delete_entity(args)
+            if deleted:
+                return f"Forgot '{args}' — entity and all relationships removed from graph."
+            return f"No entity '{args}' found in graph."
+        except Exception as e:
+            log.error("/forget failed", exc_info=True)
+            return f"Forget failed: {e}"
 
     if cmd == "/status":
         uptime = "unknown"
