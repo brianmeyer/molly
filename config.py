@@ -34,6 +34,8 @@ ALLOWED_TOOLS = [
     "contacts_search", "contacts_get", "contacts_list", "contacts_recent",
     # iMessage (Phase 3C)
     "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
+    # WhatsApp history (Phase 4)
+    "whatsapp_search",
 ]
 
 # Owner — only this user can trigger Molly (phone + LID)
@@ -41,6 +43,14 @@ OWNER_IDS = {
     "15550001234",
     "52660963176533",
 }
+
+# Web UI (Phase 4)
+WEB_HOST = os.getenv("MOLLY_WEB_HOST", "127.0.0.1")
+WEB_PORT = int(os.getenv("MOLLY_WEB_PORT", "8080"))
+WEB_AUTH_TOKEN = os.getenv("MOLLY_WEB_TOKEN", "")  # simple bearer token
+
+# Email monitoring (Phase 4)
+EMAIL_POLL_INTERVAL = 600  # 10 minutes
 
 # Timing
 POLL_INTERVAL = 2  # seconds (queue drain timeout)
@@ -84,6 +94,8 @@ ACTION_TIERS = {
         # Apple read-only (Phase 3C)
         "contacts_search", "contacts_get", "contacts_list", "contacts_recent",
         "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
+        # WhatsApp history (Phase 4)
+        "whatsapp_search",
     },
     "CONFIRM": {
         # Shell access — requires Brian's approval

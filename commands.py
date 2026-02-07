@@ -20,6 +20,7 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             "/help - Show this list\n"
             "/clear - Reset conversation session\n"
             "/memory - Show what Molly remembers (MEMORY.md)\n"
+            "/graph - Show graph summary (entity count, top connected, recent)\n"
             "/graph <entity> - Look up a person, project, or topic in the knowledge graph\n"
             "/forget <topic> - Remove an entity and its relationships from the graph\n"
             "/pending - Show actions waiting for approval\n"
@@ -47,9 +48,37 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
 
     if cmd == "/graph":
         if not args:
-            return "Usage: /graph <entity name>"
+            # Bare /graph — show overall graph summary
+            try:
+                from memory.graph import get_graph_summary
+
+                summary = get_graph_summary()
+                lines = [
+                    "*Knowledge Graph*",
+                    f"- Entities: {summary['entity_count']}",
+                    f"- Relationships: {summary['relationship_count']}",
+                ]
+                if summary["top_connected"]:
+                    lines.append("")
+                    lines.append("Top connected:")
+                    for e in summary["top_connected"]:
+                        lines.append(
+                            f"  {e['name']} ({e.get('type', '?')}) — "
+                            f"{e['connections']} connections, {e.get('mentions', 0)} mentions"
+                        )
+                if summary["recent"]:
+                    lines.append("")
+                    lines.append("Recently added:")
+                    for e in summary["recent"]:
+                        added = (e.get("added") or "?")[:10]
+                        lines.append(f"  {e['name']} ({e.get('type', '?')}) — {added}")
+                return "\n".join(lines)
+            except Exception as e:
+                log.error("/graph summary failed", exc_info=True)
+                return f"Graph summary failed: {e}"
+
         try:
-            from memory.graph import query_entity, entity_count, relationship_count
+            from memory.graph import query_entity, entity_count
 
             entity = query_entity(args)
             if not entity:

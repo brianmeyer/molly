@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
-from tools.contacts import resolve_handle_to_name
+from tools.contacts import batch_resolve_handles, resolve_handle_to_name
 
 log = logging.getLogger(__name__)
 
@@ -59,9 +59,36 @@ def _apple_to_unix(apple_ts) -> float:
     return ts + APPLE_EPOCH_OFFSET
 
 
+_DB_NANOSECONDS: bool | None = None
+
+
+def _detect_db_format():
+    """Detect whether the iMessage DB uses nanoseconds (macOS 10.13+) or seconds."""
+    global _DB_NANOSECONDS
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT date FROM message ORDER BY ROWID DESC LIMIT 1").fetchone()
+            _DB_NANOSECONDS = bool(row and row["date"] and float(row["date"]) > 1e12)
+        finally:
+            conn.close()
+    except Exception:
+        _DB_NANOSECONDS = True  # Default to nanoseconds on modern macOS
+
+
 def _unix_to_apple(unix_ts: float) -> float:
-    """Convert Unix timestamp to Apple Cocoa timestamp."""
-    return unix_ts - APPLE_EPOCH_OFFSET
+    """Convert Unix timestamp to Apple Cocoa timestamp.
+
+    Detects whether the DB uses seconds or nanoseconds (macOS 10.13+)
+    and returns the matching format.
+    """
+    global _DB_NANOSECONDS
+    if _DB_NANOSECONDS is None:
+        _detect_db_format()
+    apple_seconds = unix_ts - APPLE_EPOCH_OFFSET
+    if _DB_NANOSECONDS:
+        return apple_seconds * 1e9
+    return apple_seconds
 
 
 def _format_ts(apple_ts) -> str:
@@ -103,6 +130,17 @@ def _build_handle_map(conn: sqlite3.Connection) -> dict[int, str]:
     """Build a mapping of handle ROWID -> handle ID (phone/email)."""
     rows = conn.execute("SELECT ROWID, id FROM handle").fetchall()
     return {r["ROWID"]: r["id"] for r in rows}
+
+
+def _prewarm_contacts(rows, handle_map: dict[int, str]):
+    """Pre-warm the contacts cache for all unique handles in a result set."""
+    unique_handles = {
+        handle_map[r["handle_id"]]
+        for r in rows
+        if r["handle_id"] in handle_map
+    }
+    if unique_handles:
+        batch_resolve_handles(list(unique_handles))
 
 
 def _get_high_water() -> float:
@@ -242,6 +280,7 @@ async def imessage_search(args: dict) -> dict:
             params.append(limit)
 
             rows = conn.execute(sql, params).fetchall()
+            _prewarm_contacts(rows, handle_map)
             messages = [_format_message(r, handle_map) for r in rows]
             return _text_result(messages)
         finally:
@@ -273,6 +312,7 @@ async def imessage_recent(args: dict) -> dict:
                    ORDER BY m.date DESC LIMIT ?""",
                 (apple_threshold, limit),
             ).fetchall()
+            _prewarm_contacts(rows, handle_map)
             messages = [_format_message(r, handle_map) for r in rows]
             if not messages:
                 return _text_result(f"No messages in the last {hours} hours.")
@@ -315,6 +355,7 @@ async def imessage_thread(args: dict) -> dict:
                 [*handle_ids, limit],
             ).fetchall()
 
+            _prewarm_contacts(rows, handle_map)
             messages = [_format_message(r, handle_map) for r in reversed(rows)]
             return _text_result(messages)
         finally:
@@ -345,6 +386,7 @@ async def imessage_unread(args: dict) -> dict:
                 (apple_threshold,),
             ).fetchall()
 
+            _prewarm_contacts(rows, handle_map)
             messages = [_format_message(r, handle_map) for r in rows]
 
             # Update high-water mark
@@ -373,6 +415,7 @@ def get_new_messages_since(unix_ts: float) -> list[dict]:
     """Get new iMessages since a Unix timestamp.
 
     Returns list of message dicts with resolved contact names.
+    Pre-warms the contacts cache with a single bulk lookup.
     """
     apple_threshold = _unix_to_apple(unix_ts)
 
@@ -388,6 +431,8 @@ def get_new_messages_since(unix_ts: float) -> list[dict]:
                    ORDER BY m.date ASC""",
                 (apple_threshold,),
             ).fetchall()
+
+            _prewarm_contacts(rows, handle_map)
             return [_format_message(r, handle_map) for r in rows]
         finally:
             conn.close()

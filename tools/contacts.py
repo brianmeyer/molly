@@ -244,6 +244,109 @@ def resolve_handle_to_name(handle: str) -> str | None:
     return None
 
 
+def batch_resolve_handles(handles: list[str]) -> dict[str, str]:
+    """Resolve a batch of phone numbers/emails to contact names in a single DB pass.
+
+    Pre-warms the phone and email caches. Returns {handle: name} for resolved ones.
+    Much faster than calling resolve_handle_to_name per-handle.
+    """
+    # Split into phones and emails, skip already-cached
+    phones_to_resolve = []
+    emails_to_resolve = []
+    results = {}
+
+    for handle in set(handles):
+        if not handle:
+            continue
+        if "@" in handle:
+            if handle.lower() in _email_cache:
+                name = _email_cache[handle.lower()]
+                if name:
+                    results[handle] = name
+            else:
+                emails_to_resolve.append(handle)
+        else:
+            normalized = _normalize_phone(handle)
+            if normalized in _phone_cache:
+                name = _phone_cache[normalized]
+                if name:
+                    results[handle] = name
+            else:
+                phones_to_resolve.append((handle, normalized))
+
+    if not phones_to_resolve and not emails_to_resolve:
+        return results
+
+    try:
+        conn = _connect()
+        try:
+            # Bulk phone resolution: one query, compare all
+            if phones_to_resolve:
+                rows = conn.execute(
+                    """SELECT r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION, p.ZFULLNUMBER
+                       FROM ZABCDRECORD r
+                       JOIN ZABCDPHONENUMBER p ON r.Z_PK = p.ZOWNER
+                       WHERE p.ZFULLNUMBER IS NOT NULL""",
+                ).fetchall()
+
+                # Build a lookup of normalized DB phones -> name
+                db_phones = {}
+                for row in rows:
+                    db_norm = _normalize_phone(row["ZFULLNUMBER"])
+                    if len(db_norm) >= 10:
+                        first = row["ZFIRSTNAME"] or ""
+                        last = row["ZLASTNAME"] or ""
+                        name = f"{first} {last}".strip() or row["ZORGANIZATION"] or None
+                        if name:
+                            db_phones[db_norm[-10:]] = name
+
+                for handle, normalized in phones_to_resolve:
+                    if len(normalized) >= 10:
+                        suffix = normalized[-10:]
+                        name = db_phones.get(suffix)
+                        _phone_cache[normalized] = name
+                        if name:
+                            results[handle] = name
+                    else:
+                        _phone_cache[normalized] = None
+
+            # Bulk email resolution
+            if emails_to_resolve:
+                placeholders = ",".join("?" * len(emails_to_resolve))
+                email_rows = conn.execute(
+                    f"""SELECT e.ZADDRESS, r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION
+                        FROM ZABCDRECORD r
+                        JOIN ZABCDEMAILADDRESS e ON r.Z_PK = e.ZOWNER
+                        WHERE e.ZADDRESS COLLATE NOCASE IN ({placeholders})""",
+                    emails_to_resolve,
+                ).fetchall()
+
+                found_emails = set()
+                for row in email_rows:
+                    addr = row["ZADDRESS"].lower()
+                    first = row["ZFIRSTNAME"] or ""
+                    last = row["ZLASTNAME"] or ""
+                    name = f"{first} {last}".strip() or row["ZORGANIZATION"] or None
+                    _email_cache[addr] = name
+                    found_emails.add(addr)
+                    if name:
+                        for handle in emails_to_resolve:
+                            if handle.lower() == addr:
+                                results[handle] = name
+
+                # Cache misses
+                for handle in emails_to_resolve:
+                    if handle.lower() not in found_emails:
+                        _email_cache[handle.lower()] = None
+
+        finally:
+            conn.close()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        log.warning("Contacts DB not accessible for batch resolve", exc_info=True)
+
+    return results
+
+
 def clear_phone_cache():
     """Clear the phone resolution cache (call after contacts change)."""
     _phone_cache.clear()

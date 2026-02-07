@@ -23,6 +23,7 @@ from tools.calendar import calendar_server
 from tools.contacts import contacts_server
 from tools.gmail import gmail_server
 from tools.imessage import imessage_server
+from tools.whatsapp import whatsapp_server
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +158,7 @@ async def handle_message(
             "gmail": gmail_server,
             "apple-contacts": contacts_server,
             "imessage": imessage_server,
+            "whatsapp-history": whatsapp_server,
         },
         cwd=str(config.WORKSPACE),
     )

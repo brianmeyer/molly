@@ -600,6 +600,36 @@ class Molly:
         log.info("Molly is starting up. Waiting for WhatsApp connection...")
         log.info("Scan the QR code with your phone to pair.")
 
+        # Start web UI server (Phase 4)
+        try:
+            import uvicorn
+            from web import create_app
+
+            if not config.WEB_AUTH_TOKEN:
+                log.warning(
+                    "MOLLY_WEB_TOKEN is not set — Web UI has no authentication. "
+                    "Set MOLLY_WEB_TOKEN env var for security."
+                )
+            if config.WEB_HOST == "0.0.0.0" and not config.WEB_AUTH_TOKEN:
+                log.warning(
+                    "Web UI binding to 0.0.0.0 without auth token — "
+                    "anyone on the network can access Molly"
+                )
+
+            web_app = create_app(self)
+            web_config = uvicorn.Config(
+                web_app,
+                host=config.WEB_HOST,
+                port=config.WEB_PORT,
+                log_level="warning",
+                ws_max_size=8192,
+            )
+            web_server = uvicorn.Server(web_config)
+            asyncio.create_task(web_server.serve())
+            log.info("Web UI started at http://%s:%d", config.WEB_HOST, config.WEB_PORT)
+        except ImportError:
+            log.warning("uvicorn/fastapi not installed — Web UI disabled")
+
         # Main processing loop — uses create_task so the queue keeps draining
         # while can_use_tool awaits approval responses from WhatsApp
         while self.running:

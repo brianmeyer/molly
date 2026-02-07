@@ -407,6 +407,44 @@ def relationship_count() -> int:
         return result.single()["c"]
 
 
+def get_graph_summary() -> dict[str, Any]:
+    """Return overall graph stats: counts, top entities by connections, most recent."""
+    driver = get_driver()
+    with driver.session() as session:
+        e_count = session.run("MATCH (e:Entity) RETURN count(e) AS c").single()["c"]
+        r_count = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+
+        # Top 10 entities by connection count (in + out)
+        top_connected = session.run(
+            """MATCH (e:Entity)
+               OPTIONAL MATCH (e)-[r]-()
+               WITH e, count(r) AS connections
+               ORDER BY connections DESC
+               LIMIT 10
+               RETURN e.name AS name, e.entity_type AS type,
+                      e.mention_count AS mentions, connections""",
+        )
+        top = [dict(rec) for rec in top_connected]
+
+        # 5 most recently added entities
+        recent = session.run(
+            """MATCH (e:Entity)
+               WHERE e.first_mentioned IS NOT NULL
+               RETURN e.name AS name, e.entity_type AS type,
+                      e.first_mentioned AS added
+               ORDER BY e.first_mentioned DESC
+               LIMIT 5""",
+        )
+        recent_list = [dict(rec) for rec in recent]
+
+    return {
+        "entity_count": e_count,
+        "relationship_count": r_count,
+        "top_connected": top,
+        "recent": recent_list,
+    }
+
+
 def get_top_entities(limit: int = 20) -> list[dict[str, Any]]:
     """Return top entities ordered by strength (mentions * recency).
 
