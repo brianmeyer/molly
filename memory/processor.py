@@ -6,50 +6,47 @@ from memory.retriever import get_vectorstore
 log = logging.getLogger(__name__)
 
 
-async def process_conversation(
-    user_msg: str,
-    assistant_msg: str,
+async def embed_and_store(
+    content: str,
     chat_jid: str,
     source: str = "whatsapp",
 ):
-    """Post-response processing: embed, store, extract entities, update graph.
+    """L2: Embed content and store in vectorstore.
 
-    Runs as an async task — non-blocking to the response path.
+    Used for both passive processing (all messages) and
+    active conversations (combined user+assistant chunks).
     """
     try:
-        # Combine user + assistant into one chunk for context
-        chunk_text = f"User: {user_msg}\nMolly: {assistant_msg}"
-
-        # Layer 2: Embed and store in vectorstore
-        vec = embed(chunk_text)
-
+        vec = embed(content)
         vs = get_vectorstore()
         chunk_id = vs.store_chunk(
-            content=chunk_text,
+            content=content,
             embedding=vec,
             source=source,
             chat_jid=chat_jid,
         )
-
-        log.debug("Stored conversation chunk %s (%d chars)", chunk_id, len(chunk_text))
-
+        log.debug("Stored chunk %s (%d chars)", chunk_id, len(content))
     except Exception:
-        log.error("Layer 2 post-processing failed", exc_info=True)
+        log.error("Embed/store failed", exc_info=True)
 
-    # Layer 3: Entity extraction + Neo4j upsert (separate try so L2 failures don't block L3)
+
+async def extract_to_graph(
+    content: str,
+    chat_jid: str,
+    source: str = "whatsapp",
+):
+    """L3: Full entity/relation extraction and Neo4j upsert."""
     try:
         from memory.extractor import extract
         from memory import graph
 
-        result = extract(chunk_text)
-
+        result = extract(content)
         entities = result["entities"]
         relations = result["relations"]
 
         if not entities:
             return
 
-        # Upsert entities into Neo4j
         entity_names = []
         for ent in entities:
             canonical = graph.upsert_entity(
@@ -59,19 +56,17 @@ async def process_conversation(
             )
             entity_names.append(canonical)
 
-        # Upsert relationships
         for rel in relations:
             graph.upsert_relationship(
                 head_name=rel["head"],
                 tail_name=rel["tail"],
                 rel_type=rel["label"],
                 confidence=rel["score"],
-                context_snippet=chunk_text[:200],
+                context_snippet=content[:200],
             )
 
-        # Create episode linking conversation to entities
         graph.create_episode(
-            content_preview=chunk_text,
+            content_preview=content,
             source=source,
             entity_names=list(set(entity_names)),
         )
@@ -80,6 +75,21 @@ async def process_conversation(
             "Graph updated: %d entities, %d relations (%dms)",
             len(entities), len(relations), result["latency_ms"],
         )
-
     except Exception:
-        log.error("Layer 3 post-processing failed", exc_info=True)
+        log.error("Graph extraction failed", exc_info=True)
+
+
+async def process_conversation(
+    user_msg: str,
+    assistant_msg: str,
+    chat_jid: str,
+    source: str = "whatsapp",
+):
+    """Post-response processing: embed combined chunk, extract entities, update graph.
+
+    Runs as an async task — non-blocking to the response path.
+    Called from agent.py after Molly responds.
+    """
+    chunk_text = f"User: {user_msg}\nMolly: {assistant_msg}"
+    await embed_and_store(chunk_text, chat_jid, source)
+    await extract_to_graph(chunk_text, chat_jid, source)

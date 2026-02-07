@@ -164,6 +164,25 @@ class VectorStore:
             for r in rows
         ]
 
+    def log_tool_call(
+        self,
+        tool_name: str,
+        parameters: str = "",
+        success: bool = True,
+        latency_ms: int = 0,
+        error_message: str = "",
+    ):
+        """Log a tool call to operational memory."""
+        call_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO tool_calls
+               (id, tool_name, parameters, success, latency_ms, error_message, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (call_id, tool_name, parameters[:500], int(success), latency_ms, error_message, now),
+        )
+        self.conn.commit()
+
     def chunk_count(self) -> int:
         cursor = self.conn.execute("SELECT COUNT(*) FROM conversation_chunks")
         return cursor.fetchone()[0]

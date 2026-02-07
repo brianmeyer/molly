@@ -298,6 +298,21 @@ Tasks (work through each one):
 8. **Write maintenance report**: Write a summary of everything you did to
    {workspace}/memory/maintenance/{today}.md.
 
+9. **Relationship type review**: Review all WORKS_AT and USES relationships where the
+   target entity is an educational institution (universities, MBA programs, schools).
+   Check context_snippets for classmate/student/alumni/cohort/program indicators and
+   reclassify to CLASSMATE_OF, STUDIED_AT, or ALUMNI_OF as appropriate. USES should
+   never apply to a school — reclassify those too.
+
+10. **Semantic consistency check**: Review relationship types that don't make semantic
+    sense (e.g., USES with a Person, WORKS_AT with a Concept, MANAGES a Place). Propose
+    or execute reclassifications to the correct relationship type.
+
+11. **Shared institution relationships**: When multiple people appear in the same
+    institutional context (same school, same program, same cohort), check if they should
+    share a CLASSMATE_OF relationship. Create missing CLASSMATE_OF links between people
+    who both have STUDIED_AT or CLASSMATE_OF relationships with the same institution.
+
 Use Neo4j Cypher queries via Bash (cypher-shell) for graph operations.
 Be thorough but concise. This runs unattended.
 """
@@ -324,22 +339,40 @@ async def run_maintenance():
         )
 
         from claude_agent_sdk import ClaudeAgentOptions, query, AssistantMessage, TextBlock, ResultMessage
+        from tools.calendar import calendar_server
+        from tools.contacts import contacts_server
+        from tools.gmail import gmail_server
+        from tools.imessage import imessage_server
 
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             model="opus",
             permission_mode="bypassPermissions",
             allowed_tools=config.ALLOWED_TOOLS,
+            mcp_servers={
+                "google-calendar": calendar_server,
+                "gmail": gmail_server,
+                "apple-contacts": contacts_server,
+                "imessage": imessage_server,
+            },
             cwd=str(config.WORKSPACE),
         )
 
-        prompt = (
+        async def _maintenance_prompt(text: str):
+            yield {
+                "type": "user",
+                "session_id": "",
+                "message": {"role": "user", "content": text},
+                "parent_tool_use_id": None,
+            }
+
+        prompt_text = (
             f"Run nightly maintenance for {today}. "
             "Work through all maintenance tasks. Be thorough."
         )
 
         response_text = ""
-        async for message in query(prompt=prompt, options=options):
+        async for message in query(prompt=_maintenance_prompt(prompt_text), options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):

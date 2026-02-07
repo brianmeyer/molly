@@ -80,6 +80,34 @@ RELATION_SCHEMA = {
         "description": "General association between two entities discussed together",
         "threshold": 0.4,
     },
+    "classmate of": {
+        "description": "Person attended the same program, cohort, or school as another person",
+        "threshold": 0.45,
+    },
+    "studied at": {
+        "description": "Person attended or was enrolled at an educational institution",
+        "threshold": 0.45,
+    },
+    "alumni of": {
+        "description": "Person graduated from an educational institution or program",
+        "threshold": 0.45,
+    },
+    "mentors": {
+        "description": "Person mentors or advises another person",
+        "threshold": 0.5,
+    },
+    "mentored by": {
+        "description": "Person is mentored or advised by another person",
+        "threshold": 0.5,
+    },
+    "reports to": {
+        "description": "Person directly reports to another person in a management hierarchy",
+        "threshold": 0.5,
+    },
+    "collaborates with": {
+        "description": "Person works together with another person but not at the same organization",
+        "threshold": 0.45,
+    },
 }
 
 # Message type classification
