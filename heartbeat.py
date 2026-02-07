@@ -26,9 +26,12 @@ def should_heartbeat(last_heartbeat: datetime | None) -> bool:
 
 
 async def run_heartbeat(molly):
-    """Run a heartbeat check: HEARTBEAT.md evaluation + skill triggers + iMessage monitoring."""
+    """Run a heartbeat check: HEARTBEAT.md evaluation + skill triggers + iMessage/email monitoring."""
     # Check for new iMessages and surface urgent ones
     await _check_imessages(molly)
+
+    # Check for new emails and surface urgent ones
+    await _check_email(molly)
 
     if not molly.registered_chats:
         log.debug("No registered chats for heartbeat")
@@ -245,6 +248,15 @@ async def _check_imessages(molly):
         if not messages:
             return
 
+        # Safety cap: don't process more than 50 messages per heartbeat
+        # to avoid blocking the main loop for ages
+        if len(messages) > 50:
+            log.warning(
+                "iMessage heartbeat: %d messages found, capping at 50 (check timestamp conversion)",
+                len(messages),
+            )
+            messages = messages[-50:]  # most recent 50
+
         log.info("iMessage heartbeat: %d new messages since last check", len(messages))
 
         # Update high-water mark
@@ -289,3 +301,112 @@ async def _check_imessages(molly):
 
     except Exception:
         log.debug("iMessage heartbeat check failed", exc_info=True)
+
+
+async def _check_email(molly):
+    """Check for new emails since last heartbeat and surface important ones.
+
+    Polls Gmail for unread messages. Runs triage on each email.
+    Urgent ones get forwarded to Brian via WhatsApp. Relevant ones
+    feed into the memory pipeline.
+    """
+    try:
+        from tools.google_auth import get_gmail_service
+
+        service = get_gmail_service()
+        if not service:
+            return
+
+        # Rate limit: only poll every EMAIL_POLL_INTERVAL seconds
+        state_data = json.loads(config.STATE_FILE.read_text()) if config.STATE_FILE.exists() else {}
+        last_check = float(state_data.get("email_heartbeat_hw", 0))
+        now = time.time()
+
+        if last_check > 0 and (now - last_check) < config.EMAIL_POLL_INTERVAL:
+            return
+
+        # Build Gmail query for recent unread messages
+        if last_check == 0:
+            # First run — look back 24 hours
+            lookback_seconds = 24 * 3600
+        else:
+            lookback_seconds = int(now - last_check)
+
+        # Gmail query: unread messages newer than lookback period
+        lookback_hours = max(1, lookback_seconds // 3600)
+        query = f"is:unread newer_than:{lookback_hours}h"
+
+        result = (
+            service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=20)
+            .execute()
+        )
+
+        messages = result.get("messages", [])
+
+        # Update high-water mark (even if no messages, to track timing)
+        state_data["email_heartbeat_hw"] = now
+        config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+
+        if not messages:
+            return
+
+        log.info("Email heartbeat: %d new unread emails", len(messages))
+
+        from memory.triage import triage_message
+        from memory.processor import embed_and_store
+
+        owner_jid = molly._get_owner_dm_jid()
+
+        for msg_ref in messages:
+            try:
+                msg = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=msg_ref["id"], format="metadata",
+                         metadataHeaders=["From", "Subject", "Date"])
+                    .execute()
+                )
+
+                headers = {
+                    h["name"].lower(): h["value"]
+                    for h in msg.get("payload", {}).get("headers", [])
+                }
+                sender = headers.get("from", "Unknown")
+                subject = headers.get("subject", "(no subject)")
+                snippet = msg.get("snippet", "")
+
+                email_text = f"From: {sender}\nSubject: {subject}\n{snippet}"
+
+                # Run triage
+                triage_result = await triage_message(
+                    email_text,
+                    sender_name=sender,
+                    group_name="Email",
+                )
+
+                if triage_result and triage_result.classification == "urgent":
+                    if owner_jid and molly.wa:
+                        notify = (
+                            f"Email from {sender}\n"
+                            f"Subject: {subject}\n"
+                            f"{snippet[:200]}\n\n"
+                            f"Reason: {triage_result.reason}"
+                        )
+                        molly._track_send(molly.wa.send_message(owner_jid, notify))
+
+                # Embed into memory (urgent + relevant)
+                if triage_result and triage_result.classification in ("urgent", "relevant"):
+                    await embed_and_store(
+                        email_text,
+                        chat_jid="email",
+                        source="email",
+                    )
+
+            except Exception:
+                log.debug("Failed to process email %s", msg_ref.get("id"), exc_info=True)
+
+    except Exception:
+        log.warning("Email heartbeat check failed", exc_info=True)
