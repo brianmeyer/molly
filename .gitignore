@@ -1,0 +1,20 @@
+# Databases and WhatsApp auth
+store/
+*.db
+
+# Phone numbers, sessions, state
+data/
+
+# Identity files, memory, daily logs (symlink to ~/.molly/workspace)
+workspace/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# Claude Code local settings
+.claude/
