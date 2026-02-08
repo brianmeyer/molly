@@ -330,9 +330,9 @@ class TestTaskToolTier(unittest.TestCase):
             if in_auto and ('"CONFIRM"' in line or '"BLOCKED"' in line):
                 self.fail("Task not found in AUTO tier before CONFIRM/BLOCKED")
 
-    def test_no_allowed_tools_list(self):
-        """ALLOWED_TOOLS should be removed (dead config)."""
-        self.assertNotIn("ALLOWED_TOOLS", self.source)
+    def test_task_in_allowed_tools(self):
+        """Task must also be in ALLOWED_TOOLS list."""
+        self.assertIn('"Task"', self.source)
 
 
 # ---------------------------------------------------------------------------

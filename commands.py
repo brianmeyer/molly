@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import date, datetime, timezone
 
 import config
@@ -303,7 +304,9 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
 
     if cmd == "/digest":
         from agent import handle_message
+        from skills import get_skill, get_skill_context
 
+        digest_skill = get_skill("daily-digest")
         prompt = (
             "Run the daily digest now. "
             "Pull today's calendar, check unread emails, and summarize what's on my plate."
