@@ -321,6 +321,7 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
                 prompt, chat_jid, session_id,
                 approval_manager=molly.approvals,
                 molly_instance=molly,
+                source="whatsapp",
             )
             if new_session_id:
                 molly.sessions[chat_jid] = new_session_id

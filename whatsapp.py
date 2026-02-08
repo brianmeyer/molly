@@ -70,7 +70,12 @@ class WhatsAppClient:
         is_from_me = info.MessageSource.IsFromMe
         is_group = info.MessageSource.IsGroup
         msg_id = info.ID
-        timestamp = str(info.Timestamp)
+        # Store as ISO format for consistent comparison with search queries
+        raw_ts = info.Timestamp
+        if hasattr(raw_ts, 'isoformat'):
+            timestamp = raw_ts.isoformat()
+        else:
+            timestamp = str(raw_ts)
         pushname = info.Pushname or ""
 
         # Extract text content from any message type

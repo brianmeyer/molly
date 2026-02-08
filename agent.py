@@ -121,14 +121,24 @@ def make_tool_checker(approval_manager=None, molly=None, chat_jid: str = ""):
 
         # Request approval via WhatsApp and wait
         log.info("CONFIRM tier — requesting approval for %s", tool_name)
-        approved = await approval_manager.request_tool_approval(
+        result = await approval_manager.request_tool_approval(
             tool_name, tool_input, chat_jid, molly,
         )
 
-        if approved:
+        if result is True:
             log.info("Tool approved: %s", tool_name)
             _log_tool(tool_name, tool_input, True, t0)
             return PermissionResultAllow()
+        elif isinstance(result, str):
+            # Edit instruction from Brian — deny with modification guidance
+            log.info("Tool edit requested: %s → %s", tool_name, result)
+            _log_tool(tool_name, tool_input, False, t0, "edit_requested")
+            return PermissionResultDeny(
+                message=(
+                    f"Brian wants you to modify this action before retrying. "
+                    f"His edit instructions: {result}"
+                )
+            )
         else:
             log.info("Tool denied: %s", tool_name)
             _log_tool(tool_name, tool_input, False, t0, "denied/timed out")
@@ -243,6 +253,7 @@ async def handle_message(
     session_id: str | None = None,
     approval_manager=None,
     molly_instance=None,
+    source: str = "unknown",
 ) -> tuple[str, str | None]:
     """Send a message through Claude and return (response_text, new_session_id)."""
     system_prompt = load_identity_stack()
@@ -315,7 +326,7 @@ async def handle_message(
     # Async post-processing: embed + store conversation turn
     if response_text and not response_text.startswith("Something went wrong"):
         task = asyncio.create_task(
-            process_conversation(user_message, response_text, chat_id),
+            process_conversation(user_message, response_text, chat_id, source=source),
             name=f"post-process:{chat_id[:20]}",
         )
         task.add_done_callback(

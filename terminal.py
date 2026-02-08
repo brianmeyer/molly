@@ -54,6 +54,7 @@ async def main():
         try:
             response, new_session_id = await handle_message(
                 text, session_key, session_id,
+                source="terminal",
             )
             if new_session_id:
                 session_id = new_session_id

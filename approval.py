@@ -181,10 +181,11 @@ class ApprovalManager:
         tool_input: dict,
         chat_jid: str,
         molly,
-    ) -> bool:
+    ) -> bool | str:
         """Send an approval request on WhatsApp for a tool call and wait.
 
-        Returns True if approved, False if denied or timed out.
+        Returns True if approved, False if denied or timed out,
+        or a string with edit instructions if Brian replied "edit: ...".
         """
         # Cancel any stale pending approval for this chat
         self._cancel_pending(chat_jid)
@@ -221,10 +222,10 @@ class ApprovalManager:
                 _log_approval_decision(tool_name, "denied", elapsed)
                 return False
             elif isinstance(result, tuple) and result[0] == "edit":
-                # Edit request — deny this call, agent will see the edit instruction
-                # and retry with modified parameters
+                # Edit request — deny this call with the edit instruction so
+                # the agent can modify parameters and retry
                 _log_approval_decision(tool_name, "edited", elapsed)
-                return False
+                return result[1]  # return the edit instruction string
             _log_approval_decision(tool_name, "denied", elapsed)
             return False
         except asyncio.TimeoutError:
