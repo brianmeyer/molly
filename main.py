@@ -240,7 +240,7 @@ class Molly:
         self.start_time: datetime | None = None
         self.last_heartbeat: datetime | None = None
         self.last_maintenance: datetime | None = None
-        self._sent_ids: set[str] = set()  # message IDs Molly sent (avoid echo loop)
+        self._sent_ids: dict[str, float] = {}  # msg_id → timestamp (avoid echo loop)
         self.approvals = ApprovalManager()
 
     # --- State persistence ---
@@ -309,7 +309,11 @@ class Molly:
     def _track_send(self, msg_id: str | None):
         """Record a message ID that Molly sent so we skip it on echo."""
         if msg_id:
-            self._sent_ids.add(msg_id)
+            now = time.time()
+            self._sent_ids[msg_id] = now
+            # Prune entries older than 5 minutes
+            cutoff = now - 300
+            self._sent_ids = {k: v for k, v in self._sent_ids.items() if v > cutoff}
 
     # --- Message processing ---
 
@@ -334,7 +338,7 @@ class Molly:
         # Skip messages Molly sent (avoid echo loop)
         msg_id = msg_data["msg_id"]
         if msg_id in self._sent_ids:
-            self._sent_ids.discard(msg_id)
+            del self._sent_ids[msg_id]
             return
 
         # Determine chat processing tier

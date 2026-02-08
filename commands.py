@@ -313,7 +313,8 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
         )
         # If the skill exists, it will be matched by the prompt via normal flow.
         # But we also inject it explicitly here to be sure.
-        molly.wa.send_typing(chat_jid)
+        if molly.wa:
+            molly.wa.send_typing(chat_jid)
         try:
             session_id = molly.sessions.get(chat_jid)
             response, new_session_id = await handle_message(
@@ -329,7 +330,8 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             log.error("/digest failed", exc_info=True)
             return f"Digest failed: {e}"
         finally:
-            molly.wa.send_typing_stopped(chat_jid)
+            if molly.wa:
+                molly.wa.send_typing_stopped(chat_jid)
 
     if cmd == "/status":
         uptime = "unknown"

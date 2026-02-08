@@ -13,8 +13,15 @@ workspace/
 __pycache__/
 *.pyc
 
-# Secrets
+# Secrets / credentials
 .env
+*.env
+credentials/
+token.json
+client_secret.json
 
 # Claude Code local settings
 .claude/
+
+# Logs
+*.log

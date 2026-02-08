@@ -2,6 +2,10 @@ import os
 import re
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv(Path.home() / ".molly" / "credentials" / ".env")
+
 # Identity
 ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Molly")
 TRIGGER_PATTERN = re.compile(rf"(?:^|\s)@{ASSISTANT_NAME}\b", re.IGNORECASE)
@@ -36,13 +40,12 @@ ALLOWED_TOOLS = [
     "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
     # WhatsApp history (Phase 4)
     "whatsapp_search",
+    # External models (Phase 5)
+    "kimi_research", "grok_reason",
 ]
 
 # Owner — only this user can trigger Molly (phone + LID)
-OWNER_IDS = {
-    "15550001234",
-    "52660963176533",
-}
+OWNER_IDS = set(filter(None, os.getenv("OWNER_IDS", "").split(",")))
 
 # Web UI (Phase 4)
 WEB_HOST = os.getenv("MOLLY_WEB_HOST", "127.0.0.1")
@@ -96,6 +99,8 @@ ACTION_TIERS = {
         "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
         # WhatsApp history (Phase 4)
         "whatsapp_search",
+        # External models (Phase 5)
+        "kimi_research", "grok_reason",
     },
     "CONFIRM": {
         # Shell access — requires Brian's approval
@@ -134,6 +139,12 @@ GOOGLE_SCOPES = [
 CONTACTS_DB = Path.home() / "Library" / "Application Support" / "AddressBook" / "AddressBook-v22.abcddb"
 IMESSAGE_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
+# External model APIs (Phase 5)
+MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
+MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+XAI_BASE_URL = "https://api.x.ai/v1"
+
 # Ollama / Triage (local Qwen3-4B)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 TRIAGE_MODEL = os.getenv("TRIAGE_MODEL", "qwen3:4b")
@@ -143,4 +154,4 @@ TRIAGE_CONTEXT_ENTITIES = 20  # top N entities by strength for triage context
 # Neo4j
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")

@@ -5,8 +5,10 @@ import time
 from datetime import date, timedelta
 
 from claude_agent_sdk import (
+    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
+    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
@@ -23,6 +25,8 @@ from tools.calendar import calendar_server
 from tools.contacts import contacts_server
 from tools.gmail import gmail_server
 from tools.imessage import imessage_server
+from tools.grok import grok_server
+from tools.kimi import kimi_server
 from tools.whatsapp import whatsapp_server
 
 log = logging.getLogger(__name__)
@@ -111,6 +115,76 @@ def _log_tool(tool_name: str, tool_input: dict, success: bool, t0: float, error:
         log.debug("Failed to log tool call: %s", tool_name, exc_info=True)
 
 
+def _build_agents() -> dict[str, AgentDefinition]:
+    """Define sub-agents for intelligent task routing.
+
+    Opus orchestrates and delegates to these agents via the Task tool.
+    Sub-agents inherit all available tools (tools=None).
+    """
+    return {
+        "quick": AgentDefinition(
+            description="Fast lookups, formatting, trivial subtasks",
+            prompt=(
+                "You are a fast helper. Handle simple lookups, formatting, "
+                "unit conversions, quick calculations, and other mechanical "
+                "subtasks. Be concise and direct."
+            ),
+            model="haiku",
+        ),
+        "worker": AgentDefinition(
+            description="Email drafts, research synthesis, multi-step tool use",
+            prompt=(
+                "You are a capable worker. Handle substantial tasks like "
+                "drafting emails, synthesizing research across multiple sources, "
+                "multi-step tool workflows, and data gathering. Be thorough "
+                "but efficient."
+            ),
+            model="sonnet",
+        ),
+        "analyst": AgentDefinition(
+            description="Deep analysis, strategic thinking, complex reasoning",
+            prompt=(
+                "You are a deep analyst. Handle tasks requiring careful reasoning, "
+                "strategic analysis, nuanced judgment, and complex multi-factor "
+                "decisions. Take your time and be thorough."
+            ),
+            model="opus",
+        ),
+    }
+
+
+async def _on_subagent_start(input, tool_use_id, context):
+    """Log routing decision when a sub-agent is started."""
+    agent_type = input.get("agent_type", "unknown") if isinstance(input, dict) else "unknown"
+    try:
+        from memory.retriever import get_vectorstore
+        vs = get_vectorstore()
+        vs.log_tool_call(
+            f"routing:subagent_start:{agent_type}",
+            json.dumps({"agent": agent_type}),
+            True, 0, "",
+        )
+    except Exception:
+        log.debug("Failed to log subagent start: %s", agent_type, exc_info=True)
+    return {"continue_": True}
+
+
+async def _on_subagent_stop(input, tool_use_id, context):
+    """Log when a sub-agent completes."""
+    agent_type = input.get("agent_type", "unknown") if isinstance(input, dict) else "unknown"
+    try:
+        from memory.retriever import get_vectorstore
+        vs = get_vectorstore()
+        vs.log_tool_call(
+            f"routing:subagent_stop:{agent_type}",
+            json.dumps({"agent": agent_type}),
+            True, 0, "",
+        )
+    except Exception:
+        log.debug("Failed to log subagent stop: %s", agent_type, exc_info=True)
+    return {"continue_": True}
+
+
 async def _prompt_stream(text: str):
     """Wrap a string prompt as an async iterable for MCP server support.
 
@@ -153,12 +227,19 @@ async def handle_message(
         model=config.CLAUDE_MODEL,
         permission_mode="bypassPermissions",
         allowed_tools=config.ALLOWED_TOOLS,
+        agents=_build_agents(),
+        hooks={
+            "SubagentStart": [HookMatcher(hooks=[_on_subagent_start])],
+            "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],
+        },
         mcp_servers={
             "google-calendar": calendar_server,
             "gmail": gmail_server,
             "apple-contacts": contacts_server,
             "imessage": imessage_server,
             "whatsapp-history": whatsapp_server,
+            "kimi": kimi_server,
+            "grok": grok_server,
         },
         cwd=str(config.WORKSPACE),
     )
