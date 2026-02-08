@@ -259,10 +259,6 @@ async def _check_imessages(molly):
 
         log.info("iMessage heartbeat: %d new messages since last check", len(messages))
 
-        # Update high-water mark
-        state_data["imessage_heartbeat_hw"] = time.time()
-        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
-
         # Triage each message and surface urgent ones
         owner_jid = molly._get_owner_dm_jid()
         if not owner_jid or not molly.wa:
@@ -298,6 +294,10 @@ async def _check_imessages(molly):
                     chat_jid="imessage",
                     source="imessage",
                 )
+
+        # Update high-water mark AFTER processing so a crash doesn't lose messages
+        state_data["imessage_heartbeat_hw"] = time.time()
+        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
 
     except Exception:
         log.debug("iMessage heartbeat check failed", exc_info=True)

@@ -60,7 +60,7 @@ async def whatsapp_search(args: dict) -> dict:
     chat_id = args.get("chat_id", "")
     sender = args.get("sender", "")
     limit = min(args.get("limit", 20), 100)
-    hours_back = args.get("hours_back", 24)
+    hours_back = min(args.get("hours_back", 24), 720)  # cap at 30 days
 
     if not query_text and not chat_id and not sender:
         return _error_result(
