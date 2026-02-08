@@ -3,22 +3,25 @@ import importlib
 import json
 import logging
 import time
+from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
+    ClaudeSDKClient,
     ClaudeAgentOptions,
+    CLIConnectionError,
     HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
     TextBlock,
-    query,
 )
 
 import config
-from approval import get_action_tier, is_auto_approved_path
+from approval import RequestApprovalState, get_action_tier, is_auto_approved_path
 from memory.processor import process_conversation
 from memory.retriever import retrieve_context
 from skills import get_skill_context, match_skills
@@ -28,7 +31,10 @@ log = logging.getLogger(__name__)
 _MCP_SERVER_SPECS = {
     "google-calendar": ("tools.calendar", "calendar_server"),
     "gmail": ("tools.gmail", "gmail_server"),
-    "apple-contacts": ("tools.contacts", "contacts_server"),
+    "apple-mcp": {
+        "command": "bunx",
+        "args": ["--no-cache", "apple-mcp@latest"],
+    },
     "imessage": ("tools.imessage", "imessage_server"),
     "whatsapp-history": ("tools.whatsapp", "whatsapp_server"),
     "kimi": ("tools.kimi", "kimi_server"),
@@ -41,12 +47,35 @@ _MCP_SERVER_TOOL_NAMES = {
         "calendar_create", "calendar_update", "calendar_delete",
     },
     "gmail": {"gmail_search", "gmail_read", "gmail_draft", "gmail_send", "gmail_reply"},
-    "apple-contacts": {"contacts_search", "contacts_get", "contacts_list", "contacts_recent"},
+    "apple-mcp": {
+        "contacts", "notes", "messages", "mail", "reminders", "calendar", "maps",
+    },
     "imessage": {"imessage_search", "imessage_recent", "imessage_thread", "imessage_unread"},
     "whatsapp-history": {"whatsapp_search"},
     "kimi": {"kimi_research"},
     "grok": {"grok_reason"},
 }
+
+_CHAT_RUNTIME_LOCK = asyncio.Lock()
+_CHAT_RUNTIME_IDLE_SECONDS = 30 * 60
+_CHAT_RUNTIME_MAX_ENTRIES = 200
+
+
+@dataclass
+class _ChatRuntime:
+    """State for one chat's Claude SDK client lifecycle."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    client: ClaudeSDKClient | None = None
+    system_prompt: str = ""
+    session_id: str | None = None
+    approval_manager: object | None = None
+    molly_instance: object | None = None
+    request_state: RequestApprovalState | None = None
+    last_used_monotonic: float = field(default_factory=time.monotonic)
+
+
+_CHAT_RUNTIMES: dict[str, _ChatRuntime] = {}
 
 
 def _load_mcp_servers() -> dict[str, object]:
@@ -55,17 +84,29 @@ def _load_mcp_servers() -> dict[str, object]:
     disabled_tools = set(getattr(config, "DISABLED_TOOL_NAMES", set()))
     servers: dict[str, object] = {}
 
-    for server_name, (module_name, attr_name) in _MCP_SERVER_SPECS.items():
+    for server_name, spec in _MCP_SERVER_SPECS.items():
         if server_name in disabled_servers:
             continue
         try:
-            module = importlib.import_module(module_name)
-            servers[server_name] = getattr(module, attr_name)
+            if isinstance(spec, tuple):
+                module_name, attr_name = spec
+                module = importlib.import_module(module_name)
+                servers[server_name] = getattr(module, attr_name)
+            elif isinstance(spec, dict):
+                server_cfg = {"command": spec["command"]}
+                if spec.get("args"):
+                    server_cfg["args"] = list(spec["args"])
+                if spec.get("env"):
+                    server_cfg["env"] = dict(spec["env"])
+                servers[server_name] = server_cfg
+            else:
+                raise TypeError(f"Unsupported MCP server spec type: {type(spec)!r}")
         except Exception as e:
+            detail = spec[0] if isinstance(spec, tuple) else str(spec)
             log.warning(
-                "Disabling MCP server '%s' — failed to import %s (%s)",
+                "Disabling MCP server '%s' — failed to load %s (%s)",
                 server_name,
-                module_name,
+                detail,
                 e,
             )
             disabled_servers.add(server_name)
@@ -108,12 +149,20 @@ def _normalize_tool_name(tool_name: str) -> str:
     return tool_name
 
 
-def make_tool_checker(approval_manager=None, molly=None, chat_jid: str = ""):
+def make_tool_checker(
+    approval_manager=None,
+    molly=None,
+    chat_jid: str = "",
+    request_state: RequestApprovalState | None = None,
+):
     """Create a can_use_tool callback for code-enforced action tiers.
 
     AUTO    → PermissionResultAllow (immediate)
     CONFIRM → WhatsApp approval flow → Allow/Deny (or deny if no approval_manager)
     BLOCKED → PermissionResultDeny (immediate)
+
+    Within one handle_message request, CONFIRM-tier decisions are cached and
+    coalesced to avoid repeated prompts.
 
     This callback only fires for tools NOT in allowed_tools (i.e., CONFIRM and
     BLOCKED tier tools). AUTO-tier tools are pre-approved via allowed_tools and
@@ -126,7 +175,7 @@ def make_tool_checker(approval_manager=None, molly=None, chat_jid: str = ""):
 
     async def can_use_tool(tool_name: str, tool_input: dict, _context) -> PermissionResultAllow | PermissionResultDeny:
         short_name = _normalize_tool_name(tool_name)
-        tier = get_action_tier(short_name)
+        tier = get_action_tier(short_name, tool_input)
         t0 = time.time()
         log.info("can_use_tool fired: %s (normalized: %s) → tier=%s", tool_name, short_name, tier)
 
@@ -167,6 +216,7 @@ def make_tool_checker(approval_manager=None, molly=None, chat_jid: str = ""):
         log.info("CONFIRM tier — requesting approval for %s", tool_name)
         result = await approval_manager.request_tool_approval(
             tool_name, tool_input, chat_jid, molly,
+            request_state=request_state,
         )
 
         if result is True:
@@ -203,6 +253,230 @@ def _log_tool(tool_name: str, tool_input: dict, success: bool, t0: float, error:
         vs.log_tool_call(tool_name, params, success, latency_ms, error)
     except Exception:
         log.debug("Failed to log tool call: %s", tool_name, exc_info=True)
+
+
+async def _get_chat_runtime(chat_id: str) -> _ChatRuntime:
+    await _evict_stale_chat_runtimes()
+
+    async with _CHAT_RUNTIME_LOCK:
+        runtime = _CHAT_RUNTIMES.get(chat_id)
+        if runtime is None:
+            runtime = _ChatRuntime()
+            _CHAT_RUNTIMES[chat_id] = runtime
+        runtime.last_used_monotonic = time.monotonic()
+        return runtime
+
+
+async def _evict_stale_chat_runtimes() -> int:
+    now = time.monotonic()
+    victims: list[tuple[str, _ChatRuntime, str]] = []
+
+    async with _CHAT_RUNTIME_LOCK:
+        for chat_id, runtime in list(_CHAT_RUNTIMES.items()):
+            idle_for_s = now - runtime.last_used_monotonic
+            if runtime.lock.locked() or idle_for_s < _CHAT_RUNTIME_IDLE_SECONDS:
+                continue
+            _CHAT_RUNTIMES.pop(chat_id, None)
+            victims.append((chat_id, runtime, f"idle>{_CHAT_RUNTIME_IDLE_SECONDS}s"))
+
+        over_by = len(_CHAT_RUNTIMES) - _CHAT_RUNTIME_MAX_ENTRIES
+        if over_by > 0:
+            candidates = sorted(
+                (
+                    (chat_id, runtime)
+                    for chat_id, runtime in _CHAT_RUNTIMES.items()
+                    if not runtime.lock.locked()
+                ),
+                key=lambda pair: pair[1].last_used_monotonic,
+            )
+            for chat_id, runtime in candidates[:over_by]:
+                _CHAT_RUNTIMES.pop(chat_id, None)
+                victims.append((chat_id, runtime, "lru_capacity"))
+
+    for chat_id, runtime, reason in victims:
+        await _disconnect_runtime(runtime)
+        log.info("Evicted chat runtime for %s (%s)", chat_id, reason)
+
+    return len(victims)
+
+
+def _build_turn_prompt(
+    user_message: str,
+    memory_context: str,
+    skill_context: str,
+    chat_context: str | None,
+    response_guidance: str | None,
+) -> str:
+    sections: list[str] = []
+    if memory_context:
+        sections.append(f"Relevant memory:\n{memory_context}")
+    if skill_context:
+        sections.append(f"Skill guidance:\n{skill_context}")
+    if chat_context:
+        sections.append(f"Chat context:\n{chat_context}")
+    if response_guidance:
+        sections.append(f"Response format:\n{response_guidance}")
+
+    if not sections:
+        return user_message
+
+    return (
+        "Use this runtime context for this turn.\n\n"
+        + "\n\n---\n\n".join(sections)
+        + f"\n\n---\n\nUser request:\n{user_message}"
+    )
+
+
+def _response_guidance_for_source(source: str) -> str | None:
+    if not config.WHATSAPP_PROMPT_GUARDRAILS:
+        return None
+
+    normalized = (source or "").strip().lower()
+    if normalized not in {"whatsapp", "heartbeat", "automation"}:
+        return None
+
+    return (
+        "The final response will be read in WhatsApp. "
+        "Use plain text formatting that is easy to scan.\n"
+        "- Do not use markdown tables.\n"
+        "- Do not use # headings.\n"
+        "- Do not use fenced code blocks unless explicitly requested.\n"
+        "- Prefer short bullets with '-' and clear labels."
+    )
+
+
+def _iter_exceptions(exc: BaseException):
+    if isinstance(exc, ExceptionGroup):
+        for item in exc.exceptions:
+            yield from _iter_exceptions(item)
+    else:
+        yield exc
+
+
+def _is_recoverable_transport_error(exc: BaseException) -> bool:
+    for item in _iter_exceptions(exc):
+        if isinstance(item, CLIConnectionError):
+            return True
+        message = str(item).lower()
+        if (
+            "stream closed" in message
+            or "not ready for writing" in message
+            or "processtransport" in message
+        ):
+            return True
+    return False
+
+
+def _handle_sdk_stderr(line: str):
+    msg = line.strip()
+    if not msg:
+        return
+
+    noisy_patterns = (
+        "/$bunfs/root/claude:",
+        "Error in hook callback",
+        "Claude Code has been suspended.",
+        "ctrl + z now suspends Claude Code",
+        "error: Stream closed",
+    )
+    if any(pattern in msg for pattern in noisy_patterns):
+        log.debug("Suppressed noisy Claude CLI stderr: %s", msg[:200])
+        return
+
+    log.warning("Claude CLI stderr: %s", msg[:500])
+
+
+async def _disconnect_runtime(runtime: _ChatRuntime):
+    if runtime.client is None:
+        return
+    with suppress(Exception):
+        await runtime.client.disconnect()
+    runtime.client = None
+
+
+async def _ensure_connected_runtime(
+    runtime: _ChatRuntime,
+    chat_id: str,
+    system_prompt: str,
+) -> None:
+    if runtime.client is not None and runtime.system_prompt == system_prompt:
+        return
+
+    if runtime.client is not None:
+        await _disconnect_runtime(runtime)
+
+    disabled_tools = set(getattr(config, "DISABLED_TOOL_NAMES", set()))
+    auto_tools = sorted(t for t in config.ACTION_TIERS["AUTO"] if t not in disabled_tools)
+
+    async def can_use_tool(tool_name: str, tool_input: dict, context):
+        checker = make_tool_checker(
+            approval_manager=runtime.approval_manager,
+            molly=runtime.molly_instance,
+            chat_jid=chat_id,
+            request_state=runtime.request_state,
+        )
+        return await checker(tool_name, tool_input, context)
+
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        model=config.CLAUDE_MODEL,
+        allowed_tools=auto_tools,
+        agents=_build_agents(),
+        hooks={
+            "SubagentStart": [HookMatcher(hooks=[_on_subagent_start])],
+            "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],
+        },
+        mcp_servers=_load_mcp_servers(),
+        cwd=str(config.WORKSPACE),
+        stderr=_handle_sdk_stderr,
+        can_use_tool=can_use_tool,
+    )
+    if runtime.session_id:
+        options.resume = runtime.session_id
+
+    runtime.client = ClaudeSDKClient(options=options)
+    await runtime.client.connect()
+    runtime.system_prompt = system_prompt
+
+
+async def _query_with_client(
+    runtime: _ChatRuntime,
+    turn_prompt: str,
+) -> tuple[str, str | None]:
+    if runtime.client is None:
+        raise RuntimeError("Claude client is not connected")
+
+    response_text = ""
+    new_session_id = None
+    active_session = runtime.session_id or "default"
+
+    await runtime.client.query(turn_prompt, session_id=active_session)
+
+    async for message in runtime.client.receive_response():
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    response_text += block.text
+        elif isinstance(message, ResultMessage):
+            new_session_id = message.session_id
+            if message.is_error:
+                log.error("Claude returned error: %s", message.result)
+
+    return response_text, new_session_id
+
+
+def _emit_approval_metrics(request_state: RequestApprovalState):
+    if request_state.tool_asks <= 0:
+        return
+    log.info(
+        "[approval METRIC] - request_id=%s | tool_asks=%d | prompts_sent=%d | "
+        "auto_approved=%d | all_grant=%s",
+        request_state.request_id,
+        request_state.tool_asks,
+        request_state.prompts_sent,
+        request_state.auto_approved,
+        str(request_state.approved_all_confirm).lower(),
+    )
 
 
 def _build_agents() -> dict[str, AgentDefinition]:
@@ -275,22 +549,6 @@ async def _on_subagent_stop(input, tool_use_id, context):
     return {"continue_": True}
 
 
-async def _prompt_stream(text: str):
-    """Wrap a string prompt as an async iterable for MCP server support.
-
-    The SDK's string-prompt path calls end_input() immediately after writing,
-    which closes stdin before MCP tool registration handshake messages can be
-    processed. The async-iterable path uses stream_input() instead, which
-    detects sdk_mcp_servers and waits for the first result before closing stdin.
-    """
-    yield {
-        "type": "user",
-        "session_id": "",
-        "message": {"role": "user", "content": text},
-        "parent_tool_use_id": None,
-    }
-
-
 async def handle_message(
     user_message: str,
     chat_id: str,
@@ -298,67 +556,78 @@ async def handle_message(
     approval_manager=None,
     molly_instance=None,
     source: str = "unknown",
+    chat_context: str | None = None,
 ) -> tuple[str, str | None]:
     """Send a message through Claude and return (response_text, new_session_id)."""
+    runtime = await _get_chat_runtime(chat_id)
+
     system_prompt = load_identity_stack()
-
-    # Layer 2: semantic memory retrieval
-    memory_context = retrieve_context(user_message)
-    if memory_context:
-        system_prompt += "\n\n---\n\n" + memory_context
-
-    # Phase 3D: skill loading — match message against skill triggers
+    memory_context = retrieve_context(user_message) or ""
     matched_skills = match_skills(user_message)
-    skill_context = get_skill_context(matched_skills)
-    if skill_context:
-        system_prompt += "\n\n---\n\n" + skill_context
-
-    # Only pre-approve AUTO-tier tools. CONFIRM/BLOCKED-tier tools remain
-    # available (built-in + MCP) but require permission — which fires the
-    # can_use_tool callback for our approval system and tool logging.
-    disabled_tools = set(getattr(config, "DISABLED_TOOL_NAMES", set()))
-    auto_tools = sorted(t for t in config.ACTION_TIERS["AUTO"] if t not in disabled_tools)
-
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        model=config.CLAUDE_MODEL,
-        allowed_tools=auto_tools,
-        agents=_build_agents(),
-        hooks={
-            "SubagentStart": [HookMatcher(hooks=[_on_subagent_start])],
-            "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],
-        },
-        mcp_servers=_load_mcp_servers(),
-        cwd=str(config.WORKSPACE),
-        # Always set can_use_tool so the SDK uses the stdio control protocol
-        # (no interactive terminal prompts). Approval manager is optional —
-        # without it, CONFIRM-tier tools are denied gracefully.
-        can_use_tool=make_tool_checker(
-            approval_manager, molly_instance, chat_id,
-        ),
+    skill_context = get_skill_context(matched_skills) or ""
+    response_guidance = _response_guidance_for_source(source)
+    turn_prompt = _build_turn_prompt(
+        user_message=user_message,
+        memory_context=memory_context,
+        skill_context=skill_context,
+        chat_context=chat_context,
+        response_guidance=response_guidance,
     )
-    if session_id:
-        options.resume = session_id
 
     response_text = ""
     new_session_id = None
+    request_state = RequestApprovalState()
 
-    try:
-        # Use async iterable prompt instead of string to go through stream_input(),
-        # which keeps stdin open for MCP server bidirectional communication.
-        async for message in query(prompt=_prompt_stream(user_message), options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response_text += block.text
-            elif isinstance(message, ResultMessage):
-                new_session_id = message.session_id
-                if message.is_error:
-                    log.error("Claude returned error: %s", message.result)
-    except Exception:
-        log.error("Claude query failed for chat %s", chat_id, exc_info=True)
-        if not response_text:
-            response_text = "Something went wrong on my end. Try again in a moment."
+    async with runtime.lock:
+        runtime.last_used_monotonic = time.monotonic()
+
+        if session_id and session_id != runtime.session_id:
+            runtime.session_id = session_id
+            await _disconnect_runtime(runtime)
+        elif session_id and runtime.session_id is None:
+            runtime.session_id = session_id
+
+        runtime.approval_manager = approval_manager
+        runtime.molly_instance = molly_instance
+        runtime.request_state = request_state
+
+        try:
+            for attempt in range(2):
+                try:
+                    await _ensure_connected_runtime(runtime, chat_id, system_prompt)
+                    response_text, new_session_id = await _query_with_client(runtime, turn_prompt)
+                    break
+                except Exception as exc:
+                    recoverable = _is_recoverable_transport_error(exc)
+                    if recoverable:
+                        log.warning(
+                            "Recoverable Claude transport error in %s (attempt %d/2): %s",
+                            chat_id,
+                            attempt + 1,
+                            exc,
+                        )
+                        await _disconnect_runtime(runtime)
+                        if approval_manager and hasattr(approval_manager, "cancel_pending"):
+                            with suppress(Exception):
+                                approval_manager.cancel_pending(chat_id)
+                        request_state.reset_for_retry()
+                        if attempt == 0:
+                            continue
+
+                    log.error("Claude query failed for chat %s", chat_id, exc_info=True)
+                    if not response_text:
+                        response_text = "Something went wrong on my end. Try again in a moment."
+                    break
+        finally:
+            runtime.request_state = None
+
+        if new_session_id:
+            runtime.session_id = new_session_id
+        else:
+            new_session_id = runtime.session_id
+        runtime.last_used_monotonic = time.monotonic()
+
+    _emit_approval_metrics(request_state)
 
     # Async post-processing: embed + store conversation turn
     if response_text and not response_text.startswith("Something went wrong"):

@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import json
 import logging
-import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -19,6 +19,7 @@ from commands import handle_command
 from database import Database
 from heartbeat import run_heartbeat, should_heartbeat
 from maintenance import run_maintenance, should_run_maintenance
+from self_improve import SelfImprovementEngine
 from whatsapp import WhatsAppClient
 
 # ---------------------------------------------------------------------------
@@ -36,18 +37,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("molly")
 
-DISMISSIVE_FEEDBACK_PATTERNS = [
-    ("not_important", re.compile(r"\bnot important\b", re.IGNORECASE)),
-    ("dont_care", re.compile(r"\b(don't|dont|do not)\s+care\b", re.IGNORECASE)),
-    ("stop_sending", re.compile(r"\bstop sending\b", re.IGNORECASE)),
-    ("who_cares", re.compile(r"\bwho cares\b", re.IGNORECASE)),
-    ("ignore_those", re.compile(r"\bignore those\b", re.IGNORECASE)),
-    ("stop_notifying", re.compile(r"\bstop notifying\b", re.IGNORECASE)),
-    ("dont_need_these", re.compile(r"\b(don't|dont|do not)\s+need\s+these\b", re.IGNORECASE)),
-    ("doesnt_matter", re.compile(r"\b(doesn't|doesnt|does not)\s+matter\b", re.IGNORECASE)),
-    ("not_relevant", re.compile(r"\bnot relevant\b", re.IGNORECASE)),
-    ("skip_those", re.compile(r"\bskip those\b", re.IGNORECASE)),
-]
 SURFACED_SIGNAL_WINDOW_SECONDS = 6 * 60 * 60
 MAX_RECENT_SURFACED_ITEMS = 100
 
@@ -80,11 +69,12 @@ _TOOL_DEPENDENCY_SPECS = [
         ],
     },
     {
-        "server": "apple-contacts",
-        "tools": {"contacts_search", "contacts_get", "contacts_list", "contacts_recent"},
+        "server": "apple-mcp",
+        "tools": {"contacts", "notes", "messages", "mail", "reminders", "calendar", "maps"},
         "requirements": [
             ("claude_agent_sdk", "claude-agent-sdk"),
         ],
+        "commands": ["bunx"],
     },
     {
         "server": "imessage",
@@ -249,17 +239,29 @@ def ensure_tool_dependencies():
 
     for spec in _TOOL_DEPENDENCY_SPECS:
         missing_packages: set[str] = set()
-        for module_name, package_name in spec["requirements"]:
+        missing_commands: set[str] = set()
+
+        for module_name, package_name in spec.get("requirements", []):
             try:
                 importlib.import_module(module_name)
             except Exception:
                 missing_packages.add(package_name)
 
-        if missing_packages:
+        for command_name in spec.get("commands", []):
+            if shutil.which(command_name) is None:
+                missing_commands.add(command_name)
+
+        if missing_packages or missing_commands:
             for package_name in sorted(missing_packages):
                 log.warning(
                     "Missing dependency package '%s'; disabling MCP server '%s'.",
                     package_name,
+                    spec["server"],
+                )
+            for command_name in sorted(missing_commands):
+                log.warning(
+                    "Missing command '%s'; disabling MCP server '%s'.",
+                    command_name,
                     spec["server"],
                 )
             disabled_servers.add(spec["server"])
@@ -283,6 +285,14 @@ def preflight_checks():
     ensure_triage_model()
     ensure_tool_dependencies()
     ensure_google_auth()
+    try:
+        from health import get_health_doctor
+
+        doctor = get_health_doctor()
+        doctor.run_abbreviated_preflight()
+        log.info("Health preflight: completed")
+    except Exception:
+        log.warning("Health preflight check failed", exc_info=True)
     log.info("Preflight checks passed")
 
 
@@ -323,7 +333,10 @@ class Molly:
         self._recent_surfaces: list[dict] = []  # recent surfaced notifications for feedback linking
         self.approvals = ApprovalManager()
         self.automations = AutomationEngine(self)
+        self.self_improvement = SelfImprovementEngine(self)
         self._automation_tick_task: asyncio.Task | None = None
+        self._self_improve_tick_task: asyncio.Task | None = None
+        self.exit_code = 0
 
     # --- State persistence ---
 
@@ -393,14 +406,22 @@ class Molly:
         if self.loop:
             self.loop.call_soon_threadsafe(self.queue.put_nowait, msg_data)
 
-    def _track_send(self, msg_id: str | None):
-        """Record a message ID that Molly sent so we skip it on echo."""
-        if msg_id:
-            now = time.time()
-            self._sent_ids[msg_id] = now
-            # Prune entries older than 5 minutes
-            cutoff = now - 300
-            self._sent_ids = {k: v for k, v in self._sent_ids.items() if v > cutoff}
+    def _track_send(self, msg_id: str | list[str] | None):
+        """Record message IDs Molly sent so we skip them on echo."""
+        if not msg_id:
+            return
+
+        msg_ids = [msg_id] if isinstance(msg_id, str) else [m for m in msg_id if m]
+        if not msg_ids:
+            return
+
+        now = time.time()
+        for mid in msg_ids:
+            self._sent_ids[mid] = now
+
+        # Prune entries older than 5 minutes
+        cutoff = now - 300
+        self._sent_ids = {k: v for k, v in self._sent_ids.items() if v > cutoff}
 
     @staticmethod
     def _normalize_signal_source(source: str) -> str:
@@ -457,16 +478,42 @@ class Molly:
                 sender_pattern=sender_pattern,
             )
 
-    @staticmethod
-    def _dismissive_feedback_match(text: str) -> str | None:
-        for label, pattern in DISMISSIVE_FEEDBACK_PATTERNS:
-            if pattern.search(text):
-                return label
-        return None
+    def _get_group_participant_names(self, chat_jid: str) -> list[str]:
+        names: list[str] = []
+        cached_members = self.registered_chats.get(chat_jid, {}).get("members", [])
+        for member in cached_members:
+            name = (member.get("name", "") or "").strip()
+            if name:
+                names.append(name)
 
-    def _log_preference_signal_if_dismissive(self, chat_jid: str, owner_feedback: str):
-        pattern = self._dismissive_feedback_match(owner_feedback.strip().lower())
-        if not pattern:
+        deduped = list(dict.fromkeys(names))
+        return deduped
+
+    def build_agent_chat_context(self, chat_jid: str, is_group: bool) -> str | None:
+        """Return extra prompt context for group chats."""
+        if not is_group:
+            return None
+
+        participants = self._get_group_participant_names(chat_jid)
+        participant_names = ", ".join(participants[:20]) if participants else "group participants"
+        return (
+            f"You are responding in a group chat with [{participant_names}]. "
+            "Reply here directly — do not attempt to message individuals separately."
+        )
+
+    async def _log_preference_signal_if_dismissive(self, chat_jid: str, owner_feedback: str):
+        feedback = owner_feedback.strip()
+        if not feedback:
+            return
+
+        from memory.triage import classify_local_async
+
+        prompt = (
+            "The user just received a proactive notification and replied with: "
+            "'{reply}'. Is this dismissive feedback? Respond YES or NO."
+        )
+        result = await classify_local_async(prompt, feedback)
+        if not result.strip().upper().startswith("YES"):
             return
 
         now_ts = time.time()
@@ -482,7 +529,7 @@ class Molly:
             return
 
         sender_pattern = surfaced.get("sender_pattern", "")
-        feedback_pattern = f"feedback_pattern:{pattern}"
+        feedback_pattern = "feedback_pattern:dismissive"
         if sender_pattern:
             sender_pattern = f"{sender_pattern} | {feedback_pattern}"
         else:
@@ -495,10 +542,10 @@ class Molly:
                 source=surfaced.get("source", "calendar"),
                 surfaced_summary=surfaced.get("summary", ""),
                 sender_pattern=sender_pattern,
-                owner_feedback=owner_feedback.strip(),
+                owner_feedback=feedback,
             )
             surfaced["logged"] = True
-            log.info("Logged preference signal from owner feedback (%s)", pattern)
+            log.info("Logged preference signal from owner feedback (dismissive)")
         except Exception:
             log.debug("Failed to log preference signal", exc_info=True)
 
@@ -559,7 +606,11 @@ class Molly:
             return
 
         # Passive data collection only: log dismissive feedback to surfaced items
-        self._log_preference_signal_if_dismissive(chat_jid, content)
+        dismissive_task = asyncio.create_task(
+            self._log_preference_signal_if_dismissive(chat_jid, content),
+            name=f"dismissive-feedback:{chat_jid[:20]}",
+        )
+        dismissive_task.add_done_callback(_task_done_callback)
 
         # Check for @Molly trigger
         has_trigger = config.TRIGGER_PATTERN.search(content)
@@ -609,11 +660,16 @@ class Molly:
 
         try:
             session_id = self.sessions.get(chat_jid)
+            chat_context = self.build_agent_chat_context(
+                chat_jid,
+                bool(msg_data.get("is_group")),
+            )
             response, new_session_id = await handle_message(
                 clean_content, chat_jid, session_id,
                 approval_manager=self.approvals,
                 molly_instance=self,
                 source="whatsapp",
+                chat_context=chat_context,
             )
 
             if new_session_id:
@@ -767,11 +823,16 @@ class Molly:
         if approved:
             self.wa.send_typing(chat_jid)
             try:
+                chat_context = self.build_agent_chat_context(
+                    chat_jid,
+                    chat_jid.endswith("@g.us"),
+                )
                 response, new_session_id = await handle_message(
                     f"Approved. Proceed with: {description}",
                     chat_jid,
                     session_id,
                     source="whatsapp",
+                    chat_context=chat_context,
                 )
                 if new_session_id:
                     self.sessions[chat_jid] = new_session_id
@@ -835,6 +896,18 @@ class Molly:
         log.info("Molly is starting up. Waiting for WhatsApp connection...")
         log.info("Scan the QR code with your phone to pair.")
 
+        await self.self_improvement.initialize()
+
+        if not self.running:
+            self.db.close()
+            try:
+                from memory.graph import close as close_graph
+                close_graph()
+            except Exception:
+                pass
+            log.info("Molly shutdown requested during startup.")
+            return self.exit_code
+
         # Start web UI server (Phase 4)
         try:
             import uvicorn
@@ -890,6 +963,15 @@ class Molly:
                             name="automations-tick",
                         )
                         self._automation_tick_task.add_done_callback(_task_done_callback)
+                    if (
+                        self._self_improve_tick_task is None
+                        or self._self_improve_tick_task.done()
+                    ):
+                        self._self_improve_tick_task = asyncio.create_task(
+                            self.self_improvement.tick(),
+                            name="self-improvement-tick",
+                        )
+                        self._self_improve_tick_task.add_done_callback(_task_done_callback)
                     if should_heartbeat(self.last_heartbeat):
                         self.last_heartbeat = datetime.now()
                         task = asyncio.create_task(
@@ -921,9 +1003,19 @@ class Molly:
         except Exception:
             pass
         log.info("Molly shut down.")
+        return self.exit_code
 
     def shutdown(self, *_args):
         log.info("Shutdown signal received...")
+        self.running = False
+
+    def request_restart(self, reason: str = ""):
+        reason_text = reason.strip()
+        if reason_text:
+            log.info("Restart requested: %s", reason_text)
+        else:
+            log.info("Restart requested")
+        self.exit_code = config.MOLLY_RESTART_EXIT_CODE
         self.running = False
 
 
@@ -939,10 +1031,14 @@ def main():
     signal.signal(signal.SIGINT, molly.shutdown)
     signal.signal(signal.SIGTERM, molly.shutdown)
 
+    exit_code = 0
     try:
-        asyncio.run(molly.run())
+        exit_code = asyncio.run(molly.run()) or 0
     except KeyboardInterrupt:
         log.info("Interrupted.")
+        exit_code = 130
+
+    sys.exit(int(exit_code))
 
 
 if __name__ == "__main__":

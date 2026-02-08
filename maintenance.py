@@ -463,6 +463,7 @@ async def run_maintenance(molly=None):
     log.info("Starting nightly maintenance for %s", today)
 
     results: dict[str, str] = {}
+    improver = None
 
     # Step 1: Programmatic health check
     try:
@@ -499,6 +500,24 @@ async def run_maintenance(molly=None):
     except Exception:
         log.error("Orphan cleanup failed", exc_info=True)
         results["Orphan cleanup"] = "failed"
+
+    # Step 4b: Phase 7 memory optimization loop
+    try:
+        from self_improve import SelfImprovementEngine
+
+        improver = getattr(molly, "self_improvement", None) if molly else None
+        if improver is None:
+            improver = SelfImprovementEngine(molly=molly)
+            await improver.initialize()
+        mem_opt = await improver.run_memory_optimization()
+        results["Memory optimization"] = (
+            f"consolidated={mem_opt.get('entity_consolidations', 0)}, "
+            f"stale={mem_opt.get('stale_entities', 0)}, "
+            f"contradictions={mem_opt.get('contradictions', 0)}"
+        )
+    except Exception:
+        log.error("Memory optimization failed", exc_info=True)
+        results["Memory optimization"] = "failed"
 
     # Step 5: Prune stale daily logs
     try:
@@ -548,7 +567,46 @@ async def run_maintenance(molly=None):
     except Exception:
         log.error("Opus analysis pass failed", exc_info=True)
 
-    # Step 8: Send brief summary to owner DM
+    # Step 8: GLiNER training accumulation + conditional fine-tune trigger
+    try:
+        if improver is None:
+            from self_improve import SelfImprovementEngine
+
+            improver = getattr(molly, "self_improvement", None) if molly else None
+            if improver is None:
+                improver = SelfImprovementEngine(molly=molly)
+                await improver.initialize()
+
+        gliner_cycle = await improver.run_gliner_nightly_cycle()
+        loop_status = str(gliner_cycle.get("status", "unknown"))
+        if loop_status in {"insufficient_examples", "cooldown_active"}:
+            results["GLiNER loop"] = str(gliner_cycle.get("message", loop_status))
+        else:
+            pipeline = gliner_cycle.get("pipeline", {}) if isinstance(gliner_cycle, dict) else {}
+            pipeline_status = str(pipeline.get("status", loop_status))
+            if pipeline_status == "deployed":
+                improvement = float(pipeline.get("benchmark", {}).get("improvement", 0.0) or 0.0)
+                results["GLiNER loop"] = f"deployed ({improvement:+.2%} F1)"
+            elif pipeline_status:
+                results["GLiNER loop"] = pipeline_status
+            else:
+                results["GLiNER loop"] = loop_status
+    except Exception:
+        log.error("GLiNER closed-loop run failed", exc_info=True)
+        results["GLiNER loop"] = "failed"
+
+    # Step 9: Health Doctor daily run (after maintenance completes)
+    try:
+        from health import get_health_doctor
+
+        doctor = get_health_doctor(molly=molly)
+        doctor.run_daily()
+        results["Health Doctor"] = "completed"
+    except Exception:
+        log.error("Health Doctor run failed", exc_info=True)
+        results["Health Doctor"] = "failed"
+
+    # Step 10: Send brief summary to owner DM
     if molly and molly.wa:
         try:
             owner_jid = molly._get_owner_dm_jid()

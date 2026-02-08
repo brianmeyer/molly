@@ -93,6 +93,18 @@ class VectorStore:
                 timestamp TEXT,
                 created_at TEXT
             );
+
+            -- Phase 7: self-improvement proposals + deployments + assessments
+            CREATE TABLE IF NOT EXISTS self_improvement_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                payload TEXT,
+                status TEXT DEFAULT 'proposed',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         self._ensure_preference_signal_columns()
 
@@ -283,6 +295,96 @@ class VectorStore:
     def chunk_count(self) -> int:
         cursor = self.conn.execute("SELECT COUNT(*) FROM conversation_chunks")
         return cursor.fetchone()[0]
+
+    def log_skill_execution(
+        self,
+        skill_name: str,
+        trigger: str,
+        outcome: str,
+        user_approval: str = "",
+        edits_made: str = "",
+    ):
+        execution_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO skill_executions
+               (id, skill_name, trigger, outcome, user_approval, edits_made, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                execution_id,
+                skill_name[:200],
+                trigger[:500],
+                outcome[:1000],
+                user_approval[:200],
+                edits_made[:1000],
+                now,
+            ),
+        )
+        self.conn.commit()
+
+    def log_correction(
+        self,
+        context: str,
+        molly_output: str,
+        user_correction: str,
+        pattern: str = "",
+    ):
+        correction_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO corrections
+               (id, context, molly_output, user_correction, pattern, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                correction_id,
+                context[:2000],
+                molly_output[:2000],
+                user_correction[:2000],
+                pattern[:200],
+                now,
+            ),
+        )
+        self.conn.commit()
+
+    def log_self_improvement_event(
+        self,
+        event_type: str,
+        category: str,
+        title: str,
+        payload: str = "",
+        status: str = "proposed",
+    ) -> str:
+        event_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO self_improvement_events
+               (id, event_type, category, title, payload, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event_id,
+                event_type[:64],
+                category[:64],
+                title[:200],
+                payload[:10000],
+                status[:32],
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return event_id
+
+    def update_self_improvement_event_status(
+        self,
+        event_id: str,
+        status: str,
+    ):
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "UPDATE self_improvement_events SET status = ?, updated_at = ? WHERE id = ?",
+            (status[:32], now, event_id),
+        )
+        self.conn.commit()
 
     def close(self):
         if self.conn:

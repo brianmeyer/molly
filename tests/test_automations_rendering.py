@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
-PROJECT_ROOT = Path("/Users/brianmeyer/molly")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -45,6 +45,22 @@ class TestAutomationRenderString(unittest.TestCase):
         text = "Keep {unknown.var} {not_defined} raw JSON {\"a\":1} and lone { brace"
         rendered = self.engine._render_string(text, self.outputs, self.run_context)
         self.assertEqual(rendered, text)
+
+
+class TestEmailTriageActionability(unittest.TestCase):
+    def setUp(self):
+        self.engine = AutomationEngine(molly=None)
+
+    def test_sentinel_marks_no_actionable_items(self):
+        self.assertFalse(self.engine._email_triage_has_actionable_items("NO_ACTIONABLE_ITEMS"))
+
+    def test_json_payload_without_urgent_or_important_is_not_actionable(self):
+        payload = '{"urgent":[],"important":[],"fyi":[{"subject":"receipt"}]}'
+        self.assertFalse(self.engine._email_triage_has_actionable_items(payload))
+
+    def test_json_payload_with_important_item_is_actionable(self):
+        payload = '{"urgent":[],"important":[{"subject":"Quarterly close deadline"}]}'
+        self.assertTrue(self.engine._email_triage_has_actionable_items(payload))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import config
@@ -188,9 +190,91 @@ class EventTrigger(BaseTrigger):
 
 
 class EmailTrigger(BaseTrigger):
+    _MAX_SEEN_IDS = 500
+    _MAX_HIGH_WATER_IDS = 50
+
     def __init__(self, cfg: dict):
         super().__init__(cfg)
         self._seen_ids: set[str] = set()
+        self._automation_id = str(self.cfg.get("_automation_id", "")).strip()
+        state_path = str(self.cfg.get("_state_path", "")).strip()
+        self._state_path = Path(state_path) if state_path else config.AUTOMATIONS_STATE_FILE
+
+    def _load_high_water(self) -> tuple[int, set[str]]:
+        """Load persisted high-water state for this email automation."""
+        if not self._automation_id or not self._state_path.exists():
+            return 0, set()
+
+        try:
+            raw = json.loads(self._state_path.read_text())
+            automations = raw.get("automations", {})
+            automation_state = automations.get(self._automation_id, {})
+            trigger_state = automation_state.get("trigger_state", {})
+            email_state = trigger_state.get("email", {})
+        except Exception:
+            log.debug(
+                "EmailTrigger could not load state from %s",
+                self._state_path,
+                exc_info=True,
+            )
+            return 0, set()
+
+        try:
+            high_water_ts_ms = int(email_state.get("high_water_internal_ts_ms", 0))
+        except Exception:
+            high_water_ts_ms = 0
+        if high_water_ts_ms < 0:
+            high_water_ts_ms = 0
+
+        high_water_ids: set[str] = set()
+        raw_ids = email_state.get("high_water_ids", [])
+        if isinstance(raw_ids, list):
+            for value in raw_ids:
+                msg_id = str(value).strip()
+                if msg_id:
+                    high_water_ids.add(msg_id)
+        legacy_id = str(email_state.get("high_water_message_id", "")).strip()
+        if legacy_id:
+            high_water_ids.add(legacy_id)
+
+        return high_water_ts_ms, high_water_ids
+
+    def _build_query(self, base_query: str, high_water_ts_ms: int) -> str:
+        query = (base_query or "").strip()
+        if high_water_ts_ms <= 0:
+            return query
+
+        # Replace relative-time filters with a strict high-water boundary.
+        query = re.sub(r"(?i)\b(?:after|newer_than|older_than):\S+\b", "", query)
+        query = re.sub(r"\s+", " ", query).strip()
+
+        # Gmail "after:" is second-granular; include one-second overlap and
+        # filter exact duplicates client-side via (timestamp,id).
+        after_s = max(0, (high_water_ts_ms // 1000) - 1)
+        if query:
+            return f"{query} after:{after_s}"
+        return f"after:{after_s}"
+
+    @staticmethod
+    def _is_newer_than_high_water(message: dict, high_water_ts_ms: int, high_water_ids: set[str]) -> bool:
+        msg_id = str(message.get("id", "")).strip()
+        if not msg_id:
+            return False
+
+        try:
+            internal_ts_ms = int(message.get("internal_ts_ms", 0))
+        except Exception:
+            internal_ts_ms = 0
+
+        if high_water_ts_ms <= 0:
+            return msg_id not in high_water_ids
+        if internal_ts_ms <= 0:
+            return msg_id not in high_water_ids
+        if internal_ts_ms > high_water_ts_ms:
+            return True
+        if internal_ts_ms == high_water_ts_ms and msg_id not in high_water_ids:
+            return True
+        return False
 
     async def _search_emails(self, query: str, max_results: int) -> list[dict]:
         from tools.google_auth import get_gmail_service
@@ -221,6 +305,10 @@ class EmailTrigger(BaseTrigger):
                     h["name"].lower(): h["value"]
                     for h in msg.get("payload", {}).get("headers", [])
                 }
+                try:
+                    internal_ts_ms = int(msg.get("internalDate", 0))
+                except Exception:
+                    internal_ts_ms = 0
                 details.append(
                     {
                         "id": msg.get("id", ""),
@@ -228,6 +316,7 @@ class EmailTrigger(BaseTrigger):
                         "subject": headers.get("subject", ""),
                         "date": headers.get("date", ""),
                         "snippet": msg.get("snippet", ""),
+                        "internal_ts_ms": internal_ts_ms,
                     }
                 )
             return details
@@ -246,6 +335,9 @@ class EmailTrigger(BaseTrigger):
             if from_domain:
                 query = f"from:{from_domain} {query}"
 
+        high_water_ts_ms, high_water_ids = self._load_high_water()
+        query = self._build_query(query, high_water_ts_ms)
+
         try:
             messages = await self._search_emails(query, max_results=max_results)
         except Exception:
@@ -257,16 +349,51 @@ class EmailTrigger(BaseTrigger):
             msg_id = msg.get("id", "")
             if not msg_id or msg_id in self._seen_ids:
                 continue
+            if not self._is_newer_than_high_water(msg, high_water_ts_ms, high_water_ids):
+                continue
             new_messages.append(msg)
             self._seen_ids.add(msg_id)
 
-        if len(self._seen_ids) > 500:
-            self._seen_ids = set(list(self._seen_ids)[-500:])
+        if len(self._seen_ids) > self._MAX_SEEN_IDS and new_messages:
+            self._seen_ids = {
+                str(msg.get("id", "")).strip()
+                for msg in new_messages[-self._MAX_SEEN_IDS:]
+                if str(msg.get("id", "")).strip()
+            }
 
         if not new_messages:
             return False
 
-        self.last_payload = {"messages": new_messages, "message": new_messages[0], "query": query}
+        latest_ts_ms = 0
+        latest_ids: list[str] = []
+        for msg in new_messages:
+            msg_id = str(msg.get("id", "")).strip()
+            if not msg_id:
+                continue
+            try:
+                ts_ms = int(msg.get("internal_ts_ms", 0))
+            except Exception:
+                ts_ms = 0
+            if ts_ms > latest_ts_ms:
+                latest_ts_ms = ts_ms
+                latest_ids = [msg_id]
+            elif ts_ms == latest_ts_ms:
+                latest_ids.append(msg_id)
+
+        latest_ids = list(dict.fromkeys([msg_id for msg_id in latest_ids if msg_id]))
+        latest_ids = latest_ids[-self._MAX_HIGH_WATER_IDS:]
+        fallback_id = str(new_messages[0].get("id", "")).strip() if new_messages else ""
+
+        self.last_payload = {
+            "messages": new_messages,
+            "message": new_messages[0],
+            "query": query,
+            "_email_trigger_state": {
+                "high_water_internal_ts_ms": latest_ts_ms,
+                "high_water_ids": latest_ids,
+                "high_water_message_id": latest_ids[-1] if latest_ids else fallback_id,
+            },
+        }
         return True
 
     async def next_fire_time(self, context: dict) -> datetime | None:

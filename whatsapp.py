@@ -1,6 +1,8 @@
 import logging
 from typing import Callable
 
+import config
+from formatting import render_for_whatsapp, split_for_whatsapp
 from neonize import NewClient
 from neonize.proto.Neonize_pb2 import Connected, GroupInfo, Message as MessageEv
 from neonize.utils import extract_text
@@ -8,30 +10,18 @@ from neonize.utils.enum import ChatPresence, ChatPresenceMedia
 from neonize.utils.jid import Jid2String, build_jid
 
 log = logging.getLogger(__name__)
+SendResult = str | list[str] | None
 
 
 def _resolve_sender_name(sender_jid: str, pushname: str) -> str:
-    """Resolve a sender's name using Apple Contacts → pushname → phone fallback.
-
-    Called from the neonize message handler thread. Results are cached
-    in-memory by the contacts module.
-    """
+    """Resolve a sender name using pushname → phone fallback."""
     phone = sender_jid.split("@")[0]
 
-    # Try Apple Contacts first
-    try:
-        from tools.contacts import resolve_phone_to_name
-        contact_name = resolve_phone_to_name(phone)
-        if contact_name:
-            return contact_name
-    except Exception:
-        log.debug("Contact resolution unavailable", exc_info=True)
-
-    # Fall back to WhatsApp pushname
+    # Prefer WhatsApp pushname when available.
     if pushname:
         return pushname
 
-    # Final fallback: raw phone number
+    # Final fallback: raw phone number.
     return phone
 
 
@@ -43,9 +33,15 @@ class WhatsAppClient:
     caller is responsible for thread-safe bridging (e.g. asyncio.Queue).
     """
 
-    def __init__(self, auth_dir, message_callback: Callable | None = None):
+    def __init__(
+        self,
+        auth_dir,
+        message_callback: Callable | None = None,
+        non_whatsapp_sender: Callable[[str, str], str | None] | None = None,
+    ):
         self.client = NewClient(str(auth_dir / "molly.db"))
         self._message_callback = message_callback
+        self._non_whatsapp_sender = non_whatsapp_sender
         self.connected = False
         self._setup_events()
 
@@ -83,7 +79,7 @@ class WhatsAppClient:
         if not content:
             return
 
-        # Resolve sender name: Apple Contacts → pushname → phone number
+        # Resolve sender name: pushname → phone number
         sender_name = _resolve_sender_name(sender_jid, pushname)
 
         log.debug(
@@ -110,17 +106,78 @@ class WhatsAppClient:
     # --- Outbound ---
 
     @staticmethod
+    def _is_whatsapp_jid(jid_str: str) -> bool:
+        return isinstance(jid_str, str) and "@" in jid_str
+
+    @staticmethod
     def _parse_jid(jid_str: str):
         """Convert 'user@server' string back to a neonize JID protobuf."""
+        if not WhatsAppClient._is_whatsapp_jid(jid_str):
+            return None
         parts = jid_str.split("@", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
         return build_jid(parts[0], parts[1])
 
-    def send_message(self, chat_jid: str, text: str) -> str | None:
-        """Send a text message. Returns the message ID so callers can track it."""
+    def _route_non_whatsapp_message(self, chat_jid: str, text: str) -> str | None:
+        if not self._non_whatsapp_sender:
+            return None
+        try:
+            return self._non_whatsapp_sender(chat_jid, text)
+        except Exception:
+            log.error("Non-WhatsApp send failed for %s", chat_jid, exc_info=True)
+            return None
+
+    def _prepare_outbound_chunks(self, text: str) -> list[str]:
+        content = text or ""
+        if config.WHATSAPP_PLAIN_RENDER:
+            content = render_for_whatsapp(content)
+        content = content.strip()
+        if not content:
+            return []
+
+        if not config.WHATSAPP_CHUNKING_ENABLED:
+            chunks = [content]
+        else:
+            chunks = split_for_whatsapp(content, max_chars=config.WHATSAPP_CHUNK_CHARS)
+        if not chunks:
+            return []
+
+        # Preserve legacy signature while avoiding clutter on every chunk.
+        chunks[-1] = f"{chunks[-1]}\n\n-MollyAI"
+        return chunks
+
+    def send_message(self, chat_jid: str, text: str) -> SendResult:
+        """Send a text message. Returns one or many message IDs for send tracking."""
+        if chat_jid.startswith("web:"):
+            routed = self._route_non_whatsapp_message(chat_jid, text)
+            if routed is not None:
+                return routed
+            log.warning("No Web UI transport for %s; skipping WhatsApp send", chat_jid)
+            return None
+
         try:
             jid = self._parse_jid(chat_jid)
-            resp = self.client.send_message(jid, f"{text}\n\n-MollyAI")
-            return resp.ID if resp else None
+            if jid is None:
+                log.warning("Skipping send to non-WhatsApp target: %s", chat_jid)
+                return None
+
+            chunks = self._prepare_outbound_chunks(text)
+            if not chunks:
+                log.warning("Skipping empty outbound message to %s", chat_jid)
+                return None
+
+            msg_ids: list[str] = []
+            for chunk in chunks:
+                resp = self.client.send_message(jid, chunk)
+                if resp and resp.ID:
+                    msg_ids.append(resp.ID)
+
+            if not msg_ids:
+                return None
+            if len(msg_ids) == 1:
+                return msg_ids[0]
+            return msg_ids
         except Exception:
             log.error("Failed to send message to %s", chat_jid, exc_info=True)
             return None
@@ -128,6 +185,8 @@ class WhatsAppClient:
     def send_typing(self, chat_jid: str):
         try:
             jid = self._parse_jid(chat_jid)
+            if jid is None:
+                return
             self.client.send_chat_presence(
                 jid,
                 ChatPresence.CHAT_PRESENCE_COMPOSING,
@@ -139,6 +198,8 @@ class WhatsAppClient:
     def send_typing_stopped(self, chat_jid: str):
         try:
             jid = self._parse_jid(chat_jid)
+            if jid is None:
+                return
             self.client.send_chat_presence(
                 jid,
                 ChatPresence.CHAT_PRESENCE_PAUSED,
@@ -154,6 +215,8 @@ class WhatsAppClient:
         """
         try:
             jid = self._parse_jid(group_jid)
+            if jid is None:
+                return None
             info: GroupInfo = self.client.get_group_info(jid)
 
             participants = []

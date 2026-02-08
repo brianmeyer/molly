@@ -32,6 +32,8 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Qwen3-4B GGUF (`llama-cpp-python`) | Local triage model for message classification |
 | Kimi K2.5 (Moonshot) | External research model via MCP tool |
 | Grok (xAI) | External reasoning model via MCP tool |
+| Health Doctor (`health.py`) | Daily/preflight health reports with regression checks |
+| Self-Improvement Engine (`self_improve.py`) | Guarded self-edit loop (branch, tests, approval, rollback/restart) |
 
 ## Project Structure
 
@@ -40,6 +42,9 @@ molly/
 ├── main.py              # Entry point, async lifecycle, preflight checks
 ├── config.py            # All settings, paths, constants
 ├── whatsapp.py          # Neonize client wrapper
+├── formatting.py        # WhatsApp-safe markdown rendering + chunking
+├── health.py            # Health Doctor checks + report generation
+├── self_improve.py      # Self-improvement engine (guarded self-edit loop)
 ├── web.py               # FastAPI web UI backend (WebSocket chat)
 ├── terminal.py          # Standalone CLI REPL for debugging
 ├── database.py          # SQLite message store
@@ -51,20 +56,22 @@ molly/
 ├── automation_triggers.py # Trigger types (schedule, event, email, message, etc.)
 ├── maintenance.py       # Nightly maintenance (direct Python, no SDK tools)
 ├── skills.py            # Dynamic skill trigger matching + loading
+├── scripts/
+│   └── run_molly.sh     # Supervisor loop with restart-on-exit-code support
 ├── web/
 │   └── index.html       # Chat UI (single-page, no framework)
 ├── tools/
 │   ├── google_auth.py   # Google OAuth token management
 │   ├── calendar.py      # Google Calendar MCP tools
 │   ├── gmail.py         # Gmail MCP tools
-│   ├── contacts.py      # Apple Contacts MCP tools
 │   ├── imessage.py      # iMessage MCP tools
+│   ├── reminders.py     # Apple Reminders MCP tools
 │   ├── whatsapp.py      # WhatsApp message search MCP tool
 │   ├── kimi.py          # Kimi K2.5 research MCP tool (Moonshot API)
 │   └── grok.py          # Grok reasoning MCP tool (xAI API)
 └── memory/
     ├── embeddings.py    # EmbeddingGemma-300M wrapper
-    ├── vectorstore.py   # sqlite-vec backed vector store
+    ├── vectorstore.py   # sqlite-vec backed vector store + preference/self-improve logs
     ├── retriever.py     # Pre-query: semantic search + graph lookup
     ├── processor.py     # Post-response: embed, extract, store
     ├── extractor.py     # GLiNER2 entity/relation/classification
@@ -130,6 +137,16 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 **Pipeline steps** route through `handle_message()` → Claude Agent SDK, inheriting the full sub-agent and approval system.
 
+## Recent Updates (February 2026)
+
+- Added guarded self-improvement workflows in `self_improve.py`: proposal drafting, branch/test gates, owner approval, deploy restart, and post-deploy rollback checks.
+- Added Health Doctor in `health.py` with startup preflight snapshots, daily reports, and green→red regression detection.
+- Added WhatsApp output hardening via `formatting.py` plus message chunking and JID guards in `whatsapp.py`.
+- Expanded commitment automation to sync with Apple Reminders and exposed commitment/reminder status via `/followups`.
+- Added automation proposal mining from repeated tool traces and improved email-trigger high-water deduplication.
+- Improved approval runtime behavior with request-scoped coalescing and owner-routed approvals for non-WhatsApp channels.
+- Added `scripts/run_molly.sh` supervisor for restart-safe runtime operation.
+
 ## Preference Signals
 
 Passive feedback logging for future learning loops. When the owner dismisses a surfaced notification (e.g., "not important", "who cares", "stop sending"), the dismissal is logged with the source, summary, and sender pattern. Nothing acts on these signals yet — Phase 7 will close the loop.
@@ -152,21 +169,37 @@ Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parse
 /skill <name>         Show skill details
 /digest               Trigger daily digest manually
 /register             Register current chat for responses
+/register listen      Register current chat for listen-only monitoring
 /unregister           Unregister current chat
 /groups               List registered chats
 /pending              Show pending approvals
 /automations          List automations and their status
+/followups            Show commitment tracker + Apple Reminders status
+/commitments          Alias for /followups
+/health               Show latest health report (or generate one)
+/health history       Show 7-day health trend
 ```
 
 ## Running
 
 ```bash
 cd ~/molly
+./scripts/run_molly.sh
+```
+
+`scripts/run_molly.sh` supervises Molly and restarts automatically when she exits with
+`MOLLY_RESTART_EXIT_CODE` (default `42`). This is used for self-edit deploy reloads and
+rollback-restart recovery.
+
+Preflight checks verify Docker, Neo4j, the local triage GGUF model, and Google OAuth are
+ready before startup. WhatsApp reconnects automatically after initial QR pairing. Web UI
+starts on port 8080.
+
+For a single direct run (no supervisor loop):
+```bash
 source .venv/bin/activate
 python main.py
 ```
-
-Preflight checks verify Docker, Neo4j, the local triage GGUF model, and Google OAuth are ready before startup. WhatsApp reconnects automatically after initial QR pairing. Web UI starts on port 8080.
 
 For terminal-only debugging (no WhatsApp/web):
 ```bash
@@ -199,10 +232,10 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - [x] Phase 0: Prerequisites
 - [x] Phase 1: Core platform (WhatsApp + Claude Agent SDK)
 - [x] Phase 2: Three-layer memory (semantic search + knowledge graph + nightly maintenance)
-- [x] Phase 3: Tools + skills (Calendar, Gmail, Contacts, iMessage, Skills)
+- [x] Phase 3: Tools + skills (Calendar, Gmail, iMessage, Skills)
 - [x] Phase 4: Multi-channel (Web UI, Terminal REPL, Email monitoring)
 - [x] Phase 5: Sub-agents, model routing, audit hardening
 - [x] Phase 6: Proactive automation engine, preference signal logging, Grok x_search
-- [ ] Phase 7: Learning loops (act on preference signals, pattern detection)
+- [ ] Phase 7: Learning loops (in progress: preference signals, health doctor, automation proposal mining)
 - [ ] Phase 8: Collaboration
-- [ ] Phase 9: Self-improvement
+- [ ] Phase 9: Self-improvement (in progress: guarded self-edit + restart/rollback path)

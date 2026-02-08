@@ -40,7 +40,8 @@ TRIGGER_PATTERN = re.compile(rf"(?:^|\s)@{ASSISTANT_NAME}\b", re.IGNORECASE)
 COMMANDS = {
     "/help", "/clear", "/memory", "/graph", "/forget",
     "/status", "/pending", "/register", "/unregister", "/groups",
-    "/skills", "/skill", "/digest", "/automations",
+    "/skills", "/skill", "/digest", "/automations", "/followups",
+    "/commitments", "/health",
 }
 
 # Chat processing modes (tiered classification)
@@ -60,6 +61,12 @@ OWNER_IDS = set(filter(None, os.getenv("OWNER_IDS", "").split(",")))
 WEB_HOST = os.getenv("MOLLY_WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.getenv("MOLLY_WEB_PORT", "8080"))
 WEB_AUTH_TOKEN = os.getenv("MOLLY_WEB_TOKEN", "")  # simple bearer token
+
+# WhatsApp outbound rendering
+WHATSAPP_PLAIN_RENDER = _env_bool("MOLLY_WHATSAPP_PLAIN_RENDER", True)
+WHATSAPP_PROMPT_GUARDRAILS = _env_bool("MOLLY_WHATSAPP_PROMPT_GUARDRAILS", True)
+WHATSAPP_CHUNKING_ENABLED = _env_bool("MOLLY_WHATSAPP_CHUNKING_ENABLED", True)
+WHATSAPP_CHUNK_CHARS = int(os.getenv("MOLLY_WHATSAPP_CHUNK_CHARS", "1400"))
 
 # Email monitoring (Phase 4)
 EMAIL_POLL_INTERVAL = 600  # 10 minutes
@@ -89,6 +96,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 WORKSPACE = Path(os.getenv("MOLLY_WORKSPACE", Path.home() / ".molly" / "workspace"))
 LOG_DIR = Path.home() / ".molly" / "logs"
 AUTOMATIONS_DIR = WORKSPACE / "automations"
+SANDBOX_DIR = WORKSPACE / "sandbox"
 
 # Files
 DATABASE_PATH = STORE_DIR / "messages.db"
@@ -109,6 +117,43 @@ IDENTITY_FILES = [
 HEARTBEAT_FILE = WORKSPACE / "HEARTBEAT.md"
 SKILLS_DIR = WORKSPACE / "skills"
 
+# Phase 7: Self-improvement
+SELF_EDIT_ENABLED = _env_bool("MOLLY_SELF_EDIT_ENABLED", True)
+SELF_EDIT_MAX_PATCH_LINES = int(os.getenv("MOLLY_SELF_EDIT_MAX_PATCH_LINES", "200"))
+SELF_EDIT_AUTO_ROLLBACK_WINDOW = int(os.getenv("MOLLY_SELF_EDIT_AUTO_ROLLBACK_WINDOW", "300"))
+MOLLY_RESTART_EXIT_CODE = int(os.getenv("MOLLY_RESTART_EXIT_CODE", "42"))
+SELF_EDIT_PROTECTED_FILES = {
+    "approval.py",
+}
+SELF_EDIT_PROTECTED_IDENTITY = {
+    "SOUL.md",
+}
+GLINER_FINETUNE_MIN_EXAMPLES = int(os.getenv("MOLLY_GLINER_FINETUNE_MIN_EXAMPLES", "500"))
+GLINER_FINETUNE_BENCHMARK_THRESHOLD = float(
+    os.getenv("MOLLY_GLINER_FINETUNE_BENCHMARK_THRESHOLD", "0.05")
+)
+GLINER_FULL_FINETUNE_MIN_EXAMPLES = int(
+    os.getenv("MOLLY_GLINER_FULL_FINETUNE_MIN_EXAMPLES", "2000")
+)
+GLINER_LORA_PLATEAU_WINDOW = int(os.getenv("MOLLY_GLINER_LORA_PLATEAU_WINDOW", "3"))
+GLINER_LORA_PLATEAU_EPSILON = float(
+    os.getenv("MOLLY_GLINER_LORA_PLATEAU_EPSILON", "0.01")
+)
+WEEKLY_ASSESSMENT_DAY = os.getenv("MOLLY_WEEKLY_ASSESSMENT_DAY", "sunday").strip().lower()
+WEEKLY_ASSESSMENT_HOUR = int(os.getenv("MOLLY_WEEKLY_ASSESSMENT_HOUR", "3"))
+WEEKLY_ASSESSMENT_DIR = WORKSPACE / "memory" / "weekly"
+TOOL_GAP_MIN_FAILURES = max(1, int(os.getenv("MOLLY_TOOL_GAP_MIN_FAILURES", "5")))
+TOOL_GAP_WINDOW_DAYS = max(1, int(os.getenv("MOLLY_TOOL_GAP_WINDOW_DAYS", "7")))
+
+# Phase 7: Health Doctor
+HEALTH_REPORT_DIR = WORKSPACE / "memory" / "health"
+HEALTH_REPORT_RETENTION_DAYS = int(os.getenv("MOLLY_HEALTH_REPORT_RETENTION_DAYS", "30"))
+HEALTH_YELLOW_ESCALATION_DAYS = int(os.getenv("MOLLY_HEALTH_YELLOW_ESCALATION_DAYS", "3"))
+HEALTH_POST_DEPLOY_CHECK = _env_bool("MOLLY_HEALTH_POST_DEPLOY_CHECK", True)
+HEALTH_PIPELINE_WINDOW_HOURS = int(os.getenv("MOLLY_HEALTH_PIPELINE_WINDOW_HOURS", "24"))
+HEALTH_ENTITY_SAMPLE_SIZE = int(os.getenv("MOLLY_HEALTH_ENTITY_SAMPLE_SIZE", "20"))
+HEALTH_DUPLICATE_THRESHOLD = int(os.getenv("MOLLY_HEALTH_DUPLICATE_THRESHOLD", "3"))
+
 # Approval system — three-tier action classification
 ACTION_TIERS = {
     "AUTO": {
@@ -118,7 +163,7 @@ ACTION_TIERS = {
         "calendar_list", "calendar_get", "calendar_search",
         "gmail_search", "gmail_read",
         # Apple read-only (Phase 3C)
-        "contacts_search", "contacts_get", "contacts_list", "contacts_recent",
+        "contacts",
         "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
         # WhatsApp history (Phase 4)
         "whatsapp_search",
@@ -133,6 +178,8 @@ ACTION_TIERS = {
         # Google writes (Phase 3B)
         "gmail_send", "gmail_draft", "gmail_reply",
         "calendar_create", "calendar_update", "calendar_delete",
+        # Apple MCP tools (mixed read/write operations)
+        "reminders", "notes", "messages", "mail", "calendar", "maps",
     },
     "BLOCKED": {
         "gmail_delete", "account_settings", "credential_access",
