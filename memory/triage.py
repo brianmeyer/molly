@@ -1,28 +1,35 @@
 """Local triage model for intelligent message filtering.
 
-Calls Qwen3-4B via Ollama's chat API to classify group messages
+Runs Qwen3-4B GGUF in-process via llama-cpp-python to classify group messages
 into: urgent, relevant, background, or noise.
-
-Uses Ollama's format=json for reliable structured output.
-Qwen3 thinks internally (separate token stream) then outputs clean JSON.
 """
 
 import json
 import logging
+import os
 import re
-import urllib.request
-import urllib.error
+from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Lock
 
 import config
 
 log = logging.getLogger(__name__)
 
-# Dedicated executor for triage — isolates Ollama HTTP calls from the default
+try:
+    from llama_cpp import Llama
+except Exception:  # pragma: no cover - import failure handled at runtime
+    Llama = None
+
+# Dedicated executor for triage — isolates model calls from the default
 # executor (which Neo4j and other async tasks may share). Single worker ensures
-# sequential model inference (Qwen3 can only run one request at a time anyway).
+# sequential model inference.
 _TRIAGE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="triage")
+
+_TRIAGE_MODEL = None
+_MODEL_LOCK = Lock()
+_MODEL_LOAD_FAILED = False
 
 # Patterns that suggest event-like content worth deeper analysis
 EVENT_PATTERNS = re.compile(
@@ -58,6 +65,57 @@ class TriageResult:
     classification: str  # urgent, relevant, background, noise
     score: float  # 0.0-1.0 relevance
     reason: str  # brief explanation
+
+
+def _load_model() -> object | None:
+    """Load the local GGUF model once and cache it."""
+    global _TRIAGE_MODEL, _MODEL_LOAD_FAILED
+
+    if _TRIAGE_MODEL is not None:
+        return _TRIAGE_MODEL
+    if _MODEL_LOAD_FAILED:
+        return None
+
+    with _MODEL_LOCK:
+        if _TRIAGE_MODEL is not None:
+            return _TRIAGE_MODEL
+        if _MODEL_LOAD_FAILED:
+            return None
+
+        model_path = config.TRIAGE_MODEL_PATH.expanduser()
+
+        if Llama is None:
+            log.warning("llama-cpp-python is not installed — triage unavailable")
+            _MODEL_LOAD_FAILED = True
+            return None
+
+        if not model_path.exists():
+            log.warning("Triage model file not found: %s", model_path)
+            return None
+
+        try:
+            # Keep llama.cpp Metal kernel fallback logs quiet on Apple Silicon.
+            os.environ.setdefault("GGML_METAL_LOG_LEVEL", "0")
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                with redirect_stderr(devnull):
+                    _TRIAGE_MODEL = Llama(
+                        model_path=str(model_path),
+                        n_ctx=config.TRIAGE_N_CTX,
+                        n_threads=config.TRIAGE_N_THREADS,
+                        n_gpu_layers=config.TRIAGE_GPU_LAYERS,
+                        verbose=False,
+                    )
+            log.info("Loaded triage model: %s", model_path)
+            return _TRIAGE_MODEL
+        except Exception:
+            log.error("Failed to load triage model from %s", model_path, exc_info=True)
+            _MODEL_LOAD_FAILED = True
+            return None
+
+
+def preload_model() -> bool:
+    """Preload the triage model at startup."""
+    return _load_model() is not None
 
 
 def _build_context() -> str:
@@ -128,10 +186,10 @@ async def triage_message(
 
     use_think = _should_use_think(message)
 
-    # Run ALL blocking work (Neo4j context query + Ollama HTTP call) in a
+    # Run ALL blocking work (Neo4j context query + model inference) in a
     # dedicated executor thread. This prevents two issues:
     # 1. Neo4j sync I/O blocking the event loop
-    # 2. Default executor contention causing subsequent Ollama calls to hang
+    # 2. Default executor contention causing subsequent triage calls to hang
     import asyncio
     loop = asyncio.get_running_loop()
 
@@ -149,49 +207,71 @@ async def triage_message(
 def _sync_triage(
     message: str, sender_name: str, group_name: str, use_think: bool,
 ) -> TriageResult | None:
-    """Synchronous triage: build context + call Ollama + parse response.
+    """Synchronous triage: build context + run local model + parse response."""
+    model = _load_model()
+    if model is None:
+        return None
 
-    Runs entirely in the dedicated triage executor thread.
-    """
     context = _build_context()
     user_prompt = _build_user_prompt(message, sender_name, group_name, context)
 
-    url = f"{config.OLLAMA_BASE_URL}/api/chat"
-    payload = json.dumps({
-        "model": config.TRIAGE_MODEL,
+    max_tokens = 2048 if use_think else 512
+    raw = _run_model(model, user_prompt, max_tokens=max_tokens)
+    if not raw:
+        return TriageResult(
+            classification="background", score=0.5,
+            reason="Empty triage response — defaulting to background",
+        )
+    return _parse_response(raw)
+
+
+def _run_model(model: object, user_prompt: str, max_tokens: int) -> str:
+    """Run the local model and return raw text output."""
+    kwargs = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        "stream": False,
-        "format": "json",
-        "think": use_think,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 2048 if use_think else 512,
-        },
-    }).encode("utf-8")
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
 
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Connection": "close",
-        },
-    )
-
+    # First try strict JSON output via chat completion.
     try:
-        with urllib.request.urlopen(req, timeout=config.TRIAGE_TIMEOUT) as resp:
-            data = json.loads(resp.read())
-            raw = data.get("message", {}).get("content", "")
-    except urllib.error.URLError:
-        log.debug("Ollama not reachable — triage unavailable")
-        return None
+        resp = model.create_chat_completion(
+            **kwargs,
+            response_format={"type": "json_object"},
+        )
+        return resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except TypeError:
+        # Older llama-cpp builds may not support response_format.
+        pass
     except Exception:
-        log.debug("Ollama call failed", exc_info=True)
-        return None
+        log.debug("Triage chat completion (json mode) failed", exc_info=True)
 
-    return _parse_response(raw)
+    # Fallback: regular chat completion.
+    try:
+        resp = model.create_chat_completion(**kwargs)
+        return resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        log.debug("Triage chat completion failed", exc_info=True)
+
+    # Last fallback: plain completion prompt.
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"{user_prompt}\n\n"
+        "Return JSON only."
+    )
+    try:
+        resp = model.create_completion(
+            prompt=prompt,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+        return resp.get("choices", [{}])[0].get("text", "")
+    except Exception:
+        log.debug("Triage completion fallback failed", exc_info=True)
+        return ""
 
 
 def _parse_response(raw: str) -> TriageResult:

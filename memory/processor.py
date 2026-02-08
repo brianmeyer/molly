@@ -3,7 +3,7 @@ import logging
 import re
 from datetime import date
 
-from memory.embeddings import embed
+from memory.embeddings import embed, embed_batch
 from memory.retriever import get_vectorstore
 
 import config
@@ -83,6 +83,34 @@ async def embed_and_store(
         log.debug("Stored chunk %s (%d chars)", chunk_id, len(content))
     except Exception:
         log.error("Embed/store failed", exc_info=True)
+
+
+async def batch_embed_and_store(
+    texts: list[str],
+    chat_jid: str,
+    source: str = "email",
+) -> int:
+    """L2: Batch embed and store multiple texts in a single transaction.
+
+    Uses embed_batch() for a single model.encode() call instead of N individual
+    calls. Returns count of chunks stored.
+    """
+    if not texts:
+        return 0
+    try:
+        loop = asyncio.get_event_loop()
+        vecs = await loop.run_in_executor(None, embed_batch, texts)
+        vs = get_vectorstore()
+        chunks = [
+            {"content": text, "embedding": vec, "source": source, "chat_jid": chat_jid}
+            for text, vec in zip(texts, vecs)
+        ]
+        chunk_ids = vs.store_chunks_batch(chunks)
+        log.debug("Batch embedded+stored %d chunks", len(chunk_ids))
+        return len(chunk_ids)
+    except Exception:
+        log.error("Batch embed/store failed", exc_info=True)
+        return 0
 
 
 async def extract_to_graph(

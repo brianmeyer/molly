@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import logging
 import time
@@ -21,15 +22,58 @@ from approval import get_action_tier, is_auto_approved_path
 from memory.processor import process_conversation
 from memory.retriever import retrieve_context
 from skills import get_skill_context, match_skills
-from tools.calendar import calendar_server
-from tools.contacts import contacts_server
-from tools.gmail import gmail_server
-from tools.imessage import imessage_server
-from tools.grok import grok_server
-from tools.kimi import kimi_server
-from tools.whatsapp import whatsapp_server
 
 log = logging.getLogger(__name__)
+
+_MCP_SERVER_SPECS = {
+    "google-calendar": ("tools.calendar", "calendar_server"),
+    "gmail": ("tools.gmail", "gmail_server"),
+    "apple-contacts": ("tools.contacts", "contacts_server"),
+    "imessage": ("tools.imessage", "imessage_server"),
+    "whatsapp-history": ("tools.whatsapp", "whatsapp_server"),
+    "kimi": ("tools.kimi", "kimi_server"),
+    "grok": ("tools.grok", "grok_server"),
+}
+
+_MCP_SERVER_TOOL_NAMES = {
+    "google-calendar": {
+        "calendar_list", "calendar_get", "calendar_search",
+        "calendar_create", "calendar_update", "calendar_delete",
+    },
+    "gmail": {"gmail_search", "gmail_read", "gmail_draft", "gmail_send", "gmail_reply"},
+    "apple-contacts": {"contacts_search", "contacts_get", "contacts_list", "contacts_recent"},
+    "imessage": {"imessage_search", "imessage_recent", "imessage_thread", "imessage_unread"},
+    "whatsapp-history": {"whatsapp_search"},
+    "kimi": {"kimi_research"},
+    "grok": {"grok_reason"},
+}
+
+
+def _load_mcp_servers() -> dict[str, object]:
+    """Load enabled MCP servers, skipping any disabled by startup preflight."""
+    disabled_servers = set(getattr(config, "DISABLED_MCP_SERVERS", set()))
+    disabled_tools = set(getattr(config, "DISABLED_TOOL_NAMES", set()))
+    servers: dict[str, object] = {}
+
+    for server_name, (module_name, attr_name) in _MCP_SERVER_SPECS.items():
+        if server_name in disabled_servers:
+            continue
+        try:
+            module = importlib.import_module(module_name)
+            servers[server_name] = getattr(module, attr_name)
+        except Exception as e:
+            log.warning(
+                "Disabling MCP server '%s' — failed to import %s (%s)",
+                server_name,
+                module_name,
+                e,
+            )
+            disabled_servers.add(server_name)
+            disabled_tools.update(_MCP_SERVER_TOOL_NAMES.get(server_name, set()))
+
+    config.DISABLED_MCP_SERVERS = disabled_servers
+    config.DISABLED_TOOL_NAMES = disabled_tools
+    return servers
 
 
 def load_identity_stack() -> str:
@@ -272,7 +316,8 @@ async def handle_message(
     # Only pre-approve AUTO-tier tools. CONFIRM/BLOCKED-tier tools remain
     # available (built-in + MCP) but require permission — which fires the
     # can_use_tool callback for our approval system and tool logging.
-    auto_tools = sorted(config.ACTION_TIERS["AUTO"])
+    disabled_tools = set(getattr(config, "DISABLED_TOOL_NAMES", set()))
+    auto_tools = sorted(t for t in config.ACTION_TIERS["AUTO"] if t not in disabled_tools)
 
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -283,15 +328,7 @@ async def handle_message(
             "SubagentStart": [HookMatcher(hooks=[_on_subagent_start])],
             "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],
         },
-        mcp_servers={
-            "google-calendar": calendar_server,
-            "gmail": gmail_server,
-            "apple-contacts": contacts_server,
-            "imessage": imessage_server,
-            "whatsapp-history": whatsapp_server,
-            "kimi": kimi_server,
-            "grok": grok_server,
-        },
+        mcp_servers=_load_mcp_servers(),
         cwd=str(config.WORKSPACE),
         # Always set can_use_tool so the SDK uses the stdio control protocol
         # (no interactive terminal prompts). Approval manager is optional —

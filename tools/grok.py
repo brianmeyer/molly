@@ -53,12 +53,14 @@ def _run_x_search(query_text: str, system_context: str, days_back: int) -> dict:
 
     client = Client(api_key=config.XAI_API_KEY)
     chat = client.chat.create(
-        model="grok-4-1-fast-non-reasoning",
+        # xAI server-side tools like x_search require an agentic reasoning model.
+        model="grok-4-1-fast-reasoning",
         messages=[
             system(system_context),
             user(query_text),
         ],
         tools=[search_tool],
+        include=["x_search_call_output", "inline_citations"],
     )
 
     response = chat.sample()

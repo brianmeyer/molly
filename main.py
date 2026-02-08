@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import logging
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import config
 from agent import handle_message
+from automations import AutomationEngine
 from approval import ApprovalManager
 from commands import handle_command
 from database import Database
@@ -33,6 +35,89 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("molly")
+
+DISMISSIVE_FEEDBACK_PATTERNS = [
+    ("not_important", re.compile(r"\bnot important\b", re.IGNORECASE)),
+    ("dont_care", re.compile(r"\b(don't|dont|do not)\s+care\b", re.IGNORECASE)),
+    ("stop_sending", re.compile(r"\bstop sending\b", re.IGNORECASE)),
+    ("who_cares", re.compile(r"\bwho cares\b", re.IGNORECASE)),
+    ("ignore_those", re.compile(r"\bignore those\b", re.IGNORECASE)),
+    ("stop_notifying", re.compile(r"\bstop notifying\b", re.IGNORECASE)),
+    ("dont_need_these", re.compile(r"\b(don't|dont|do not)\s+need\s+these\b", re.IGNORECASE)),
+    ("doesnt_matter", re.compile(r"\b(doesn't|doesnt|does not)\s+matter\b", re.IGNORECASE)),
+    ("not_relevant", re.compile(r"\bnot relevant\b", re.IGNORECASE)),
+    ("skip_those", re.compile(r"\bskip those\b", re.IGNORECASE)),
+]
+SURFACED_SIGNAL_WINDOW_SECONDS = 6 * 60 * 60
+MAX_RECENT_SURFACED_ITEMS = 100
+
+_TOOL_DEPENDENCY_SPECS = [
+    {
+        "server": "google-calendar",
+        "tools": {
+            "calendar_list", "calendar_get", "calendar_search",
+            "calendar_create", "calendar_update", "calendar_delete",
+        },
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("google.auth.transport.requests", "google-auth"),
+            ("google.oauth2.credentials", "google-auth"),
+            ("google_auth_oauthlib.flow", "google-auth-oauthlib"),
+            ("googleapiclient.discovery", "google-api-python-client"),
+        ],
+    },
+    {
+        "server": "gmail",
+        "tools": {
+            "gmail_search", "gmail_read", "gmail_draft", "gmail_send", "gmail_reply",
+        },
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("google.auth.transport.requests", "google-auth"),
+            ("google.oauth2.credentials", "google-auth"),
+            ("google_auth_oauthlib.flow", "google-auth-oauthlib"),
+            ("googleapiclient.discovery", "google-api-python-client"),
+        ],
+    },
+    {
+        "server": "apple-contacts",
+        "tools": {"contacts_search", "contacts_get", "contacts_list", "contacts_recent"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+        ],
+    },
+    {
+        "server": "imessage",
+        "tools": {"imessage_search", "imessage_recent", "imessage_thread", "imessage_unread"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+        ],
+    },
+    {
+        "server": "whatsapp-history",
+        "tools": {"whatsapp_search"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+        ],
+    },
+    {
+        "server": "kimi",
+        "tools": {"kimi_research"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("httpx", "httpx"),
+        ],
+    },
+    {
+        "server": "grok",
+        "tools": {"grok_reason"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("httpx", "httpx"),
+            ("xai_sdk", "xai-sdk"),
+        ],
+    },
+]
 
 
 def _task_done_callback(task: asyncio.Task):
@@ -113,74 +198,25 @@ def _wait_for_neo4j(timeout: int = 30):
     sys.exit(1)
 
 
-def ensure_ollama():
-    """Ensure Ollama is running and the triage model is available.
+def ensure_triage_model():
+    """Preload the local GGUF triage model.
 
     Non-blocking on failure — triage is optional, Molly works without it.
     """
-    import urllib.request
-    import urllib.error
+    from memory.triage import preload_model
 
-    def _ollama_api_up() -> bool:
-        try:
-            req = urllib.request.Request(f"{config.OLLAMA_BASE_URL}/api/tags")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                return resp.status == 200
-        except (urllib.error.URLError, OSError):
-            return False
+    model_path = config.TRIAGE_MODEL_PATH.expanduser()
+    if not model_path.exists():
+        log.warning("Triage model file not found: %s", model_path)
+        return
 
-    def _model_available() -> bool:
-        try:
-            req = urllib.request.Request(f"{config.OLLAMA_BASE_URL}/api/tags")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                import json as _json
-                data = _json.loads(resp.read())
-                model_names = [m.get("name", "") for m in data.get("models", [])]
-                # Match both "qwen3:4b" and "qwen3:4b-<hash>" variants
-                target = config.TRIAGE_MODEL.split(":")[0]
-                return any(target in name for name in model_names)
-        except Exception:
-            return False
-
-    # Check if Ollama binary exists
-    result = _run(["which", "ollama"])
-    if result.returncode != 0:
-        log.warning("Ollama not found. Installing via Homebrew...")
-        result = _run(["brew", "install", "ollama"])
-        if result.returncode != 0:
-            log.warning("Ollama install failed — triage will be unavailable")
-            return
-
-    # Check if Ollama API is up
-    if not _ollama_api_up():
-        log.info("Ollama not running — starting...")
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # Wait up to 15 seconds
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if _ollama_api_up():
-                break
-            time.sleep(1)
+    try:
+        if preload_model():
+            log.info("Triage model ready: %s", model_path)
         else:
-            log.warning("Ollama failed to start within 15s — triage will be unavailable")
-            return
-
-    log.info("Ollama: running")
-
-    # Check if triage model is pulled
-    if not _model_available():
-        log.info("Pulling triage model %s (this may take a few minutes)...", config.TRIAGE_MODEL)
-        result = _run(["ollama", "pull", config.TRIAGE_MODEL], timeout=600)
-        if result.returncode != 0:
-            log.warning("Failed to pull %s — triage will be unavailable", config.TRIAGE_MODEL)
-            return
-        log.info("Triage model %s pulled successfully", config.TRIAGE_MODEL)
-    else:
-        log.info("Triage model %s: available", config.TRIAGE_MODEL)
+            log.warning("Triage model failed to load — triage will be unavailable")
+    except Exception:
+        log.warning("Triage model preload failed — triage will be unavailable", exc_info=True)
 
 
 def ensure_google_auth():
@@ -206,12 +242,46 @@ def ensure_google_auth():
         log.error("Google OAuth failed — Calendar and Gmail tools will be unavailable", exc_info=True)
 
 
+def ensure_tool_dependencies():
+    """Verify MCP tool dependencies are importable; disable tools if missing."""
+    disabled_servers: set[str] = set()
+    disabled_tools: set[str] = set()
+
+    for spec in _TOOL_DEPENDENCY_SPECS:
+        missing_packages: set[str] = set()
+        for module_name, package_name in spec["requirements"]:
+            try:
+                importlib.import_module(module_name)
+            except Exception:
+                missing_packages.add(package_name)
+
+        if missing_packages:
+            for package_name in sorted(missing_packages):
+                log.warning(
+                    "Missing dependency package '%s'; disabling MCP server '%s'.",
+                    package_name,
+                    spec["server"],
+                )
+            disabled_servers.add(spec["server"])
+            disabled_tools.update(spec["tools"])
+
+    config.DISABLED_MCP_SERVERS = disabled_servers
+    config.DISABLED_TOOL_NAMES = disabled_tools
+
+    if disabled_servers:
+        log.warning(
+            "Disabled MCP servers at startup: %s",
+            ", ".join(sorted(disabled_servers)),
+        )
+
+
 def preflight_checks():
     """Run all service checks before Molly starts."""
     log.info("Running preflight checks...")
     ensure_docker()
     ensure_neo4j()
-    ensure_ollama()
+    ensure_triage_model()
+    ensure_tool_dependencies()
     ensure_google_auth()
     log.info("Preflight checks passed")
 
@@ -250,7 +320,10 @@ class Molly:
         self.last_heartbeat: datetime | None = None
         self.last_maintenance: datetime | None = None
         self._sent_ids: dict[str, float] = {}  # msg_id → timestamp (avoid echo loop)
+        self._recent_surfaces: list[dict] = []  # recent surfaced notifications for feedback linking
         self.approvals = ApprovalManager()
+        self.automations = AutomationEngine(self)
+        self._automation_tick_task: asyncio.Task | None = None
 
     # --- State persistence ---
 
@@ -329,6 +402,106 @@ class Molly:
             cutoff = now - 300
             self._sent_ids = {k: v for k, v in self._sent_ids.items() if v > cutoff}
 
+    @staticmethod
+    def _normalize_signal_source(source: str) -> str:
+        src = (source or "").strip().lower()
+        if src in {"email", "imessage", "calendar"}:
+            return src
+        return "calendar"
+
+    def _prune_recent_surfaces(self, now_ts: float):
+        cutoff = now_ts - SURFACED_SIGNAL_WINDOW_SECONDS
+        self._recent_surfaces = [
+            item for item in self._recent_surfaces
+            if item.get("surfaced_ts", 0) >= cutoff and not item.get("logged", False)
+        ][-MAX_RECENT_SURFACED_ITEMS:]
+
+    def _record_surfaced_item(
+        self,
+        chat_jid: str,
+        source: str,
+        surfaced_summary: str,
+        sender_pattern: str,
+    ):
+        now_ts = time.time()
+        self._prune_recent_surfaces(now_ts)
+        self._recent_surfaces.append(
+            {
+                "chat_jid": chat_jid,
+                "source": self._normalize_signal_source(source),
+                "summary": (surfaced_summary or "").strip()[:1000],
+                "sender_pattern": (sender_pattern or "").strip()[:500],
+                "surfaced_ts": now_ts,
+                "logged": False,
+            }
+        )
+
+    def send_surface_message(
+        self,
+        chat_jid: str,
+        text: str,
+        source: str,
+        surfaced_summary: str = "",
+        sender_pattern: str = "",
+    ):
+        """Send a surfaced notification and cache metadata for preference learning."""
+        if not self.wa:
+            return
+        msg_id = self.wa.send_message(chat_jid, text)
+        self._track_send(msg_id)
+        if msg_id:
+            self._record_surfaced_item(
+                chat_jid=chat_jid,
+                source=source,
+                surfaced_summary=surfaced_summary or text,
+                sender_pattern=sender_pattern,
+            )
+
+    @staticmethod
+    def _dismissive_feedback_match(text: str) -> str | None:
+        for label, pattern in DISMISSIVE_FEEDBACK_PATTERNS:
+            if pattern.search(text):
+                return label
+        return None
+
+    def _log_preference_signal_if_dismissive(self, chat_jid: str, owner_feedback: str):
+        pattern = self._dismissive_feedback_match(owner_feedback.strip().lower())
+        if not pattern:
+            return
+
+        now_ts = time.time()
+        self._prune_recent_surfaces(now_ts)
+
+        surfaced = None
+        for item in reversed(self._recent_surfaces):
+            if item.get("chat_jid") == chat_jid and not item.get("logged", False):
+                surfaced = item
+                break
+
+        if not surfaced:
+            return
+
+        sender_pattern = surfaced.get("sender_pattern", "")
+        feedback_pattern = f"feedback_pattern:{pattern}"
+        if sender_pattern:
+            sender_pattern = f"{sender_pattern} | {feedback_pattern}"
+        else:
+            sender_pattern = feedback_pattern
+
+        try:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            vs.log_preference_signal(
+                source=surfaced.get("source", "calendar"),
+                surfaced_summary=surfaced.get("summary", ""),
+                sender_pattern=sender_pattern,
+                owner_feedback=owner_feedback.strip(),
+            )
+            surfaced["logged"] = True
+            log.info("Logged preference signal from owner feedback (%s)", pattern)
+        except Exception:
+            log.debug("Failed to log preference signal", exc_info=True)
+
     # --- Message processing ---
 
     async def process_message(self, msg_data: dict):
@@ -355,6 +528,13 @@ class Molly:
             del self._sent_ids[msg_id]
             return
 
+        # Phase 6: evaluate message-triggered automations in background
+        auto_msg_task = asyncio.create_task(
+            self.automations.on_message(msg_data),
+            name=f"automation-msg:{chat_jid[:20]}",
+        )
+        auto_msg_task.add_done_callback(_task_done_callback)
+
         # Determine chat processing tier
         chat_mode = self._get_chat_mode(chat_jid)
         is_owner = self._is_owner(sender_jid)
@@ -377,6 +557,9 @@ class Molly:
         # Check if this is a yes/no reply to a pending approval
         if self.approvals.try_resolve(content.strip(), chat_jid):
             return
+
+        # Passive data collection only: log dismissive feedback to surfaced items
+        self._log_preference_signal_if_dismissive(chat_jid, content)
 
         # Check for @Molly trigger
         has_trigger = config.TRIGGER_PATTERN.search(content)
@@ -522,7 +705,13 @@ class Molly:
                     f"{preview}\n\n"
                     f"Reason: {result.reason}"
                 )
-                self._track_send(self.wa.send_message(owner_jid, notify_msg))
+                self.send_surface_message(
+                    owner_jid,
+                    notify_msg,
+                    source="whatsapp",
+                    surfaced_summary=f"{sender_name}: {preview}",
+                    sender_pattern=f"group:{group_name};sender:{sender_name}",
+                )
 
         elif result.classification == "relevant":
             await embed_and_store(content, chat_jid)
@@ -637,6 +826,7 @@ class Molly:
         self.wa = WhatsAppClient(
             config.AUTH_DIR, message_callback=self._on_whatsapp_message
         )
+        await self.automations.initialize()
 
         # Start WhatsApp in background thread (neonize is synchronous)
         wa_thread = threading.Thread(target=self.wa.connect, daemon=True, name="whatsapp")
@@ -691,6 +881,15 @@ class Molly:
             except asyncio.TimeoutError:
                 # No message in queue — check scheduled tasks (run in background)
                 if self.wa and self.wa.connected:
+                    if (
+                        self._automation_tick_task is None
+                        or self._automation_tick_task.done()
+                    ):
+                        self._automation_tick_task = asyncio.create_task(
+                            self.automations.tick(),
+                            name="automations-tick",
+                        )
+                        self._automation_tick_task.add_done_callback(_task_done_callback)
                     if should_heartbeat(self.last_heartbeat):
                         self.last_heartbeat = datetime.now()
                         task = asyncio.create_task(
