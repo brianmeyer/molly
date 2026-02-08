@@ -14,9 +14,6 @@ import config
 
 log = logging.getLogger(__name__)
 
-# Skills that can be activated by heartbeat events (not message matching)
-HEARTBEAT_SKILLS = {"daily-digest", "meeting-prep"}
-
 # Cache for compiled trigger patterns (rebuilt when skills reload)
 _trigger_patterns: list[tuple[str, re.Pattern]] | None = None
 
