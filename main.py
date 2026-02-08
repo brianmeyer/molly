@@ -292,6 +292,7 @@ class Molly:
     def _get_chat_mode(self, chat_jid: str) -> str:
         """Determine the processing tier for a chat.
 
+        Returns one of config.CHAT_MODES:
         owner_dm   — DMs where chat JID matches an OWNER_ID
         respond    — registered group, full processing + respond to @Molly
         listen     — monitored group, embed + selective graph, no responses
@@ -304,7 +305,11 @@ class Molly:
         # Check registered chats
         chat_info = self.registered_chats.get(chat_jid)
         if chat_info:
-            return chat_info.get("mode", "respond")
+            mode = chat_info.get("mode", "respond")
+            if mode not in config.CHAT_MODES:
+                log.warning("Unknown chat mode '%s' for %s, falling back to store_only", mode, chat_jid)
+                return "store_only"
+            return mode
 
         return "store_only"
 

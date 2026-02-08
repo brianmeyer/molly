@@ -26,23 +26,6 @@ CHAT_MODES = {"owner_dm", "respond", "listen", "store_only"}
 
 # Claude
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "opus")
-ALLOWED_TOOLS = [
-    # Built-in Claude Code tools
-    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
-    # Google Calendar (Phase 3B)
-    "calendar_list", "calendar_get", "calendar_search",
-    "calendar_create", "calendar_update", "calendar_delete",
-    # Gmail (Phase 3B)
-    "gmail_search", "gmail_read", "gmail_draft", "gmail_send", "gmail_reply",
-    # Apple Contacts (Phase 3C)
-    "contacts_search", "contacts_get", "contacts_list", "contacts_recent",
-    # iMessage (Phase 3C)
-    "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
-    # WhatsApp history (Phase 4)
-    "whatsapp_search",
-    # External models (Phase 5)
-    "kimi_research", "grok_reason",
-]
 
 # Owner — only this user can trigger Molly (phone + LID)
 OWNER_IDS = set(filter(None, os.getenv("OWNER_IDS", "").split(",")))
