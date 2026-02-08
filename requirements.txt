@@ -1,0 +1,29 @@
+# Core runtime
+claude-agent-sdk
+python-dotenv
+neonize
+
+# API / web
+httpx
+fastapi
+uvicorn
+
+# Google tools (gmail/calendar)
+google-auth
+google-auth-oauthlib
+google-api-python-client
+
+# External model tools
+xai-sdk
+
+# Automation / config
+PyYAML
+croniter
+
+# Memory stack
+numpy
+sentence-transformers
+sqlite-vec
+gliner2
+neo4j
+llama-cpp-python

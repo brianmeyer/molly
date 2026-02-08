@@ -31,7 +31,8 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             "/status - Show uptime, model, connection info, and message stats\n"
             "/skills - List all available skills and their triggers\n"
             "/skill <name> - Show details of a specific skill\n"
-            "/digest - Run the daily digest now"
+            "/digest - Run the daily digest now\n"
+            "/automations - List loaded automations and run schedule"
         )
 
     if cmd == "/clear":
@@ -368,8 +369,27 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             f"- Active sessions: {session_count}",
             f"- Messages today: {msg_count}",
         ]
+        if hasattr(molly, "automations") and molly.automations:
+            try:
+                summary = await molly.automations.status_summary()
+                lines.append(
+                    f"- Automations: {summary['enabled']}/{summary['loaded']} enabled"
+                )
+                if summary.get("last_run"):
+                    lines.append(f"- Last automation run: {summary['last_run']}")
+            except Exception:
+                log.debug("Automation status summary failed", exc_info=True)
         if hasattr(molly, "last_heartbeat") and molly.last_heartbeat:
             lines.append(f"- Last heartbeat: {molly.last_heartbeat.strftime('%H:%M')}")
         return "\n".join(lines)
+
+    if cmd == "/automations":
+        if not hasattr(molly, "automations") or not molly.automations:
+            return "Automation engine is not initialized."
+        try:
+            return await molly.automations.status_report()
+        except Exception as e:
+            log.error("/automations failed", exc_info=True)
+            return f"Automations status failed: {e}"
 
     return None

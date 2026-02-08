@@ -29,7 +29,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | sqlite-vec | Layer 2: vector search + operational logs |
 | GLiNER2 | Entity + relationship extraction (DeBERTa-large) |
 | Neo4j | Layer 3: knowledge graph |
-| Qwen3-4B (Ollama) | Local triage model for message classification |
+| Qwen3-4B GGUF (`llama-cpp-python`) | Local triage model for message classification |
 | Kimi K2.5 (Moonshot) | External research model via MCP tool |
 | Grok (xAI) | External reasoning model via MCP tool |
 
@@ -47,6 +47,8 @@ molly/
 ├── approval.py          # Action approval flow (WhatsApp yes/no)
 ├── commands.py          # /help, /clear, /memory, /graph, /forget, /status
 ├── heartbeat.py         # Proactive check-in + iMessage/email monitoring
+├── automations.py       # YAML-based proactive automation engine
+├── automation_triggers.py # Trigger types (schedule, event, email, message, etc.)
 ├── maintenance.py       # Nightly maintenance (direct Python, no SDK tools)
 ├── skills.py            # Dynamic skill trigger matching + loading
 ├── web/
@@ -109,6 +111,29 @@ Opus orchestrates and delegates to sub-agents via the SDK's Task tool:
 
 External models (Kimi K2.5 for research, Grok for social intelligence) are available as MCP tools, not sub-agents.
 
+## Automations
+
+YAML-based proactive automation engine. Automations live in `~/.molly/workspace/automations/` and run on triggers without requiring a message from the user.
+
+| Automation | Trigger | What it does |
+|-----------|---------|-------------|
+| Morning Briefing | Cron (7 AM weekdays) | Calendar, email, commitments summary |
+| Meeting Prep | 30 min before calendar event | Context gathering for upcoming meetings |
+| Email Triage | New unread emails (polled) | Categorize and surface urgent emails |
+| Commitment Tracker | Owner makes a commitment | Logs and tracks follow-through |
+| End-of-Day Wrap | Cron (6 PM weekdays) | Daily summary if 3+ messages exchanged |
+| Weekend Review | Cron (9 AM Saturday) | Weekly reflection and planning |
+
+**Trigger types:** schedule (cron), event (calendar), email (Gmail poll), message (pattern match), commitment (extracted from conversation), condition (custom expression), webhook.
+
+**Guards:** Quiet hours (10 PM–7 AM ET, VIP/urgent bypass), deduplication via state.json (payload hash + min interval), condition expressions.
+
+**Pipeline steps** route through `handle_message()` → Claude Agent SDK, inheriting the full sub-agent and approval system.
+
+## Preference Signals
+
+Passive feedback logging for future learning loops. When the owner dismisses a surfaced notification (e.g., "not important", "who cares", "stop sending"), the dismissal is logged with the source, summary, and sender pattern. Nothing acts on these signals yet — Phase 7 will close the loop.
+
 ## Skills
 
 Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parsed dynamically from each skill's `## Trigger` section. Matched skills inject their instructions into the system prompt for that turn. Adding a new `.md` file with quoted trigger phrases is picked up automatically after restart.
@@ -130,6 +155,7 @@ Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parse
 /unregister           Unregister current chat
 /groups               List registered chats
 /pending              Show pending approvals
+/automations          List automations and their status
 ```
 
 ## Running
@@ -140,7 +166,7 @@ source .venv/bin/activate
 python main.py
 ```
 
-Preflight checks verify Docker, Neo4j, Ollama, and Google OAuth are ready before startup. WhatsApp reconnects automatically after initial QR pairing. Web UI starts on port 8080.
+Preflight checks verify Docker, Neo4j, the local triage GGUF model, and Google OAuth are ready before startup. WhatsApp reconnects automatically after initial QR pairing. Web UI starts on port 8080.
 
 For terminal-only debugging (no WhatsApp/web):
 ```bash
@@ -162,7 +188,8 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - Docker (for Neo4j)
 - Claude Max subscription (for Claude Agent SDK)
 - HuggingFace account (for gated EmbeddingGemma model)
-- Ollama (optional, for local triage)
+- `llama-cpp-python` (for local triage)
+- Qwen3-4B GGUF file at `~/.molly/models/Qwen_Qwen3-4B-Q4_K_M.gguf`
 - Google Cloud OAuth credentials (optional, for Calendar/Gmail)
 - Moonshot API key (optional, for Kimi K2.5 research tool)
 - xAI API key (optional, for Grok reasoning tool)
@@ -175,6 +202,7 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - [x] Phase 3: Tools + skills (Calendar, Gmail, Contacts, iMessage, Skills)
 - [x] Phase 4: Multi-channel (Web UI, Terminal REPL, Email monitoring)
 - [x] Phase 5: Sub-agents, model routing, audit hardening
-- [ ] Phase 6: Learning loops
-- [ ] Phase 7: Collaboration
-- [ ] Phase 8: Self-improvement
+- [x] Phase 6: Proactive automation engine, preference signal logging, Grok x_search
+- [ ] Phase 7: Learning loops (act on preference signals, pattern detection)
+- [ ] Phase 8: Collaboration
+- [ ] Phase 9: Self-improvement

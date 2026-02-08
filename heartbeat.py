@@ -13,6 +13,30 @@ HEARTBEAT_SENTINEL = "HEARTBEAT_OK"
 DIGEST_HOUR = 7
 
 
+def _send_surface(
+    molly,
+    chat_jid: str,
+    text: str,
+    source: str,
+    surfaced_summary: str = "",
+    sender_pattern: str = "",
+):
+    """Send surfaced info and attach metadata for passive preference logging."""
+    if hasattr(molly, "send_surface_message"):
+        molly.send_surface_message(
+            chat_jid,
+            text,
+            source=source,
+            surfaced_summary=surfaced_summary or text,
+            sender_pattern=sender_pattern,
+        )
+        return
+
+    # Test/legacy fallback: preserve old behavior if helper isn't present.
+    if getattr(molly, "wa", None):
+        molly._track_send(molly.wa.send_message(chat_jid, text))
+
+
 def should_heartbeat(last_heartbeat: datetime | None) -> bool:
     """Check if it's time for a heartbeat based on interval and active hours."""
     now = datetime.now()
@@ -77,7 +101,14 @@ async def run_heartbeat(molly):
 
         if response and HEARTBEAT_SENTINEL not in response:
             log.info("Heartbeat: sending proactive message to %s", chat_jid)
-            molly._track_send(molly.wa.send_message(chat_jid, response))
+            _send_surface(
+                molly,
+                chat_jid,
+                response,
+                source="calendar",
+                surfaced_summary=response,
+                sender_pattern="heartbeat:checklist",
+            )
         else:
             log.info("Heartbeat: nothing to report")
     except Exception:
@@ -130,7 +161,14 @@ async def _check_morning_digest(molly, chat_jid: str):
             molly.save_sessions()
 
         if response:
-            molly._track_send(molly.wa.send_message(chat_jid, response))
+            _send_surface(
+                molly,
+                chat_jid,
+                response,
+                source="calendar",
+                surfaced_summary=response,
+                sender_pattern="digest:daily",
+            )
             log.info("Morning digest sent (%d chars)", len(response))
     except Exception:
         log.error("Morning digest failed", exc_info=True)
@@ -219,7 +257,14 @@ async def _check_meeting_prep(molly, chat_jid: str):
                     source="heartbeat",
                 )
                 if response:
-                    molly._track_send(molly.wa.send_message(chat_jid, response))
+                    _send_surface(
+                        molly,
+                        chat_jid,
+                        response,
+                        source="calendar",
+                        surfaced_summary=f"Meeting prep for {title}",
+                        sender_pattern=f"meeting:{title}",
+                    )
                     log.info("Meeting prep sent for '%s' (%d chars)", title, len(response))
             except Exception:
                 log.error("Meeting prep failed for '%s'", title, exc_info=True)
@@ -290,7 +335,14 @@ async def _check_imessages(molly):
                     f"{preview}\n\n"
                     f"Reason: {result.reason}"
                 )
-                molly._track_send(molly.wa.send_message(owner_jid, notify))
+                _send_surface(
+                    molly,
+                    owner_jid,
+                    notify,
+                    source="imessage",
+                    surfaced_summary=f"{msg['sender']}: {preview}",
+                    sender_pattern=f"sender:{msg['sender']}",
+                )
 
             # Embed + graph extract for relevant/urgent messages
             if result and result.classification in ("urgent", "relevant"):
@@ -309,9 +361,12 @@ async def _check_imessages(molly):
 async def _check_email(molly):
     """Check for new emails since last heartbeat and surface important ones.
 
-    Polls Gmail for unread messages. Runs triage on each email.
-    Urgent ones get forwarded to Brian via WhatsApp. Relevant ones
-    feed into the memory pipeline.
+    Polls Gmail for unread messages. Processes in three phases for throughput:
+      1. Fetch all email metadata (sequential Gmail API)
+      2. Triage all emails in parallel (asyncio.gather)
+      3. Batch embed passing texts + parallel graph extraction
+
+    Target: 7 emails in under 60 seconds.
     """
     try:
         from tools.google_auth import get_gmail_service
@@ -357,11 +412,14 @@ async def _check_email(molly):
 
         log.info("Email heartbeat: %d new unread emails", len(messages))
 
+        import asyncio
         from memory.triage import triage_message
-        from memory.processor import embed_and_store, extract_to_graph
+        from memory.processor import batch_embed_and_store, extract_to_graph
 
         owner_jid = molly._get_owner_dm_jid()
 
+        # --- Phase 1: Fetch all email metadata ---
+        email_data = []  # list of (sender, subject, snippet, email_text)
         for msg_ref in messages:
             try:
                 msg = (
@@ -371,7 +429,6 @@ async def _check_email(molly):
                          metadataHeaders=["From", "Subject", "Date"])
                     .execute()
                 )
-
                 headers = {
                     h["name"].lower(): h["value"]
                     for h in msg.get("payload", {}).get("headers", [])
@@ -379,33 +436,73 @@ async def _check_email(molly):
                 sender = headers.get("from", "Unknown")
                 subject = headers.get("subject", "(no subject)")
                 snippet = msg.get("snippet", "")
-
                 email_text = f"From: {sender}\nSubject: {subject}\n{snippet}"
-
-                # Run triage
-                triage_result = await triage_message(
-                    email_text,
-                    sender_name=sender,
-                    group_name="Email",
-                )
-
-                if triage_result and triage_result.classification == "urgent":
-                    if owner_jid and molly.wa:
-                        notify = (
-                            f"Email from {sender}\n"
-                            f"Subject: {subject}\n"
-                            f"{snippet[:200]}\n\n"
-                            f"Reason: {triage_result.reason}"
-                        )
-                        molly._track_send(molly.wa.send_message(owner_jid, notify))
-
-                # Embed + graph extract for relevant/urgent emails
-                if triage_result and triage_result.classification in ("urgent", "relevant"):
-                    await embed_and_store(email_text, chat_jid="email", source="email")
-                    await extract_to_graph(email_text, chat_jid="email", source="email")
-
+                email_data.append((sender, subject, snippet, email_text))
             except Exception:
-                log.debug("Failed to process email %s", msg_ref.get("id"), exc_info=True)
+                log.debug("Failed to fetch email %s", msg_ref.get("id"), exc_info=True)
+
+        if not email_data:
+            state_data["email_heartbeat_hw"] = now
+            config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+            return
+
+        # --- Phase 2: Triage all emails in parallel ---
+        triage_tasks = [
+            triage_message(email_text, sender_name=sender, group_name="Email")
+            for sender, _subject, _snippet, email_text in email_data
+        ]
+        triage_results = await asyncio.gather(*triage_tasks, return_exceptions=True)
+
+        # --- Phase 3: Surface urgent notifications + collect texts for memory ---
+        texts_to_embed = []
+        texts_to_extract = []
+
+        for i, triage_result in enumerate(triage_results):
+            if isinstance(triage_result, Exception):
+                log.debug("Triage failed for email %d", i, exc_info=triage_result)
+                continue
+
+            sender, subject, snippet, email_text = email_data[i]
+
+            if triage_result and triage_result.classification == "urgent":
+                if owner_jid and molly.wa:
+                    notify = (
+                        f"Email from {sender}\n"
+                        f"Subject: {subject}\n"
+                        f"{snippet[:200]}\n\n"
+                        f"Reason: {triage_result.reason}"
+                    )
+                    _send_surface(
+                        molly,
+                        owner_jid,
+                        notify,
+                        source="email",
+                        surfaced_summary=f"{subject}: {snippet[:200]}",
+                        sender_pattern=f"sender:{sender}",
+                    )
+
+            if triage_result and triage_result.classification in ("urgent", "relevant"):
+                texts_to_embed.append(email_text)
+                texts_to_extract.append(email_text)
+
+        # --- Phase 4: Batch embed + parallel graph extraction ---
+        if texts_to_embed:
+            # Single batched embedding call instead of N individual calls
+            embed_task = batch_embed_and_store(
+                texts_to_embed, chat_jid="email", source="email",
+            )
+            # Parallel graph extraction
+            graph_tasks = [
+                extract_to_graph(text, chat_jid="email", source="email")
+                for text in texts_to_extract
+            ]
+            await asyncio.gather(embed_task, *graph_tasks, return_exceptions=True)
+
+            log.info(
+                "Email heartbeat: processed %d emails, %d embedded+extracted",
+                len(email_data), len(texts_to_embed),
+            )
 
         # Update high-water mark AFTER processing so a crash doesn't lose emails
         state_data["email_heartbeat_hw"] = now

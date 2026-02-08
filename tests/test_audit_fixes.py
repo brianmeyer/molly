@@ -491,5 +491,89 @@ class TestEmailHighWaterMark(unittest.TestCase):
         self.assertGreater(hw_update_line, for_loop_line)
 
 
+# ---------------------------------------------------------------------------
+# #15: Email batching and parallel triage
+# ---------------------------------------------------------------------------
+class TestEmailBatching(unittest.TestCase):
+    """Verify email heartbeat uses batch embedding and parallel triage."""
+
+    def setUp(self):
+        self.heartbeat_src = _read_source("heartbeat.py")
+        self.processor_src = _read_source("memory/processor.py")
+        self.vectorstore_src = _read_source("memory/vectorstore.py")
+
+    def test_uses_batch_embed_not_individual(self):
+        """_check_email should use batch_embed_and_store, not embed_and_store."""
+        # Find the _check_email function body
+        lines = self.heartbeat_src.split("\n")
+        in_check_email = False
+        check_email_body = []
+        for line in lines:
+            if "async def _check_email" in line:
+                in_check_email = True
+            elif in_check_email and line and not line[0].isspace() and "def " in line:
+                break
+            if in_check_email:
+                check_email_body.append(line)
+        body = "\n".join(check_email_body)
+        self.assertIn("batch_embed_and_store", body)
+        # Should not use individual embed_and_store (but batch_embed_and_store is OK)
+        individual_calls = re.findall(r'(?<!batch_)embed_and_store', body)
+        self.assertEqual(len(individual_calls), 0,
+                         "Found individual embed_and_store calls — use batch_embed_and_store")
+
+    def test_uses_asyncio_gather_for_triage(self):
+        """_check_email should use asyncio.gather for parallel triage."""
+        self.assertIn("asyncio.gather", self.heartbeat_src)
+
+    def test_batch_embed_and_store_exists(self):
+        """processor.py must export batch_embed_and_store."""
+        self.assertIn("async def batch_embed_and_store", self.processor_src)
+
+    def test_batch_embed_uses_embed_batch(self):
+        """batch_embed_and_store must use embed_batch, not embed."""
+        self.assertIn("embed_batch", self.processor_src)
+
+    def test_store_chunks_batch_exists(self):
+        """vectorstore.py must have store_chunks_batch method."""
+        self.assertIn("def store_chunks_batch", self.vectorstore_src)
+
+    def test_store_chunks_batch_single_commit(self):
+        """store_chunks_batch should commit once, not per-chunk."""
+        # Extract the method body
+        lines = self.vectorstore_src.split("\n")
+        in_method = False
+        method_body = []
+        for line in lines:
+            if "def store_chunks_batch" in line:
+                in_method = True
+            elif in_method and line.strip() and not line[0].isspace():
+                break
+            elif in_method and "def " in line and "store_chunks_batch" not in line:
+                break
+            if in_method:
+                method_body.append(line)
+        body = "\n".join(method_body)
+        # Should have exactly one commit (after the loop)
+        self.assertEqual(body.count("self.conn.commit()"), 1)
+
+    def test_email_phases_ordered(self):
+        """_check_email should fetch metadata, then triage, then embed+extract."""
+        lines = self.heartbeat_src.split("\n")
+        fetch_line = triage_line = embed_line = None
+        for i, line in enumerate(lines):
+            if "Phase 1" in line and "metadata" in line.lower():
+                fetch_line = i
+            elif "Phase 2" in line and "triage" in line.lower():
+                triage_line = i
+            elif "Phase 4" in line and ("embed" in line.lower() or "batch" in line.lower()):
+                embed_line = i
+        self.assertIsNotNone(fetch_line, "Phase 1 (fetch) comment not found")
+        self.assertIsNotNone(triage_line, "Phase 2 (triage) comment not found")
+        self.assertIsNotNone(embed_line, "Phase 4 (embed) comment not found")
+        self.assertLess(fetch_line, triage_line)
+        self.assertLess(triage_line, embed_line)
+
+
 if __name__ == "__main__":
     unittest.main()

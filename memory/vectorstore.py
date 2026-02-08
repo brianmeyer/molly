@@ -85,10 +85,16 @@ class VectorStore:
             CREATE TABLE IF NOT EXISTS preference_signals (
                 id TEXT PRIMARY KEY,
                 signal_type TEXT,
+                source TEXT,
+                surfaced_summary TEXT,
+                sender_pattern TEXT,
+                owner_feedback TEXT,
                 context TEXT,
+                timestamp TEXT,
                 created_at TEXT
             );
         """)
+        self._ensure_preference_signal_columns()
 
         # Create virtual vec table (separate statement — can't be in executescript)
         self.conn.execute(f"""
@@ -99,6 +105,23 @@ class VectorStore:
             )
         """)
         self.conn.commit()
+
+    def _ensure_preference_signal_columns(self):
+        """Backfill new preference_signals columns for existing databases."""
+        cursor = self.conn.execute("PRAGMA table_info(preference_signals)")
+        existing = {row["name"] for row in cursor.fetchall()}
+        required = {
+            "source": "TEXT",
+            "surfaced_summary": "TEXT",
+            "sender_pattern": "TEXT",
+            "owner_feedback": "TEXT",
+            "timestamp": "TEXT",
+        }
+        for column, col_type in required.items():
+            if column not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE preference_signals ADD COLUMN {column} {col_type}"
+                )
 
     def store_chunk(
         self,
@@ -127,6 +150,42 @@ class VectorStore:
         )
         self.conn.commit()
         return chunk_id
+
+    def store_chunks_batch(
+        self,
+        chunks: list[dict],
+    ) -> list[str]:
+        """Store multiple conversation chunks in a single transaction.
+
+        Each dict must have: content, embedding, source, chat_jid.
+        Returns list of chunk IDs.
+        """
+        if not chunks:
+            return []
+
+        chunk_ids = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        for chunk in chunks:
+            chunk_id = str(uuid.uuid4())
+            chunk_ids.append(chunk_id)
+            self.conn.execute(
+                """
+                INSERT INTO conversation_chunks
+                    (id, content, created_at, source, chat_jid, topic_tags, entity_refs)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, chunk["content"], now, chunk["source"],
+                 chunk["chat_jid"], "", ""),
+            )
+            self.conn.execute(
+                "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                (chunk_id, _serialize_float32(chunk["embedding"])),
+            )
+
+        self.conn.commit()
+        log.debug("Batch stored %d chunks in single transaction", len(chunk_ids))
+        return chunk_ids
 
     def search(self, query_embedding: list[float], top_k: int = 5) -> list[dict]:
         """ANN search for the most similar conversation chunks."""
@@ -180,6 +239,44 @@ class VectorStore:
                (id, tool_name, parameters, success, latency_ms, error_message, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (call_id, tool_name, parameters[:500], int(success), latency_ms, error_message, now),
+        )
+        self.conn.commit()
+
+    def log_preference_signal(
+        self,
+        source: str,
+        surfaced_summary: str,
+        sender_pattern: str,
+        owner_feedback: str,
+        signal_type: str = "dismissive_feedback",
+    ):
+        """Log dismissive owner feedback tied to a surfaced proactive item."""
+        signal_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        context = json.dumps(
+            {
+                "source": source,
+                "surfaced_summary": surfaced_summary,
+                "sender_pattern": sender_pattern,
+                "owner_feedback": owner_feedback,
+            },
+            ensure_ascii=True,
+        )
+        self.conn.execute(
+            """INSERT INTO preference_signals
+               (id, signal_type, source, surfaced_summary, sender_pattern, owner_feedback, context, timestamp, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                signal_id,
+                signal_type,
+                source[:32],
+                surfaced_summary[:1000],
+                sender_pattern[:500],
+                owner_feedback[:500],
+                context[:2000],
+                now,
+                now,
+            ),
         )
         self.conn.commit()
 

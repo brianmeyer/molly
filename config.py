@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from pathlib import Path
@@ -5,6 +6,31 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv(Path.home() / ".molly" / "credentials" / ".env")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_vip_contacts() -> list[dict]:
+    """Load VIP contacts from env as JSON list, fallback to empty list.
+
+    Expected format:
+      MOLLY_VIP_CONTACTS='[{"email":"a@b.com","name":"Manager"}]'
+    """
+    raw = os.getenv("MOLLY_VIP_CONTACTS", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except Exception:
+        pass
+    return []
 
 # Identity
 ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Molly")
@@ -14,7 +40,7 @@ TRIGGER_PATTERN = re.compile(rf"(?:^|\s)@{ASSISTANT_NAME}\b", re.IGNORECASE)
 COMMANDS = {
     "/help", "/clear", "/memory", "/graph", "/forget",
     "/status", "/pending", "/register", "/unregister", "/groups",
-    "/skills", "/skill", "/digest",
+    "/skills", "/skill", "/digest", "/automations",
 }
 
 # Chat processing modes (tiered classification)
@@ -43,6 +69,18 @@ POLL_INTERVAL = 2  # seconds (queue drain timeout)
 HEARTBEAT_INTERVAL = 1800  # 30 minutes
 ACTIVE_HOURS = (8, 22)  # 8am to 10pm
 TIMEZONE = os.getenv("MOLLY_TIMEZONE", "America/New_York")
+AUTOMATION_TICK_INTERVAL = int(os.getenv("MOLLY_AUTOMATION_TICK_INTERVAL", "20"))  # seconds
+
+# Quiet hours / proactive automations (Phase 6)
+QUIET_HOURS_START = os.getenv("MOLLY_QUIET_HOURS_START", "22:00")
+QUIET_HOURS_END = os.getenv("MOLLY_QUIET_HOURS_END", "07:00")
+QUIET_HOURS_TIMEZONE = os.getenv("MOLLY_QUIET_HOURS_TIMEZONE", TIMEZONE)
+QUIET_HOURS_VIP_BYPASS = _env_bool("MOLLY_QUIET_HOURS_VIP_BYPASS", True)
+QUIET_HOURS_URGENT_BYPASS = _env_bool("MOLLY_QUIET_HOURS_URGENT_BYPASS", True)
+VIP_CONTACTS = _load_vip_contacts()
+AUTOMATION_PROPOSAL_COOLDOWN = int(os.getenv("MOLLY_AUTOMATION_PROPOSAL_COOLDOWN", "86400"))
+AUTOMATION_MIN_PATTERN_COUNT = int(os.getenv("MOLLY_AUTOMATION_MIN_PATTERN_COUNT", "3"))
+EMAIL_TRIAGE_INTERVAL = int(os.getenv("MOLLY_EMAIL_TRIAGE_INTERVAL", "600"))
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent
@@ -50,6 +88,7 @@ STORE_DIR = PROJECT_ROOT / "store"
 DATA_DIR = PROJECT_ROOT / "data"
 WORKSPACE = Path(os.getenv("MOLLY_WORKSPACE", Path.home() / ".molly" / "workspace"))
 LOG_DIR = Path.home() / ".molly" / "logs"
+AUTOMATIONS_DIR = WORKSPACE / "automations"
 
 # Files
 DATABASE_PATH = STORE_DIR / "messages.db"
@@ -58,6 +97,7 @@ AUTH_DIR = STORE_DIR / "auth"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 REGISTERED_CHATS_FILE = DATA_DIR / "registered_chats.json"
 STATE_FILE = DATA_DIR / "state.json"
+AUTOMATIONS_STATE_FILE = AUTOMATIONS_DIR / "state.json"
 
 # Identity files (loaded every turn)
 IDENTITY_FILES = [
@@ -100,6 +140,10 @@ ACTION_TIERS = {
     },
 }
 
+# Runtime preflight toggles (set in main.py at startup)
+DISABLED_MCP_SERVERS: set[str] = set()
+DISABLED_TOOL_NAMES: set[str] = set()
+
 # Paths within workspace/memory/ are auto-approved for Write/Edit
 # (daily logs, deep knowledge files). Identity files still require approval.
 AUTO_APPROVE_PATHS = {"memory/"}
@@ -128,11 +172,18 @@ MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 XAI_BASE_URL = "https://api.x.ai/v1"
 
-# Ollama / Triage (local Qwen3-4B)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-TRIAGE_MODEL = os.getenv("TRIAGE_MODEL", "qwen3:4b")
-TRIAGE_TIMEOUT = 30  # seconds per triage call (Qwen3 thinking uses extra tokens)
+# Local triage model (Qwen3-4B GGUF via llama-cpp-python)
+TRIAGE_MODEL_PATH = Path(
+    os.getenv(
+        "TRIAGE_MODEL_PATH",
+        Path.home() / ".molly" / "models" / "Qwen_Qwen3-4B-Q4_K_M.gguf",
+    )
+).expanduser()
+TRIAGE_TIMEOUT = 30  # seconds per triage call
 TRIAGE_CONTEXT_ENTITIES = 20  # top N entities by strength for triage context
+TRIAGE_GPU_LAYERS = int(os.getenv("TRIAGE_GPU_LAYERS", "-1"))  # -1 = use all available GPU layers
+TRIAGE_N_CTX = int(os.getenv("TRIAGE_N_CTX", "4096"))
+TRIAGE_N_THREADS = int(os.getenv("TRIAGE_N_THREADS", str(os.cpu_count() or 8)))
 
 # Neo4j
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
