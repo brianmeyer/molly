@@ -306,5 +306,190 @@ class TestDynamicTriggers(unittest.TestCase):
         self.assertIn("research-brief", names)
 
 
+# ---------------------------------------------------------------------------
+# #9: Task tool in AUTO tier (sub-agent routing unblocked)
+# ---------------------------------------------------------------------------
+class TestTaskToolTier(unittest.TestCase):
+    """Verify Task tool is in AUTO tier so sub-agents can be invoked."""
+
+    def setUp(self):
+        self.source = _read_source("config.py")
+
+    def test_task_in_auto_tier(self):
+        """Task must be in ACTION_TIERS AUTO set."""
+        # Find the AUTO section and check for Task
+        self.assertIn('"Task"', self.source)
+        # Verify it's in the AUTO block, not CONFIRM or BLOCKED
+        lines = self.source.split("\n")
+        in_auto = False
+        for line in lines:
+            if '"AUTO"' in line:
+                in_auto = True
+            if in_auto and '"Task"' in line:
+                break
+            if in_auto and ('"CONFIRM"' in line or '"BLOCKED"' in line):
+                self.fail("Task not found in AUTO tier before CONFIRM/BLOCKED")
+
+    def test_task_in_allowed_tools(self):
+        """Task must also be in ALLOWED_TOOLS list."""
+        self.assertIn('"Task"', self.source)
+
+
+# ---------------------------------------------------------------------------
+# #10: Timestamp format consistency
+# ---------------------------------------------------------------------------
+class TestTimestampFormat(unittest.TestCase):
+    """Verify timestamps are stored in ISO format."""
+
+    def setUp(self):
+        self.source = _read_source("whatsapp.py")
+
+    def test_uses_isoformat(self):
+        """whatsapp.py must convert timestamps to ISO format."""
+        self.assertIn("isoformat()", self.source)
+
+    def test_no_bare_str_timestamp(self):
+        """Must not use bare str(info.Timestamp) for storage."""
+        self.assertNotIn("timestamp = str(info.Timestamp)", self.source)
+
+
+# ---------------------------------------------------------------------------
+# #11: Approval edit flow returns instruction
+# ---------------------------------------------------------------------------
+class TestApprovalEditFlow(unittest.TestCase):
+    """Verify edit responses return the edit instruction, not just False."""
+
+    def setUp(self):
+        self.approval_source = _read_source("approval.py")
+        self.agent_source = _read_source("agent.py")
+
+    def test_edit_returns_instruction(self):
+        """Edit branch must return result[1] (the instruction string)."""
+        self.assertIn("return result[1]", self.approval_source)
+
+    def test_edit_not_returns_false(self):
+        """Edit branch must NOT return False."""
+        lines = self.approval_source.split("\n")
+        for i, line in enumerate(lines):
+            if 'result[0] == "edit"' in line:
+                # Check the next few lines don't return False
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    if "return False" in lines[j]:
+                        self.fail("Edit branch still returns False")
+                    if "return result[1]" in lines[j]:
+                        break
+
+    def test_agent_handles_edit_string(self):
+        """agent.py must handle edit instruction as a string result."""
+        self.assertIn("isinstance(result, str)", self.agent_source)
+        self.assertIn("edit instructions", self.agent_source)
+
+
+# ---------------------------------------------------------------------------
+# #12: Source parameter in handle_message
+# ---------------------------------------------------------------------------
+class TestSourceParameter(unittest.TestCase):
+    """Verify handle_message accepts source and callers pass it."""
+
+    def setUp(self):
+        self.agent_source = _read_source("agent.py")
+        self.main_source = _read_source("main.py")
+        self.web_source = _read_source("web.py")
+        self.terminal_source = _read_source("terminal.py")
+
+    def test_handle_message_has_source_param(self):
+        """handle_message must accept a source parameter."""
+        self.assertIn('source: str = "unknown"', self.agent_source)
+
+    def test_default_not_whatsapp(self):
+        """Default source must NOT be 'whatsapp'."""
+        self.assertNotIn('source: str = "whatsapp"', self.agent_source)
+
+    def test_main_passes_whatsapp(self):
+        """main.py must pass source='whatsapp'."""
+        self.assertIn('source="whatsapp"', self.main_source)
+
+    def test_web_passes_web(self):
+        """web.py must pass source='web'."""
+        self.assertIn('source="web"', self.web_source)
+
+    def test_terminal_passes_terminal(self):
+        """terminal.py must pass source='terminal'."""
+        self.assertIn('source="terminal"', self.terminal_source)
+
+    def test_post_processing_passes_source(self):
+        """agent.py post-processing must forward source to process_conversation."""
+        self.assertIn("source=source", self.agent_source)
+
+
+# ---------------------------------------------------------------------------
+# #13: Graph extraction in heartbeat paths
+# ---------------------------------------------------------------------------
+class TestHeartbeatGraphExtraction(unittest.TestCase):
+    """Verify iMessage and email heartbeat paths extract to graph."""
+
+    def setUp(self):
+        self.source = _read_source("heartbeat.py")
+
+    def test_imessage_imports_extract(self):
+        """iMessage heartbeat must import extract_to_graph."""
+        # Find the _check_imessage function area
+        self.assertIn("extract_to_graph", self.source)
+
+    def test_imessage_calls_extract(self):
+        """iMessage heartbeat must call extract_to_graph for relevant messages."""
+        # Look for extract_to_graph with imessage source
+        self.assertIn('source="imessage"', self.source)
+        lines = self.source.split("\n")
+        found_imessage_extract = False
+        for line in lines:
+            if "extract_to_graph" in line and "imessage" in line:
+                found_imessage_extract = True
+                break
+        self.assertTrue(found_imessage_extract, "extract_to_graph not called with imessage source")
+
+    def test_email_calls_extract(self):
+        """Email heartbeat must call extract_to_graph for relevant emails."""
+        lines = self.source.split("\n")
+        found_email_extract = False
+        for line in lines:
+            if "extract_to_graph" in line and "email" in line:
+                found_email_extract = True
+                break
+        self.assertTrue(found_email_extract, "extract_to_graph not called with email source")
+
+
+# ---------------------------------------------------------------------------
+# #14: Email high-water mark timing
+# ---------------------------------------------------------------------------
+class TestEmailHighWaterMark(unittest.TestCase):
+    """Verify email high-water mark is updated AFTER processing."""
+
+    def setUp(self):
+        self.source = _read_source("heartbeat.py")
+
+    def test_hw_after_processing_loop(self):
+        """email_heartbeat_hw update must come after the for msg_ref loop."""
+        lines = self.source.split("\n")
+        in_check_email = False
+        for_loop_line = None
+        hw_update_line = None
+        for i, line in enumerate(lines):
+            if "async def _check_email" in line:
+                in_check_email = True
+            if not in_check_email:
+                continue
+            if "for msg_ref in messages:" in line:
+                for_loop_line = i
+            if 'email_heartbeat_hw' in line and "now" in line and for_loop_line is not None:
+                # There should be a hw update after the for loop
+                # (one early return for no-messages case is OK, but the main one must be after)
+                if i > for_loop_line:
+                    hw_update_line = i
+        self.assertIsNotNone(for_loop_line, "for msg_ref loop not found in _check_email")
+        self.assertIsNotNone(hw_update_line, "email_heartbeat_hw update not found after processing loop")
+        self.assertGreater(hw_update_line, for_loop_line)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -425,6 +425,7 @@ class Molly:
                 clean_content, chat_jid, session_id,
                 approval_manager=self.approvals,
                 molly_instance=self,
+                source="whatsapp",
             )
 
             if new_session_id:
@@ -576,6 +577,7 @@ class Molly:
                     f"Approved. Proceed with: {description}",
                     chat_jid,
                     session_id,
+                    source="whatsapp",
                 )
                 if new_session_id:
                     self.sessions[chat_jid] = new_session_id

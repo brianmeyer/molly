@@ -78,6 +78,7 @@ def create_app(molly) -> FastAPI:
                         text, session_key, session_id,
                         approval_manager=molly.approvals,
                         molly_instance=molly,
+                        source="web",
                     )
 
                     if new_session_id:

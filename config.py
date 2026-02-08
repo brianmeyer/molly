@@ -28,7 +28,7 @@ CHAT_MODES = {"owner_dm", "respond", "listen", "store_only"}
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "opus")
 ALLOWED_TOOLS = [
     # Built-in Claude Code tools
-    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch",
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
     # Google Calendar (Phase 3B)
     "calendar_list", "calendar_get", "calendar_search",
     "calendar_create", "calendar_update", "calendar_delete",
@@ -90,7 +90,7 @@ SKILLS_DIR = WORKSPACE / "skills"
 ACTION_TIERS = {
     "AUTO": {
         # Read-only, local, safe — execute immediately
-        "Read", "Glob", "Grep", "WebSearch", "WebFetch",
+        "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
         # Google read-only (Phase 3B)
         "calendar_list", "calendar_get", "calendar_search",
         "gmail_search", "gmail_read",

@@ -66,7 +66,7 @@ async def run_heartbeat(molly):
     session_id = molly.sessions.get(heartbeat_key)
 
     try:
-        response, new_session_id = await handle_message(prompt, chat_jid, session_id)
+        response, new_session_id = await handle_message(prompt, chat_jid, session_id, source="heartbeat")
 
         if new_session_id:
             molly.sessions[heartbeat_key] = new_session_id
@@ -119,6 +119,7 @@ async def _check_morning_digest(molly, chat_jid: str):
             prompt, chat_jid, None,
             approval_manager=molly.approvals,
             molly_instance=molly,
+            source="heartbeat",
         )
 
         if new_session_id:
@@ -212,6 +213,7 @@ async def _check_meeting_prep(molly, chat_jid: str):
                     prompt, chat_jid, None,
                     approval_manager=molly.approvals,
                     molly_instance=molly,
+                    source="heartbeat",
                 )
                 if response:
                     molly._track_send(molly.wa.send_message(chat_jid, response))
@@ -265,7 +267,7 @@ async def _check_imessages(molly):
             return
 
         from memory.triage import triage_message
-        from memory.processor import embed_and_store
+        from memory.processor import embed_and_store, extract_to_graph
 
         for msg in messages:
             if msg["is_from_me"] or not msg["text"]:
@@ -287,13 +289,11 @@ async def _check_imessages(molly):
                 )
                 molly._track_send(molly.wa.send_message(owner_jid, notify))
 
-            # Embed into memory (urgent + relevant)
+            # Embed + graph extract for relevant/urgent messages
             if result and result.classification in ("urgent", "relevant"):
-                await embed_and_store(
-                    f"iMessage from {msg['sender']}: {msg['text']}",
-                    chat_jid="imessage",
-                    source="imessage",
-                )
+                imsg_text = f"iMessage from {msg['sender']}: {msg['text']}"
+                await embed_and_store(imsg_text, chat_jid="imessage", source="imessage")
+                await extract_to_graph(imsg_text, chat_jid="imessage", source="imessage")
 
         # Update high-water mark AFTER processing so a crash doesn't lose messages
         state_data["imessage_heartbeat_hw"] = time.time()
@@ -345,18 +345,17 @@ async def _check_email(molly):
 
         messages = result.get("messages", [])
 
-        # Update high-water mark (even if no messages, to track timing)
-        state_data["email_heartbeat_hw"] = now
-        config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
-
         if not messages:
+            # No messages — still update high-water to track timing
+            state_data["email_heartbeat_hw"] = now
+            config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
             return
 
         log.info("Email heartbeat: %d new unread emails", len(messages))
 
         from memory.triage import triage_message
-        from memory.processor import embed_and_store
+        from memory.processor import embed_and_store, extract_to_graph
 
         owner_jid = molly._get_owner_dm_jid()
 
@@ -397,16 +396,18 @@ async def _check_email(molly):
                         )
                         molly._track_send(molly.wa.send_message(owner_jid, notify))
 
-                # Embed into memory (urgent + relevant)
+                # Embed + graph extract for relevant/urgent emails
                 if triage_result and triage_result.classification in ("urgent", "relevant"):
-                    await embed_and_store(
-                        email_text,
-                        chat_jid="email",
-                        source="email",
-                    )
+                    await embed_and_store(email_text, chat_jid="email", source="email")
+                    await extract_to_graph(email_text, chat_jid="email", source="email")
 
             except Exception:
                 log.debug("Failed to process email %s", msg_ref.get("id"), exc_info=True)
+
+        # Update high-water mark AFTER processing so a crash doesn't lose emails
+        state_data["email_heartbeat_hw"] = now
+        config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
 
     except Exception:
         log.warning("Email heartbeat check failed", exc_info=True)
