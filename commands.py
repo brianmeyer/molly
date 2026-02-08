@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from datetime import date, datetime, timezone
@@ -32,7 +33,11 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             "/skills - List all available skills and their triggers\n"
             "/skill <name> - Show details of a specific skill\n"
             "/digest - Run the daily digest now\n"
-            "/automations - List loaded automations and run schedule"
+            "/automations - List loaded automations and run schedule\n"
+            "/followups - Show active commitments + Apple Reminders sync status\n"
+            "/commitments - Alias for /followups\n"
+            "/health - Show latest health report (or generate one)\n"
+            "/health history - Show 7-day health trend"
         )
 
     if cmd == "/clear":
@@ -216,22 +221,10 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
                     label += f" — {info['member_count']} members"
                 groups.append(label)
             else:
-                # DM — resolve phone to contact name
+                # DM — use stored display name or phone fallback
                 phone = jid.split("@")[0]
-                name = None
-
-                # Try Apple Contacts
-                try:
-                    from tools.contacts import resolve_phone_to_name
-                    name = resolve_phone_to_name(phone)
-                except Exception:
-                    pass
-
-                # Fall back to stored name (may be a pushname)
-                if not name:
-                    stored = info.get("name", "")
-                    if stored and stored != phone:
-                        name = stored
+                stored = info.get("name", "")
+                name = stored if stored and stored != phone else None
 
                 # Final fallback: formatted phone number
                 if not name:
@@ -318,11 +311,18 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             molly.wa.send_typing(chat_jid)
         try:
             session_id = molly.sessions.get(chat_jid)
+            chat_context = None
+            if hasattr(molly, "build_agent_chat_context"):
+                chat_context = molly.build_agent_chat_context(
+                    chat_jid,
+                    chat_jid.endswith("@g.us"),
+                )
             response, new_session_id = await handle_message(
                 prompt, chat_jid, session_id,
                 approval_manager=molly.approvals,
                 molly_instance=molly,
                 source="whatsapp",
+                chat_context=chat_context,
             )
             if new_session_id:
                 molly.sessions[chat_jid] = new_session_id
@@ -391,5 +391,29 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
         except Exception as e:
             log.error("/automations failed", exc_info=True)
             return f"Automations status failed: {e}"
+
+    if cmd in {"/followups", "/commitments"}:
+        if not hasattr(molly, "automations") or not molly.automations:
+            return "Automation engine is not initialized."
+        try:
+            return await molly.automations.commitments_report()
+        except Exception as e:
+            log.error("%s failed", cmd, exc_info=True)
+            return f"Commitments report failed: {e}"
+
+    if cmd == "/health":
+        from health import get_health_doctor
+
+        doctor = get_health_doctor(molly)
+        arg = args.strip().lower()
+        try:
+            if arg == "history":
+                return await asyncio.to_thread(doctor.history_markdown, days=7)
+            if arg in {"fresh", "now", "run"}:
+                return await asyncio.to_thread(doctor.generate_report, abbreviated=False, trigger="manual")
+            return await asyncio.to_thread(doctor.get_or_generate_latest_report, fresh=False)
+        except Exception as e:
+            log.error("/health failed", exc_info=True)
+            return f"Health check failed: {e}"
 
     return None

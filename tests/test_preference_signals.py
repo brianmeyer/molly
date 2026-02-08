@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 
-PROJECT_ROOT = Path("/Users/brianmeyer/molly")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _read(path: str) -> str:
@@ -22,9 +22,17 @@ class TestPreferenceSignalSchema(unittest.TestCase):
 class TestDismissiveFeedbackHook(unittest.TestCase):
     def test_main_logs_dismissive_owner_feedback(self):
         src = _read("main.py")
-        self.assertIn("DISMISSIVE_FEEDBACK_PATTERNS", src)
+        self.assertNotIn("DISMISSIVE_FEEDBACK_PATTERNS", src)
         self.assertIn("def _log_preference_signal_if_dismissive", src)
+        self.assertIn("from memory.triage import classify_local_async", src)
+        self.assertIn("dismissive_task = asyncio.create_task(", src)
         self.assertIn("self._log_preference_signal_if_dismissive(chat_jid, content)", src)
+
+    def test_triage_has_local_classifier_helper(self):
+        src = _read("memory/triage.py")
+        self.assertIn("def classify_local(prompt: str, text: str) -> str:", src)
+        self.assertIn("async def classify_local_async(prompt: str, text: str) -> str:", src)
+        self.assertIn("run_in_executor", src)
 
 
 class TestSurfacingMetadata(unittest.TestCase):

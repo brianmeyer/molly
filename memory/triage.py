@@ -168,6 +168,75 @@ def _build_user_prompt(
     )
 
 
+def classify_local(prompt: str, text: str) -> str:
+    """Run a cheap local classification task and return the model label text."""
+    model = _load_model()
+    if model is None:
+        return ""
+
+    base_prompt = (prompt or "").strip()
+    if not base_prompt:
+        return ""
+
+    payload = text or ""
+    user_prompt = (
+        base_prompt.replace("{reply}", payload).replace("{text}", payload)
+    )
+    if user_prompt == base_prompt and payload:
+        user_prompt = f"{base_prompt}\n\n{payload}"
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a local classifier. Follow instructions and respond tersely.",
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+
+    raw = ""
+    try:
+        resp = model.create_chat_completion(
+            messages=messages,
+            temperature=0.0,
+            max_tokens=16,
+        )
+        raw = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        log.debug("Local classify chat completion failed", exc_info=True)
+
+    if not raw:
+        try:
+            resp = model.create_completion(
+                prompt=f"{messages[0]['content']}\n\n{messages[1]['content']}",
+                temperature=0.0,
+                max_tokens=16,
+            )
+            raw = resp.get("choices", [{}])[0].get("text", "")
+        except Exception:
+            log.debug("Local classify completion fallback failed", exc_info=True)
+
+    cleaned = (raw or "").strip()
+    yn = re.search(r"\b(YES|NO)\b", cleaned, flags=re.IGNORECASE)
+    if yn:
+        return yn.group(1).upper()
+    if not cleaned:
+        return ""
+    return cleaned.splitlines()[0].strip()[:64]
+
+
+async def classify_local_async(prompt: str, text: str) -> str:
+    """Async wrapper for local classification using the triage executor."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _TRIAGE_EXECUTOR,
+        classify_local,
+        prompt,
+        text,
+    )
+
+
 async def triage_message(
     message: str,
     sender_name: str = "Unknown",

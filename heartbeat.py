@@ -375,24 +375,51 @@ async def _check_email(molly):
         if not service:
             return
 
-        # Rate limit: only poll every EMAIL_POLL_INTERVAL seconds
+        # Rate limit: only poll every EMAIL_POLL_INTERVAL seconds.
+        # Keep legacy fallback for existing state files that only have
+        # email_heartbeat_hw.
         state_data = json.loads(config.STATE_FILE.read_text()) if config.STATE_FILE.exists() else {}
-        last_check = float(state_data.get("email_heartbeat_hw", 0))
+        last_poll = float(
+            state_data.get(
+                "email_heartbeat_last_poll",
+                state_data.get("email_heartbeat_hw", 0),
+            )
+        )
         now = time.time()
 
-        if last_check > 0 and (now - last_check) < config.EMAIL_POLL_INTERVAL:
+        if last_poll > 0 and (now - last_poll) < config.EMAIL_POLL_INTERVAL:
             return
 
-        # Build Gmail query for recent unread messages
-        if last_check == 0:
-            # First run — look back 24 hours
-            lookback_seconds = 24 * 3600
-        else:
-            lookback_seconds = int(now - last_check)
+        try:
+            high_water_ts_ms = int(
+                state_data.get(
+                    "email_heartbeat_hw_ts_ms",
+                    float(state_data.get("email_heartbeat_hw", 0)) * 1000,
+                )
+            )
+        except Exception:
+            high_water_ts_ms = 0
+        if high_water_ts_ms < 0:
+            high_water_ts_ms = 0
 
-        # Gmail query: unread messages newer than lookback period
-        lookback_hours = max(1, lookback_seconds // 3600)
-        query = f"is:unread newer_than:{lookback_hours}h"
+        high_water_ids_list = [
+            str(value).strip()
+            for value in state_data.get("email_heartbeat_hw_ids", [])
+            if str(value).strip()
+        ]
+        legacy_high_water_id = str(state_data.get("email_heartbeat_hw_id", "")).strip()
+        if legacy_high_water_id and legacy_high_water_id not in high_water_ids_list:
+            high_water_ids_list.append(legacy_high_water_id)
+        high_water_ids = set(high_water_ids_list)
+
+        # Use precise high-water timestamp for query, with a one-second overlap
+        # to avoid dropping messages on second-level boundaries.
+        if high_water_ts_ms > 0:
+            after_s = max(0, (high_water_ts_ms // 1000) - 1)
+        else:
+            after_s = int(now - (24 * 3600))
+
+        query = f"is:unread after:{after_s}"
 
         result = (
             service.users()
@@ -404,7 +431,8 @@ async def _check_email(molly):
         messages = result.get("messages", [])
 
         if not messages:
-            # No messages — still update high-water to track timing
+            # No messages — update poll timestamp but keep high-water cursor.
+            state_data["email_heartbeat_last_poll"] = now
             state_data["email_heartbeat_hw"] = now
             config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
@@ -419,7 +447,7 @@ async def _check_email(molly):
         owner_jid = molly._get_owner_dm_jid()
 
         # --- Phase 1: Fetch all email metadata ---
-        email_data = []  # list of (sender, subject, snippet, email_text)
+        email_data = []  # list of (msg_id, internal_ts_ms, sender, subject, snippet, email_text)
         for msg_ref in messages:
             try:
                 msg = (
@@ -433,15 +461,37 @@ async def _check_email(molly):
                     h["name"].lower(): h["value"]
                     for h in msg.get("payload", {}).get("headers", [])
                 }
+
+                msg_id = str(msg.get("id", "")).strip()
+                if not msg_id:
+                    continue
+
+                try:
+                    internal_ts_ms = int(msg.get("internalDate", 0))
+                except Exception:
+                    internal_ts_ms = 0
+
+                # Query includes a boundary overlap second; filter duplicates
+                # with exact (timestamp,id) high-water checks.
+                if high_water_ts_ms > 0:
+                    if internal_ts_ms > 0:
+                        if internal_ts_ms < high_water_ts_ms:
+                            continue
+                        if internal_ts_ms == high_water_ts_ms and msg_id in high_water_ids:
+                            continue
+                    elif msg_id in high_water_ids:
+                        continue
+
                 sender = headers.get("from", "Unknown")
                 subject = headers.get("subject", "(no subject)")
                 snippet = msg.get("snippet", "")
                 email_text = f"From: {sender}\nSubject: {subject}\n{snippet}"
-                email_data.append((sender, subject, snippet, email_text))
+                email_data.append((msg_id, internal_ts_ms, sender, subject, snippet, email_text))
             except Exception:
                 log.debug("Failed to fetch email %s", msg_ref.get("id"), exc_info=True)
 
         if not email_data:
+            state_data["email_heartbeat_last_poll"] = now
             state_data["email_heartbeat_hw"] = now
             config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
@@ -450,7 +500,7 @@ async def _check_email(molly):
         # --- Phase 2: Triage all emails in parallel ---
         triage_tasks = [
             triage_message(email_text, sender_name=sender, group_name="Email")
-            for sender, _subject, _snippet, email_text in email_data
+            for _msg_id, _internal_ts_ms, sender, _subject, _snippet, email_text in email_data
         ]
         triage_results = await asyncio.gather(*triage_tasks, return_exceptions=True)
 
@@ -463,7 +513,7 @@ async def _check_email(molly):
                 log.debug("Triage failed for email %d", i, exc_info=triage_result)
                 continue
 
-            sender, subject, snippet, email_text = email_data[i]
+            _msg_id, _internal_ts_ms, sender, subject, snippet, email_text = email_data[i]
 
             if triage_result and triage_result.classification == "urgent":
                 if owner_jid and molly.wa:
@@ -504,7 +554,39 @@ async def _check_email(molly):
                 len(email_data), len(texts_to_embed),
             )
 
-        # Update high-water mark AFTER processing so a crash doesn't lose emails
+        # Update high-water mark AFTER processing so a crash doesn't lose emails.
+        latest_ts_ms = 0
+        latest_ids: list[str] = []
+        for msg_id, internal_ts_ms, _sender, _subject, _snippet, _email_text in email_data:
+            if internal_ts_ms > latest_ts_ms:
+                latest_ts_ms = internal_ts_ms
+                latest_ids = [msg_id]
+            elif internal_ts_ms == latest_ts_ms:
+                latest_ids.append(msg_id)
+
+        latest_ids = list(dict.fromkeys([msg_id for msg_id in latest_ids if msg_id]))
+        latest_ids = latest_ids[-50:]
+        if latest_ts_ms <= 0 and email_data:
+            latest_ts_ms = max(high_water_ts_ms, int(now * 1000))
+            latest_ids = [
+                msg_id
+                for msg_id, _internal_ts_ms, _sender, _subject, _snippet, _email_text in email_data
+                if msg_id
+            ][-50:]
+
+        if latest_ts_ms > high_water_ts_ms:
+            merged_ids = latest_ids
+        elif latest_ts_ms == high_water_ts_ms:
+            merged_ids = list(dict.fromkeys([*high_water_ids_list, *latest_ids]))[-50:]
+        else:
+            merged_ids = high_water_ids_list[-50:]
+
+        if latest_ts_ms > 0:
+            state_data["email_heartbeat_hw_ts_ms"] = latest_ts_ms
+            state_data["email_heartbeat_hw_ids"] = merged_ids
+            state_data["email_heartbeat_hw_id"] = merged_ids[-1] if merged_ids else ""
+
+        state_data["email_heartbeat_last_poll"] = now
         state_data["email_heartbeat_hw"] = now
         config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         config.STATE_FILE.write_text(json.dumps(state_data, indent=2))

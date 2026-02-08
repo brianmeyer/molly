@@ -1,7 +1,7 @@
 """iMessage MCP tools for Molly (read-only).
 
 Read-only access to the macOS Messages SQLite database (chat.db).
-Automatically resolves sender handles to Apple Contact names.
+Sender names fall back to raw handles when contacts are unavailable.
 
 Tools:
   imessage_search  (AUTO) — Search messages by contact, keyword, or date range
@@ -17,6 +17,7 @@ Requires Full Disk Access for the Python process.
 
 import json
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -24,12 +25,19 @@ from datetime import datetime, timezone
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
-from tools.contacts import batch_resolve_handles, resolve_handle_to_name
 
 log = logging.getLogger(__name__)
 
 # Seconds between Unix epoch (1970-01-01) and Apple epoch (2001-01-01)
 APPLE_EPOCH_OFFSET = 978307200
+_NON_DIGITS = re.compile(r"\D+")
+
+
+def _normalize_phone_for_match(phone: str) -> str:
+    digits = _NON_DIGITS.sub("", str(phone or ""))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits[-10:] if len(digits) >= 10 else digits
 
 
 def _connect() -> sqlite3.Connection:
@@ -100,12 +108,9 @@ def _format_ts(apple_ts) -> str:
 
 
 def _resolve_handle(handle_id: str) -> str:
-    """Resolve an iMessage handle (phone/email) to a contact name."""
+    """Resolve an iMessage handle to a display value."""
     if not handle_id:
         return "Unknown"
-    name = resolve_handle_to_name(handle_id)
-    if name:
-        return name
     return handle_id
 
 
@@ -133,14 +138,8 @@ def _build_handle_map(conn: sqlite3.Connection) -> dict[int, str]:
 
 
 def _prewarm_contacts(rows, handle_map: dict[int, str]):
-    """Pre-warm the contacts cache for all unique handles in a result set."""
-    unique_handles = {
-        handle_map[r["handle_id"]]
-        for r in rows
-        if r["handle_id"] in handle_map
-    }
-    if unique_handles:
-        batch_resolve_handles(list(unique_handles))
+    """Legacy no-op: contact prewarming moved to apple-mcp."""
+    return
 
 
 def _get_high_water() -> float:
@@ -214,13 +213,13 @@ def _find_handles_for_contact(
             if identifiers:
                 matching = []
                 for rowid, handle_id in handle_map.items():
-                    handle_norm = handle_id.lstrip("+").replace("-", "").replace(" ", "")
+                    handle_norm = _normalize_phone_for_match(handle_id)
                     for ident in identifiers:
-                        ident_norm = ident.lstrip("+").replace("-", "").replace(" ", "")
-                        if handle_norm[-10:] == ident_norm[-10:] and len(handle_norm) >= 10:
+                        ident_norm = _normalize_phone_for_match(str(ident))
+                        if handle_norm and ident_norm and handle_norm == ident_norm:
                             matching.append(rowid)
                             break
-                        if handle_id.lower() == ident.lower():
+                        if str(handle_id).lower() == str(ident).lower():
                             matching.append(rowid)
                             break
                 return matching
@@ -291,8 +290,8 @@ async def imessage_search(args: dict) -> dict:
 
 @tool(
     "imessage_recent",
-    "Get recent iMessages from the last N hours. Shows sender names "
-    "(resolved from Apple Contacts), message text, and timestamps.",
+    "Get recent iMessages from the last N hours. Shows sender handles, "
+    "message text, and timestamps.",
     {"hours": int, "limit": int},
 )
 async def imessage_recent(args: dict) -> dict:

@@ -5,6 +5,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import config
 
@@ -24,17 +25,80 @@ NO_WORDS = frozenset({
     "no", "n", "deny", "denied", "cancel", "stop", "don't", "dont",
     "nope", "nah",
 })
+APPROVE_ALL_WORDS = frozenset({
+    "all",
+    "yes all",
+    "approve all",
+    "approved all",
+    "go all",
+    "proceed all",
+    "all yes",
+})
+
+# Intentionally empty: owner routing should come from configured OWNER_IDS
+# or runtime-registered owner chats, not hardcoded personal IDs.
+OWNER_APPROVAL_JID_FALLBACKS: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
 # Action tier classification
 # ---------------------------------------------------------------------------
 
-def get_action_tier(tool_name: str) -> str:
+_APPLE_MCP_READ_OPS: dict[str, set[str]] = {
+    "reminders": {"list", "search", "listbyid"},
+    "notes": {"search", "list"},
+    "messages": {"read", "unread"},
+    "mail": {"unread", "search", "mailboxes", "accounts", "latest"},
+    "calendar": {"search", "open", "list"},
+    "maps": {"search", "directions", "listguides"},
+}
+
+_APPLE_MCP_WRITE_OPS: dict[str, set[str]] = {
+    "reminders": {"create", "open"},
+    "notes": {"create"},
+    "messages": {"send", "schedule"},
+    "mail": {"send"},
+    "calendar": {"create"},
+    "maps": {"save", "pin", "addtoguide", "createguide"},
+}
+
+_APPLE_MCP_TOOL_ALIAS_TIERS: dict[str, str] = {
+    "list_reminders": "AUTO",
+    "search_reminders": "AUTO",
+    "create_reminder": "CONFIRM",
+    "complete_reminder": "CONFIRM",
+    "delete_reminder": "CONFIRM",
+}
+
+
+def _get_operation(tool_input: dict[str, Any] | None) -> str | None:
+    if not isinstance(tool_input, dict):
+        return None
+    raw = tool_input.get("operation")
+    if not isinstance(raw, str):
+        return None
+    op = raw.strip().lower()
+    return op or None
+
+
+def get_action_tier(tool_name: str, tool_input: dict[str, Any] | None = None) -> str:
     """Classify a tool into AUTO, CONFIRM, or BLOCKED.
 
     Unknown tools default to BLOCKED for safety.
     """
+    operation = _get_operation(tool_input)
+    alias_tier = _APPLE_MCP_TOOL_ALIAS_TIERS.get(tool_name)
+    if alias_tier:
+        return alias_tier
+
+    if tool_name in _APPLE_MCP_READ_OPS:
+        if operation in _APPLE_MCP_READ_OPS[tool_name]:
+            return "AUTO"
+        if operation in _APPLE_MCP_WRITE_OPS.get(tool_name, set()):
+            return "CONFIRM"
+        # Conservative fallback for unknown/omitted operations.
+        return "CONFIRM"
+
     for tier in ("AUTO", "CONFIRM", "BLOCKED"):
         if tool_name in config.ACTION_TIERS.get(tier, set()):
             return tier
@@ -121,6 +185,19 @@ def format_approval_message(tool_name: str, tool_input: dict) -> str:
     elif tool_name == "calendar_delete":
         lines.append(f"Event: {tool_input.get('event_id', 'unknown')}")
 
+    elif tool_name in ("reminders", "create_reminder"):
+        operation = str(tool_input.get("operation", "create")).strip().lower() if tool_name == "reminders" else "create"
+        lines.append(f"Operation: {operation or 'create'}")
+        lines.append(f"List: {tool_input.get('list', tool_input.get('list_name', 'Molly'))}")
+        lines.append(f"Title: {tool_input.get('title', 'unknown')}")
+        if tool_input.get("due_at"):
+            lines.append(f"Due: {tool_input.get('due_at')}")
+        if tool_input.get("notes"):
+            preview = str(tool_input.get("notes", ""))
+            if len(preview) > 200:
+                preview = preview[:200] + "..."
+            lines.append(f"Notes: {preview}")
+
     else:
         # Generic format for other CONFIRM tools
         for key, value in list(tool_input.items())[:5]:
@@ -129,7 +206,10 @@ def format_approval_message(tool_name: str, tool_input: dict) -> str:
                 val_str = val_str[:200] + "..."
             lines.append(f"{key}: {val_str}")
 
-    lines.append("\nReply YES to proceed, NO to cancel, or EDIT: [changes]")
+    lines.append(
+        "\nReply YES to approve this action, ALL to approve all actions for this request, "
+        "NO to cancel, or EDIT: [changes]"
+    )
     return "\n".join(lines)
 
 
@@ -138,14 +218,42 @@ def format_approval_message(tool_name: str, tool_input: dict) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class RequestApprovalState:
+    """Per-request approval cache and inflight coalescing state."""
+
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    approved_all_confirm: bool = False
+    approved_tools: set[str] = field(default_factory=set)
+    denied_tools: set[str] = field(default_factory=set)
+    inflight_tool_approvals: dict[str, asyncio.Future] = field(default_factory=dict)
+    tool_asks: int = 0
+    prompts_sent: int = 0
+    auto_approved: int = 0
+
+    def reset_for_retry(self):
+        """Clear transient deny/inflight state before a transport retry."""
+        self.denied_tools.clear()
+        self.inflight_tool_approvals.clear()
+
+
+@dataclass
 class PendingApproval:
     id: str
     category: str
     description: str
     chat_jid: str
+    response_chat_jid: str
     session_id: str | None
     future: asyncio.Future
+    required_keyword: str = ""
+    allow_edit: bool = True
+    allow_approve_all: bool = False
     created_at: datetime = field(default_factory=datetime.now)
+
+
+def _is_approve_all_reply(normalized_text: str) -> bool:
+    compact = " ".join(normalized_text.strip().split())
+    return compact in APPROVE_ALL_WORDS
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +264,120 @@ class ApprovalManager:
     """Manages approval requests sent via WhatsApp and resolved by yes/no replies."""
 
     def __init__(self):
-        self._pending: dict[str, PendingApproval] = {}  # chat_jid -> approval
+        self._pending: dict[str, PendingApproval] = {}  # approval_id -> approval
+        self._pending_by_request_chat: dict[str, str] = {}  # request_chat_jid -> approval_id
+        self._pending_by_response_chat: dict[str, str] = {}  # response_chat_jid -> approval_id
+
+    @staticmethod
+    def _is_whatsapp_jid(chat_jid: str) -> bool:
+        return isinstance(chat_jid, str) and "@" in chat_jid
+
+    def _iter_owner_approval_jids(self, molly) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: str | None):
+            jid = (candidate or "").strip()
+            if not jid or jid in seen:
+                return
+            seen.add(jid)
+            candidates.append(jid)
+
+        if molly and hasattr(molly, "_get_owner_dm_jid"):
+            try:
+                _add(molly._get_owner_dm_jid())
+            except Exception:
+                log.debug("Failed resolving owner DM JID from Molly", exc_info=True)
+
+        registered = getattr(molly, "registered_chats", {}) if molly else {}
+        if isinstance(registered, dict):
+            for jid in registered:
+                if jid.split("@")[0] in config.OWNER_IDS:
+                    _add(jid)
+
+        for owner_id in config.OWNER_IDS:
+            oid = owner_id.strip()
+            if not oid:
+                continue
+            if "@" in oid:
+                _add(oid)
+                continue
+            _add(f"{oid}@s.whatsapp.net")
+            _add(f"{oid}@lid")
+
+        for fallback in OWNER_APPROVAL_JID_FALLBACKS:
+            _add(fallback)
+
+        return candidates
+
+    def _resolve_response_chat_jid(self, request_chat_jid: str, molly) -> str:
+        if self._is_whatsapp_jid(request_chat_jid):
+            return request_chat_jid
+
+        for candidate in self._iter_owner_approval_jids(molly):
+            if self._is_whatsapp_jid(candidate):
+                if candidate != request_chat_jid:
+                    log.info(
+                        "Routing approval from non-WhatsApp chat %s to owner WhatsApp chat %s",
+                        request_chat_jid,
+                        candidate,
+                    )
+                return candidate
+
+        log.warning(
+            "No owner WhatsApp JID available for non-WhatsApp approval source %s",
+            request_chat_jid,
+        )
+        return request_chat_jid
+
+    def _track_send(self, molly, message_result):
+        if hasattr(molly, "_track_send"):
+            try:
+                molly._track_send(message_result)
+            except Exception:
+                log.debug("Failed to track outbound approval message", exc_info=True)
+
+    def _send_approval_message(self, molly, chat_jid: str, text: str):
+        wa = getattr(molly, "wa", None)
+        if not wa:
+            log.warning("Approval message not sent (WhatsApp unavailable): %s", chat_jid)
+            return None
+        message_result = wa.send_message(chat_jid, text)
+        self._track_send(molly, message_result)
+        return message_result
+
+    def _lookup_pending_id(self, chat_jid: str) -> str | None:
+        pending_id = self._pending_by_response_chat.get(chat_jid)
+        if pending_id:
+            return pending_id
+        return self._pending_by_request_chat.get(chat_jid)
+
+    def _lookup_pending(self, chat_jid: str) -> PendingApproval | None:
+        pending_id = self._lookup_pending_id(chat_jid)
+        if not pending_id:
+            return None
+        return self._pending.get(pending_id)
+
+    def _register_pending(self, approval: PendingApproval):
+        self._pending[approval.id] = approval
+        self._pending_by_request_chat[approval.chat_jid] = approval.id
+        self._pending_by_response_chat[approval.response_chat_jid] = approval.id
+
+    def _remove_pending(self, approval: PendingApproval):
+        existing = self._pending.pop(approval.id, None)
+        if not existing:
+            return
+        if self._pending_by_request_chat.get(existing.chat_jid) == existing.id:
+            self._pending_by_request_chat.pop(existing.chat_jid, None)
+        if self._pending_by_response_chat.get(existing.response_chat_jid) == existing.id:
+            self._pending_by_response_chat.pop(existing.response_chat_jid, None)
+
+    def _pop_pending_for_chat(self, chat_jid: str) -> PendingApproval | None:
+        pending = self._lookup_pending(chat_jid)
+        if not pending:
+            return None
+        self._remove_pending(pending)
+        return pending
 
     # --- Tag detection (prompt-level fallback) ---
 
@@ -181,32 +402,91 @@ class ApprovalManager:
         tool_input: dict,
         chat_jid: str,
         molly,
+        request_state: RequestApprovalState | None = None,
     ) -> bool | str:
         """Send an approval request on WhatsApp for a tool call and wait.
 
         Returns True if approved, False if denied or timed out,
         or a string with edit instructions if Brian replied "edit: ...".
         """
-        # Cancel any stale pending approval for this chat
+        if request_state is not None:
+            request_state.tool_asks += 1
+
+        if request_state is not None and request_state.approved_all_confirm:
+            request_state.auto_approved += 1
+            log.info("Tool auto-approved (request-level ALL grant): %s", tool_name)
+            return True
+
+        if request_state is not None and tool_name in request_state.approved_tools:
+            request_state.auto_approved += 1
+            log.info("Tool auto-approved (session grant): %s", tool_name)
+            return True
+
+        if request_state is not None and tool_name in request_state.denied_tools:
+            log.info("Tool auto-denied (session deny): %s", tool_name)
+            return False
+
+        if request_state is not None:
+            inflight = request_state.inflight_tool_approvals.get(tool_name)
+            if inflight is not None:
+                log.info("Awaiting in-flight approval for [%s] in %s", tool_name, chat_jid)
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(inflight), timeout=config.APPROVAL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    return False
+                final = self._apply_tool_approval_result(tool_name, result, request_state)
+                if final is True:
+                    request_state.auto_approved += 1
+                return final
+
+        response_chat_jid = self._resolve_response_chat_jid(chat_jid, molly)
+
+        # Cancel any stale pending approval for this request or approval-response chat
         self._cancel_pending(chat_jid)
+        if response_chat_jid != chat_jid:
+            self._cancel_pending(response_chat_jid)
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        if request_state is not None:
+            request_state.inflight_tool_approvals[tool_name] = future
 
         description = format_approval_message(tool_name, tool_input)
+        if request_state is not None:
+            session_header = (
+                f"🔧 {tool_name} requested — approve for this request? "
+                f"(Reply ALL to approve all CONFIRM actions in this request)"
+            )
+            description = f"{session_header}\n\n{description}"
+        if response_chat_jid != chat_jid:
+            description = f"{description}\n\nOrigin chat: {chat_jid}"
+
         approval = PendingApproval(
             id=str(uuid.uuid4()),
             category=tool_name,
             description=description,
             chat_jid=chat_jid,
+            response_chat_jid=response_chat_jid,
             session_id=None,
             future=future,
+            required_keyword="",
+            allow_edit=True,
+            allow_approve_all=True,
         )
-        self._pending[chat_jid] = approval
+        self._register_pending(approval)
 
-        # Send the structured approval message via WhatsApp
-        molly._track_send(molly.wa.send_message(chat_jid, description))
-        log.info("Tool approval requested [%s] in %s", tool_name, chat_jid)
+        # Send the structured approval message (non-WhatsApp requests are routed to owner WhatsApp)
+        if request_state is not None:
+            request_state.prompts_sent += 1
+        self._send_approval_message(molly, response_chat_jid, description)
+        log.info(
+            "Tool approval requested [%s] request_chat=%s response_chat=%s",
+            tool_name,
+            chat_jid,
+            response_chat_jid,
+        )
 
         # Wait for yes/no/edit or timeout
         t0 = asyncio.get_event_loop().time()
@@ -215,31 +495,67 @@ class ApprovalManager:
                 future, timeout=config.APPROVAL_TIMEOUT
             )
             elapsed = asyncio.get_event_loop().time() - t0
-            if result is True:
-                _log_approval_decision(tool_name, "approved", elapsed)
+            final = self._apply_tool_approval_result(tool_name, result, request_state)
+            if final is True:
+                if isinstance(result, tuple) and result[0] == "approve_all":
+                    _log_approval_decision(tool_name, "approved_all", elapsed)
+                else:
+                    _log_approval_decision(tool_name, "approved", elapsed)
                 return True
-            elif result is False:
-                _log_approval_decision(tool_name, "denied", elapsed)
-                return False
-            elif isinstance(result, tuple) and result[0] == "edit":
+            if isinstance(final, str):
                 # Edit request — deny this call with the edit instruction so
                 # the agent can modify parameters and retry
                 _log_approval_decision(tool_name, "edited", elapsed)
-                return result[1]  # return the edit instruction string
+                return final
             _log_approval_decision(tool_name, "denied", elapsed)
             return False
         except asyncio.TimeoutError:
-            self._pending.pop(chat_jid, None)
+            self._remove_pending(approval)
+            if not future.done():
+                future.set_result(False)
             elapsed = asyncio.get_event_loop().time() - t0
+            self._apply_tool_approval_result(tool_name, False, request_state)
             _log_approval_decision(tool_name, "timed_out", elapsed)
-            molly._track_send(
-                molly.wa.send_message(
-                    chat_jid,
-                    f"Approval timed out for: {tool_name}",
-                )
+            self._send_approval_message(
+                molly,
+                response_chat_jid,
+                f"Approval timed out for: {tool_name}",
             )
             log.info("Tool approval timed out: %s", tool_name)
             return False
+        finally:
+            if request_state is not None:
+                current = request_state.inflight_tool_approvals.get(tool_name)
+                if current is future:
+                    request_state.inflight_tool_approvals.pop(tool_name, None)
+
+    @staticmethod
+    def _apply_tool_approval_result(
+        tool_name: str,
+        result: Any,
+        request_state: RequestApprovalState | None,
+    ) -> bool | str:
+        if isinstance(result, tuple) and result and result[0] == "edit":
+            if request_state is not None:
+                request_state.denied_tools.add(tool_name)
+            return result[1]
+
+        if isinstance(result, tuple) and result and result[0] == "approve_all":
+            if request_state is not None:
+                request_state.approved_all_confirm = True
+                request_state.approved_tools.add(tool_name)
+                request_state.denied_tools.discard(tool_name)
+            return True
+
+        if result is True:
+            if request_state is not None:
+                request_state.approved_tools.add(tool_name)
+                request_state.denied_tools.discard(tool_name)
+            return True
+
+        if request_state is not None:
+            request_state.denied_tools.add(tool_name)
+        return False
 
     # --- Tag-based approval (prompt-level fallback) ---
 
@@ -255,7 +571,10 @@ class ApprovalManager:
 
         Returns True if approved, False if denied or timed out.
         """
+        response_chat_jid = self._resolve_response_chat_jid(chat_jid, molly)
         self._cancel_pending(chat_jid)
+        if response_chat_jid != chat_jid:
+            self._cancel_pending(response_chat_jid)
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -265,10 +584,13 @@ class ApprovalManager:
             category=category,
             description=description,
             chat_jid=chat_jid,
+            response_chat_jid=response_chat_jid,
             session_id=session_id,
             future=future,
+            required_keyword="",
+            allow_edit=True,
         )
-        self._pending[chat_jid] = approval
+        self._register_pending(approval)
 
         msg = (
             f"Approval needed\n\n"
@@ -276,7 +598,9 @@ class ApprovalManager:
             f"Category: {category}\n"
             f"Reply YES to proceed, NO to cancel, or EDIT: [changes]"
         )
-        molly._track_send(molly.wa.send_message(chat_jid, msg))
+        if response_chat_jid != chat_jid:
+            msg = f"{msg}\n\nOrigin chat: {chat_jid}"
+        self._send_approval_message(molly, response_chat_jid, msg)
         log.info("Tag approval requested [%s]: %s", category, description)
 
         try:
@@ -287,13 +611,78 @@ class ApprovalManager:
                 return True
             return False
         except asyncio.TimeoutError:
-            self._pending.pop(chat_jid, None)
-            molly._track_send(
-                molly.wa.send_message(
-                    chat_jid, f"Approval timed out for: {description}"
-                )
-            )
+            self._remove_pending(approval)
+            self._send_approval_message(molly, response_chat_jid, f"Approval timed out for: {description}")
             log.info("Tag approval timed out: %s", description)
+            return False
+
+    async def request_custom_approval(
+        self,
+        category: str,
+        description: str,
+        chat_jid: str,
+        molly,
+        required_keyword: str = "YES",
+        timeout_s: int | None = None,
+        allow_edit: bool = True,
+    ) -> bool | str:
+        """Request approval with a custom required keyword (for DEPLOY gating).
+
+        Returns:
+            True if approved,
+            False if denied/timeout,
+            str edit instruction if allow_edit and owner replied EDIT: ...
+        """
+        response_chat_jid = self._resolve_response_chat_jid(chat_jid, molly)
+        self._cancel_pending(chat_jid)
+        if response_chat_jid != chat_jid:
+            self._cancel_pending(response_chat_jid)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        key = (required_keyword or "YES").strip().upper()
+        approval = PendingApproval(
+            id=str(uuid.uuid4()),
+            category=category,
+            description=description,
+            chat_jid=chat_jid,
+            response_chat_jid=response_chat_jid,
+            session_id=None,
+            future=future,
+            required_keyword=key,
+            allow_edit=allow_edit,
+        )
+        self._register_pending(approval)
+
+        edit_hint = ", EDIT: [changes]" if allow_edit else ""
+        msg = (
+            f"{description}\n\n"
+            f"Reply {key} to approve, NO to reject{edit_hint}"
+        )
+        if response_chat_jid != chat_jid:
+            msg = f"{msg}\n\nOrigin chat: {chat_jid}"
+        self._send_approval_message(molly, response_chat_jid, msg)
+        log.info("Custom approval requested [%s] keyword=%s", category, key)
+
+        t0 = asyncio.get_event_loop().time()
+        wait_timeout = timeout_s if timeout_s is not None else config.APPROVAL_TIMEOUT
+        try:
+            result = await asyncio.wait_for(future, timeout=wait_timeout)
+            elapsed = asyncio.get_event_loop().time() - t0
+            if result is True:
+                _log_approval_decision(category, "approved", elapsed)
+                return True
+            if isinstance(result, tuple) and result[0] == "edit":
+                _log_approval_decision(category, "edited", elapsed)
+                return result[1]
+            _log_approval_decision(category, "denied", elapsed)
+            return False
+        except asyncio.TimeoutError:
+            self._remove_pending(approval)
+            elapsed = asyncio.get_event_loop().time() - t0
+            _log_approval_decision(category, "timed_out", elapsed)
+            self._send_approval_message(molly, response_chat_jid, f"Approval timed out for: {category}")
             return False
 
     # --- Resolution ---
@@ -303,28 +692,62 @@ class ApprovalManager:
 
         Returns True if the message was consumed as an approval response.
         """
-        if chat_jid not in self._pending:
+        pending = self._lookup_pending(chat_jid)
+        if not pending:
             return False
 
         normalized = text.strip().lower()
+        keyword = pending.required_keyword.strip().lower()
+
+        if _is_approve_all_reply(normalized):
+            if not pending.allow_approve_all:
+                return False
+            if keyword and keyword != "yes":
+                return False
+            approval = self._pop_pending_for_chat(chat_jid)
+            if not approval:
+                return False
+            if not approval.future.done():
+                approval.future.set_result(("approve_all", True))
+            log.info("Approval GRANTED for ALL (request scope): %s", approval.category)
+            return True
+
+        if keyword and normalized == keyword:
+            approval = self._pop_pending_for_chat(chat_jid)
+            if not approval:
+                return False
+            if not approval.future.done():
+                approval.future.set_result(True)
+            log.info("Approval GRANTED by keyword '%s': %s", keyword, approval.category)
+            return True
 
         if normalized in YES_WORDS:
-            approval = self._pending.pop(chat_jid)
+            if keyword and keyword != "yes":
+                return False
+            approval = self._pop_pending_for_chat(chat_jid)
+            if not approval:
+                return False
             if not approval.future.done():
                 approval.future.set_result(True)
             log.info("Approval GRANTED: %s", approval.category)
             return True
 
         if normalized in NO_WORDS:
-            approval = self._pending.pop(chat_jid)
+            approval = self._pop_pending_for_chat(chat_jid)
+            if not approval:
+                return False
             if not approval.future.done():
                 approval.future.set_result(False)
             log.info("Approval DENIED: %s", approval.category)
             return True
 
         if normalized.startswith("edit:"):
+            if not pending.allow_edit:
+                return False
             edit_instruction = text.strip()[5:].strip()
-            approval = self._pending.pop(chat_jid)
+            approval = self._pop_pending_for_chat(chat_jid)
+            if not approval:
+                return False
             if not approval.future.done():
                 approval.future.set_result(("edit", edit_instruction))
             log.info("Approval EDIT: %s → %s", approval.category, edit_instruction)
@@ -335,15 +758,19 @@ class ApprovalManager:
     # --- Query ---
 
     def has_pending(self, chat_jid: str) -> bool:
-        return chat_jid in self._pending
+        return self._lookup_pending(chat_jid) is not None
 
     def get_pending(self, chat_jid: str) -> PendingApproval | None:
-        return self._pending.get(chat_jid)
+        return self._lookup_pending(chat_jid)
 
     def get_all_pending(self) -> list[PendingApproval]:
         return list(self._pending.values())
 
+    def cancel_pending(self, chat_jid: str):
+        """Public wrapper for clearing pending approval state for one chat."""
+        self._cancel_pending(chat_jid)
+
     def _cancel_pending(self, chat_jid: str):
-        old = self._pending.pop(chat_jid, None)
+        old = self._pop_pending_for_chat(chat_jid)
         if old and not old.future.done():
             old.future.set_result(False)
