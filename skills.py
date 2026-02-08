@@ -14,59 +14,11 @@ import config
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Trigger definitions — maps skill filename stems to match patterns
-# ---------------------------------------------------------------------------
-
-# Each entry: (skill_name, compiled_regex, is_command)
-# is_command=True means the pattern matches slash commands (handled separately)
-_TRIGGER_PATTERNS: list[tuple[str, re.Pattern, bool]] = [
-    # Daily Digest
-    ("daily-digest", re.compile(
-        r"/digest|daily\s+digest|morning\s+briefing|what'?s\s+on\s+today",
-        re.IGNORECASE,
-    ), False),
-
-    # Meeting Prep
-    ("meeting-prep", re.compile(
-        r"prep\s+me\s+for|meeting\s+prep|brief\s+me\s+for\s+my\s+meeting|who\s+am\s+i\s+meeting",
-        re.IGNORECASE,
-    ), False),
-
-    # Email Drafting
-    ("email-draft", re.compile(
-        r"draft\s+an?\s+email|reply\s+to\s+.+\s+saying|"
-        r"email\s+\w+|write\s+an?\s+email|send\s+an?\s+email",
-        re.IGNORECASE,
-    ), False),
-
-    # Follow-Up Tracking — commitment language detection
-    # Two patterns: standalone commitment phrases OR commitment + deadline
-    ("follow-up-tracking", re.compile(
-        r"(?:"
-        # Standalone commitment phrases (no deadline needed)
-        r"(?:let\s+me\s+get\s+back\s+to|i\s+owe\s+\w+\s+a\s+|remind\s+me\s+to|"
-        r"don'?t\s+let\s+me\s+forget\s+to)"
-        r"|"
-        # Commitment prefix + action/deadline
-        r"(?:i'?ll|let\s+me|i\s+need\s+to|i\s+have\s+to|i\s+promised)\s+.+?"
-        r"(?:by\s+\w|before\s+|tomorrow|tonight|this\s+week|next\s+week|"
-        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-        r"send\s+|finish\s+|call\s+|follow\s+up)"
-        r")",
-        re.IGNORECASE,
-    ), False),
-
-    # Research & Brief
-    ("research-brief", re.compile(
-        r"research\s+\w|brief\s+me\s+on|what\s+should\s+i\s+know\s+about|"
-        r"look\s+into\s+\w|dig\s+into\s+\w|what'?s\s+the\s+deal\s+with",
-        re.IGNORECASE,
-    ), False),
-]
-
 # Skills that can be activated by heartbeat events (not message matching)
 HEARTBEAT_SKILLS = {"daily-digest", "meeting-prep"}
+
+# Cache for compiled trigger patterns (rebuilt when skills reload)
+_trigger_patterns: list[tuple[str, re.Pattern]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +90,84 @@ def _load_all() -> dict[str, Skill]:
 
 def reload_skills():
     """Force reload of skills from disk (e.g., after editing skill files)."""
-    global _skills_cache
+    global _skills_cache, _trigger_patterns
     _skills_cache = None
+    _trigger_patterns = None
     return _load_all()
+
+
+# ---------------------------------------------------------------------------
+# Trigger parsing from markdown
+# ---------------------------------------------------------------------------
+
+def _extract_trigger_phrases(trigger_text: str) -> list[str]:
+    """Extract quoted trigger phrases from a ## Trigger section.
+
+    Finds all double-quoted strings and returns them as raw phrases.
+    E.g.: '"daily digest", "morning briefing"' -> ["daily digest", "morning briefing"]
+    """
+    return re.findall(r'"([^"]+)"', trigger_text)
+
+
+def _phrase_to_regex(phrase: str) -> str:
+    """Convert a trigger phrase to a regex pattern.
+
+    Handles:
+    - Bracketed placeholders: [person] -> \\w+(?:\\s+\\w+)*
+    - Whitespace: collapsed to \\s+
+    - Apostrophes: made optional with '?
+    - Special regex chars: escaped
+    """
+    # Replace bracketed placeholders first
+    phrase = re.sub(r'\[.*?\]', r'PLACEHOLDER_TOKEN', phrase)
+
+    # Escape special regex chars (but not the placeholder token)
+    parts = phrase.split('PLACEHOLDER_TOKEN')
+    escaped_parts = [re.escape(p) for p in parts]
+    # Re-join with flexible word matching for placeholders
+    result = r'\w+(?:\s+\w+)*'.join(escaped_parts)
+
+    # Make whitespace flexible
+    result = re.sub(r'\\ ', r'\\s+', result)
+
+    # Make apostrophes optional
+    result = result.replace("\\'", "'?")
+
+    return result
+
+
+def _build_trigger_patterns() -> list[tuple[str, re.Pattern]]:
+    """Build trigger patterns from all loaded skill files."""
+    global _trigger_patterns
+    if _trigger_patterns is not None:
+        return _trigger_patterns
+
+    skills = _load_all()
+    patterns: list[tuple[str, re.Pattern]] = []
+
+    for name, skill in skills.items():
+        if not skill.trigger:
+            continue
+
+        phrases = _extract_trigger_phrases(skill.trigger)
+        if not phrases:
+            continue
+
+        # Also extract /command patterns (e.g., "`/digest` command")
+        commands = re.findall(r'`(/\w+)`', skill.trigger)
+        regex_parts = [_phrase_to_regex(p) for p in phrases] + [re.escape(c) for c in commands]
+
+        if regex_parts:
+            combined = "|".join(regex_parts)
+            try:
+                compiled = re.compile(combined, re.IGNORECASE)
+                patterns.append((name, compiled))
+            except re.error:
+                log.warning("Failed to compile trigger regex for skill %s: %s", name, combined)
+
+    _trigger_patterns = patterns
+    log.debug("Built %d trigger patterns from skill files", len(patterns))
+    return patterns
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +177,18 @@ def reload_skills():
 def match_skills(message: str) -> list[Skill]:
     """Match an incoming message against skill trigger patterns.
 
+    Trigger patterns are parsed dynamically from each skill's ## Trigger
+    section. Adding a new .md file with quoted trigger phrases will be
+    picked up automatically after reload_skills() or restart.
+
     Returns a list of matching Skill objects (may be empty).
     Multiple skills can match simultaneously.
     """
     skills = _load_all()
+    patterns = _build_trigger_patterns()
     matched = []
 
-    for skill_name, pattern, _is_command in _TRIGGER_PATTERNS:
+    for skill_name, pattern in patterns:
         if skill_name in skills and pattern.search(message):
             matched.append(skills[skill_name])
 

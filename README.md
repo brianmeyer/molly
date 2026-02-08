@@ -23,13 +23,15 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Component | Role |
 |-----------|------|
 | Neonize | WhatsApp client (Go whatsmeow via Python) |
-| Claude Agent SDK | LLM brain (Claude Max subscription) |
+| Claude Agent SDK | LLM brain with sub-agent routing (Claude Max) |
 | FastAPI + uvicorn | Web UI with WebSocket chat |
 | EmbeddingGemma-300M | 768-dim embeddings for semantic search |
 | sqlite-vec | Layer 2: vector search + operational logs |
 | GLiNER2 | Entity + relationship extraction (DeBERTa-large) |
 | Neo4j | Layer 3: knowledge graph |
 | Qwen3-4B (Ollama) | Local triage model for message classification |
+| Kimi K2.5 (Moonshot) | External research model via MCP tool |
+| Grok (xAI) | External reasoning model via MCP tool |
 
 ## Project Structure
 
@@ -41,12 +43,12 @@ molly/
 ├── web.py               # FastAPI web UI backend (WebSocket chat)
 ├── terminal.py          # Standalone CLI REPL for debugging
 ├── database.py          # SQLite message store
-├── agent.py             # Claude Agent SDK wrapper + identity loading
+├── agent.py             # Claude Agent SDK wrapper, sub-agents, identity loading
 ├── approval.py          # Action approval flow (WhatsApp yes/no)
 ├── commands.py          # /help, /clear, /memory, /graph, /forget, /status
 ├── heartbeat.py         # Proactive check-in + iMessage/email monitoring
-├── maintenance.py       # Nightly Opus maintenance + health check
-├── skills.py            # Skill matching + loading
+├── maintenance.py       # Nightly maintenance (direct Python, no SDK tools)
+├── skills.py            # Dynamic skill trigger matching + loading
 ├── web/
 │   └── index.html       # Chat UI (single-page, no framework)
 ├── tools/
@@ -55,7 +57,9 @@ molly/
 │   ├── gmail.py         # Gmail MCP tools
 │   ├── contacts.py      # Apple Contacts MCP tools
 │   ├── imessage.py      # iMessage MCP tools
-│   └── whatsapp.py      # WhatsApp message search MCP tool
+│   ├── whatsapp.py      # WhatsApp message search MCP tool
+│   ├── kimi.py          # Kimi K2.5 research MCP tool (Moonshot API)
+│   └── grok.py          # Grok reasoning MCP tool (xAI API)
 └── memory/
     ├── embeddings.py    # EmbeddingGemma-300M wrapper
     ├── vectorstore.py   # sqlite-vec backed vector store
@@ -93,9 +97,21 @@ Sensitive actions require explicit approval via WhatsApp before execution. Three
 - **CONFIRM** — Shell access, file writes, external sends require Brian's yes/no
 - **BLOCKED** — Destructive actions are denied outright
 
+## Sub-Agents
+
+Opus orchestrates and delegates to sub-agents via the SDK's Task tool:
+
+| Agent | Model | Use for |
+|-------|-------|---------|
+| `quick` | Haiku | Fast lookups, formatting, trivial subtasks |
+| `worker` | Sonnet | Email drafts, research synthesis, multi-step tools |
+| `analyst` | Opus | Deep analysis, strategic thinking, complex reasoning |
+
+External models (Kimi K2.5 for research, Grok for social intelligence) are available as MCP tools, not sub-agents.
+
 ## Skills
 
-Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns. Matched skills inject their instructions into the system prompt for that turn. Built-in skills: daily digest, meeting prep.
+Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parsed dynamically from each skill's `## Trigger` section. Matched skills inject their instructions into the system prompt for that turn. Adding a new `.md` file with quoted trigger phrases is picked up automatically after restart.
 
 ## Commands
 
@@ -148,6 +164,8 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - HuggingFace account (for gated EmbeddingGemma model)
 - Ollama (optional, for local triage)
 - Google Cloud OAuth credentials (optional, for Calendar/Gmail)
+- Moonshot API key (optional, for Kimi K2.5 research tool)
+- xAI API key (optional, for Grok reasoning tool)
 
 ## Build Phases
 
@@ -156,6 +174,7 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - [x] Phase 2: Three-layer memory (semantic search + knowledge graph + nightly maintenance)
 - [x] Phase 3: Tools + skills (Calendar, Gmail, Contacts, iMessage, Skills)
 - [x] Phase 4: Multi-channel (Web UI, Terminal REPL, Email monitoring)
-- [ ] Phase 5: Learning loops
-- [ ] Phase 6: Collaboration
-- [ ] Phase 7: Self-improvement
+- [x] Phase 5: Sub-agents, model routing, audit hardening
+- [ ] Phase 6: Learning loops
+- [ ] Phase 7: Collaboration
+- [ ] Phase 8: Self-improvement

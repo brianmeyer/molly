@@ -35,6 +35,15 @@ logging.basicConfig(
 log = logging.getLogger("molly")
 
 
+def _task_done_callback(task: asyncio.Task):
+    """Log exceptions from fire-and-forget tasks instead of swallowing them."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        log.error("Background task %s failed: %s", task.get_name(), exc, exc_info=exc)
+
+
 # ---------------------------------------------------------------------------
 # Service startup checks
 # ---------------------------------------------------------------------------
@@ -348,12 +357,14 @@ class Molly:
         # Non-owner messages: passive processing only, never respond
         if not is_owner:
             if content.strip():
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._process_passive(
                         content, chat_jid, chat_mode, sender_jid,
                         sender_name=sender_name, group_name=group_name,
-                    )
+                    ),
+                    name=f"passive:{chat_jid[:20]}",
                 )
+                task.add_done_callback(_task_done_callback)
             return
 
         # --- Owner messages from here ---
@@ -369,11 +380,19 @@ class Molly:
             if has_trigger else content.strip()
         )
 
-        # Commands: always available from owner with @Molly, any chat
-        if has_trigger and clean_content:
-            first_word = clean_content.split()[0]
+        # Commands: available from owner with @Molly (any chat) or directly in DMs
+        cmd_text = clean_content
+        is_dm_command = (
+            chat_mode == "owner_dm"
+            and content.strip().startswith("/")
+        )
+        if is_dm_command:
+            cmd_text = content.strip()
+
+        if (has_trigger or is_dm_command) and cmd_text:
+            first_word = cmd_text.split()[0]
             if first_word in config.COMMANDS:
-                response = await handle_command(clean_content, chat_jid, self)
+                response = await handle_command(cmd_text, chat_jid, self)
                 if response:
                     self._track_send(self.wa.send_message(chat_jid, response))
                 return
@@ -387,12 +406,14 @@ class Molly:
         if not should_respond or not clean_content:
             # Owner message but not triggering a response — passive processing
             if content.strip():
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._process_passive(
                         content, chat_jid, chat_mode, sender_jid,
                         sender_name=sender_name, group_name=group_name,
-                    )
+                    ),
+                    name=f"passive-owner:{chat_jid[:20]}",
                 )
+                task.add_done_callback(_task_done_callback)
             return
 
         # --- Molly is going to respond ---
@@ -423,9 +444,11 @@ class Molly:
                 if visible:
                     self._track_send(self.wa.send_message(chat_jid, visible))
 
-                asyncio.create_task(
-                    self._approval_flow(category, description, chat_jid, new_session_id)
+                task = asyncio.create_task(
+                    self._approval_flow(category, description, chat_jid, new_session_id),
+                    name=f"approval:{chat_jid[:20]}",
                 )
+                task.add_done_callback(_task_done_callback)
             else:
                 self._track_send(self.wa.send_message(chat_jid, response))
 
@@ -571,6 +594,17 @@ class Molly:
                 self.wa.send_message(chat_jid, "Got it, I won't do that.")
             )
 
+    # --- Timeout wrapper for background tasks ---
+
+    async def _run_with_timeout(self, coro, name: str, timeout: int):
+        """Run a coroutine with a timeout cap. Logs warning on timeout."""
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning("%s exceeded %ds timeout — cancelled", name, timeout)
+        except Exception:
+            log.error("%s failed", name, exc_info=True)
+
     # --- Safe message processing wrapper ---
 
     async def _safe_process(self, msg_data: dict):
@@ -629,7 +663,8 @@ class Molly:
                 ws_max_size=8192,
             )
             web_server = uvicorn.Server(web_config)
-            asyncio.create_task(web_server.serve())
+            web_task = asyncio.create_task(web_server.serve(), name="web-ui")
+            web_task.add_done_callback(_task_done_callback)
             log.info("Web UI started at http://%s:%d", config.WEB_HOST, config.WEB_PORT)
         except ImportError:
             log.warning("uvicorn/fastapi not installed — Web UI disabled")
@@ -641,16 +676,32 @@ class Molly:
                 msg_data = await asyncio.wait_for(
                     self.queue.get(), timeout=config.POLL_INTERVAL
                 )
-                asyncio.create_task(self._safe_process(msg_data))
+                task = asyncio.create_task(
+                    self._safe_process(msg_data),
+                    name=f"process:{msg_data.get('chat_jid', '')[:20]}",
+                )
+                task.add_done_callback(_task_done_callback)
             except asyncio.TimeoutError:
-                # No message in queue — check scheduled tasks
+                # No message in queue — check scheduled tasks (run in background)
                 if self.wa and self.wa.connected:
                     if should_heartbeat(self.last_heartbeat):
                         self.last_heartbeat = datetime.now()
-                        await run_heartbeat(self)
+                        task = asyncio.create_task(
+                            self._run_with_timeout(
+                                run_heartbeat(self), "heartbeat", timeout=120,
+                            ),
+                            name="heartbeat",
+                        )
+                        task.add_done_callback(_task_done_callback)
                     if should_run_maintenance(self.last_maintenance):
                         self.last_maintenance = datetime.now()
-                        await run_maintenance()
+                        task = asyncio.create_task(
+                            self._run_with_timeout(
+                                run_maintenance(molly=self), "maintenance", timeout=1800,
+                            ),
+                            name="maintenance",
+                        )
+                        task.add_done_callback(_task_done_callback)
             except asyncio.CancelledError:
                 break
             except Exception:

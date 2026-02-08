@@ -1,9 +1,63 @@
+import asyncio
 import logging
+import re
+from datetime import date
 
 from memory.embeddings import embed
 from memory.retriever import get_vectorstore
 
+import config
+
 log = logging.getLogger(__name__)
+
+# Entities extracted from system prompts, pronouns, and generic noise.
+# These should never be stored in the knowledge graph.
+_ENTITY_BLOCKLIST = {
+    # System artifacts
+    "molly", "user", "heartbeat", "brian's approval", "approval",
+    "context", "system", "assistant", "claude", "opus", "haiku", "sonnet",
+    # Pronouns / generic words that GLiNER2 over-extracts
+    "him", "her", "his", "them", "it", "its", "they", "we", "you", "i",
+    "me", "my", "mine", "your", "yours", "he", "she",
+    # Common noise
+    "someone", "something", "nothing", "everything", "anyone",
+}
+
+# Minimum entity name length (single chars are always noise)
+_MIN_ENTITY_LEN = 2
+
+
+def _filter_entities(entities: list[dict]) -> list[dict]:
+    """Remove noise entities that come from system prompts or are too generic."""
+    filtered = []
+    for ent in entities:
+        name = ent.get("text", "").strip()
+        if not name or len(name) < _MIN_ENTITY_LEN:
+            continue
+        if name.lower() in _ENTITY_BLOCKLIST:
+            continue
+        # Skip entities that contain newlines (parsing artifacts like "Rodrigo\nMolly")
+        if "\n" in name:
+            continue
+        filtered.append(ent)
+    return filtered
+
+
+def _filter_relations(relations: list[dict]) -> list[dict]:
+    """Remove relations involving blocked entities or self-references."""
+    filtered = []
+    for rel in relations:
+        head = rel.get("head", "").strip()
+        tail = rel.get("tail", "").strip()
+        if not head or not tail:
+            continue
+        if head.lower() in _ENTITY_BLOCKLIST or tail.lower() in _ENTITY_BLOCKLIST:
+            continue
+        # Skip self-referencing relationships
+        if head.lower() == tail.lower():
+            continue
+        filtered.append(rel)
+    return filtered
 
 
 async def embed_and_store(
@@ -17,7 +71,8 @@ async def embed_and_store(
     active conversations (combined user+assistant chunks).
     """
     try:
-        vec = embed(content)
+        loop = asyncio.get_event_loop()
+        vec = await loop.run_in_executor(None, embed, content)
         vs = get_vectorstore()
         chunk_id = vs.store_chunk(
             content=content,
@@ -40,13 +95,16 @@ async def extract_to_graph(
         from memory.extractor import extract
         from memory import graph
 
-        result = extract(content)
-        entities = result["entities"]
-        relations = result["relations"]
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, extract, content)
+        entities = _filter_entities(result["entities"])
+        relations = _filter_relations(result["relations"])
 
         if not entities:
             return
 
+        # Build raw→canonical name mapping so relationships use the right names
+        raw_to_canonical: dict[str, str] = {}
         entity_names = []
         for ent in entities:
             canonical = graph.upsert_entity(
@@ -54,12 +112,16 @@ async def extract_to_graph(
                 entity_type=ent["label"],
                 confidence=ent["score"],
             )
+            raw_to_canonical[ent["text"]] = canonical
             entity_names.append(canonical)
 
         for rel in relations:
+            # Resolve raw extracted names to canonical graph names
+            head = raw_to_canonical.get(rel["head"], rel["head"])
+            tail = raw_to_canonical.get(rel["tail"], rel["tail"])
             graph.upsert_relationship(
-                head_name=rel["head"],
-                tail_name=rel["tail"],
+                head_name=head,
+                tail_name=tail,
                 rel_type=rel["label"],
                 confidence=rel["score"],
                 context_snippet=content[:200],
@@ -93,3 +155,38 @@ async def process_conversation(
     chunk_text = f"User: {user_msg}\nMolly: {assistant_msg}"
     await embed_and_store(chunk_text, chat_jid, source)
     await extract_to_graph(chunk_text, chat_jid, source)
+    _append_daily_log(user_msg, assistant_msg, chat_jid)
+
+
+def _append_daily_log(user_msg: str, assistant_msg: str, chat_jid: str):
+    """Append a brief conversation summary to today's daily log.
+
+    Writes to workspace/memory/YYYY-MM-DD.md so the identity stack
+    picks it up on subsequent turns.
+    """
+    try:
+        today = date.today().isoformat()
+        log_path = config.WORKSPACE / "memory" / f"{today}.md"
+
+        # Truncate for the log entry
+        user_preview = user_msg[:150].replace("\n", " ")
+        molly_preview = assistant_msg[:150].replace("\n", " ")
+        chat_short = chat_jid.split("@")[0] if "@" in chat_jid else chat_jid
+
+        entry = f"- [{chat_short}] **User:** {user_preview}"
+        if len(user_msg) > 150:
+            entry += "..."
+        entry += f"\n  **Molly:** {molly_preview}"
+        if len(assistant_msg) > 150:
+            entry += "..."
+        entry += "\n"
+
+        if not log_path.exists():
+            log_path.write_text(f"# Daily Log — {today}\n\n{entry}\n")
+        else:
+            with open(log_path, "a") as f:
+                f.write(f"{entry}\n")
+
+        log.debug("Appended to daily log: %s", log_path.name)
+    except Exception:
+        log.debug("Failed to write daily log", exc_info=True)

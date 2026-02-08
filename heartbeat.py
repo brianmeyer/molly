@@ -33,11 +33,11 @@ async def run_heartbeat(molly):
     # Check for new emails and surface urgent ones
     await _check_email(molly)
 
-    if not molly.registered_chats:
-        log.debug("No registered chats for heartbeat")
+    # Always send proactive messages to the owner's DM, not a random group
+    chat_jid = molly._get_owner_dm_jid()
+    if not chat_jid:
+        log.debug("No owner DM JID available for heartbeat")
         return
-
-    chat_jid = next(iter(molly.registered_chats))
 
     # Phase 3D: morning digest (7 AM)
     await _check_morning_digest(molly, chat_jid)
