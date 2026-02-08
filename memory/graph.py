@@ -390,6 +390,93 @@ def delete_entity(name: str) -> bool:
         return record and record["deleted"] > 0
 
 
+# --- Maintenance ---
+
+
+def run_strength_decay() -> int:
+    """Recalculate strength for all entities based on mentions * recency decay.
+
+    Returns the number of entities updated.
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (e:Entity)
+            WHERE e.last_mentioned IS NOT NULL
+            WITH e,
+                 e.mention_count AS mentions,
+                 duration.between(datetime(e.last_mentioned), datetime()).days AS days_since
+            SET e.strength = mentions * exp(-0.03 * days_since)
+            RETURN count(e) AS updated
+            """
+        )
+        updated = result.single()["updated"]
+        log.info("Strength decay: updated %d entities", updated)
+        return updated
+
+
+def delete_orphan_entities() -> int:
+    """Delete entities with zero relationships (no MENTIONS from episodes either counts).
+
+    Returns the number of entities deleted.
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (e:Entity)
+            WHERE NOT (e)--()
+            DELETE e
+            RETURN count(e) AS deleted
+            """
+        )
+        deleted = result.single()["deleted"]
+        log.info("Deleted %d orphan entities", deleted)
+        return deleted
+
+
+def delete_self_referencing_rels() -> int:
+    """Delete relationships where head and tail are the same entity.
+
+    Returns the number of relationships deleted.
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (e:Entity)-[r]->(e)
+            DELETE r
+            RETURN count(r) AS deleted
+            """
+        )
+        deleted = result.single()["deleted"]
+        log.info("Deleted %d self-referencing relationships", deleted)
+        return deleted
+
+
+def delete_blocklisted_entities(blocklist: set[str]) -> int:
+    """Delete entities whose names match the blocklist (case-insensitive).
+
+    Returns the number of entities deleted.
+    """
+    driver = get_driver()
+    names_lower = [n.lower() for n in blocklist]
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (e:Entity)
+            WHERE toLower(e.name) IN $names
+            DETACH DELETE e
+            RETURN count(e) AS deleted
+            """,
+            names=names_lower,
+        )
+        deleted = result.single()["deleted"]
+        log.info("Deleted %d blocklisted entities", deleted)
+        return deleted
+
+
 # --- Stats ---
 
 

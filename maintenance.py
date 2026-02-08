@@ -261,127 +261,315 @@ def write_health_check():
 
 
 # ---------------------------------------------------------------------------
-# Opus maintenance turn (agent-based reasoning session)
+# Programmatic maintenance tasks (direct Python, no Agent SDK tools)
 # ---------------------------------------------------------------------------
 
-MAINTENANCE_SYSTEM_PROMPT = """\
-You are Molly's maintenance agent. This is a nightly maintenance session at 11 PM.
 
-You have full access to Molly's workspace at {workspace}. Your job is to analyze
-the day's activity and maintain the knowledge systems.
+def _run_strength_decay() -> int:
+    """Task 1: Recalculate strength for all entities."""
+    from memory.graph import run_strength_decay
+    return run_strength_decay()
 
-Tasks (work through each one):
 
-1. **Strength decay**: Read entity and relationship data from Neo4j. Recompute
-   strength scores using: strength = mentions * exp(-0.03 * days_since_last_mention).
-   Update entities and relationships with decayed scores.
+def _run_dedup_sweep() -> int:
+    """Task 2: Find and merge duplicate entities with fuzzy matching."""
+    from memory.graph import get_driver
+    from difflib import SequenceMatcher
 
-2. **Deduplication sweep**: Look for duplicate entities (same name variants, acronyms,
-   typos). Merge them: combine mention_counts, union aliases, keep earliest first_mentioned.
+    driver = get_driver()
+    merged = 0
 
-3. **Orphan cleanup**: Find entities with zero relationships and low mention counts
-   (mention_count <= 1, strength < 0.3). Delete them.
+    with driver.session() as session:
+        # Get all entities grouped by type
+        result = session.run(
+            "MATCH (e:Entity) RETURN e.name AS name, e.entity_type AS type "
+            "ORDER BY e.entity_type, e.name"
+        )
+        entities = [dict(r) for r in result]
 
-4. **Community detection**: Group entities into clusters (Work, Side Projects, Family,
-   Social, etc.) based on relationship density. Add a `community` property to entities.
+    # Group by type
+    by_type: dict[str, list[str]] = {}
+    for ent in entities:
+        by_type.setdefault(ent["type"], []).append(ent["name"])
 
-5. **Contradiction detection**: Find conflicting relationships (e.g., person WORKS_AT
-   two different companies with overlapping valid_from/valid_until). Write findings to
-   {workspace}/memory/maintenance/{today}.md.
+    for etype, names in by_type.items():
+        for i, name_a in enumerate(names):
+            for name_b in names[i + 1:]:
+                ratio = SequenceMatcher(
+                    None, name_a.lower(), name_b.lower()
+                ).ratio()
+                if ratio >= 0.85 and name_a != name_b:
+                    # Merge name_b into name_a (keep first alphabetically)
+                    keep, drop = sorted([name_a, name_b])
+                    with driver.session() as session:
+                        session.run(
+                            """MATCH (keep:Entity {name: $keep}), (drop:Entity {name: $drop})
+                               SET keep.mention_count = keep.mention_count + drop.mention_count,
+                                   keep.aliases = keep.aliases + drop.aliases + [$drop_name],
+                                   keep.first_mentioned = CASE
+                                       WHEN keep.first_mentioned < drop.first_mentioned
+                                       THEN keep.first_mentioned ELSE drop.first_mentioned END
+                               WITH keep, drop
+                               CALL {
+                                   WITH keep, drop
+                                   MATCH (drop)-[r]->()
+                                   RETURN collect(r) AS rels
+                               }
+                               DETACH DELETE drop""",
+                            keep=keep, drop=drop, drop_name=drop,
+                        )
+                    merged += 1
+                    log.debug("Merged '%s' into '%s'", drop, keep)
 
-6. **Prune stale daily logs**: Archive daily logs older than 30 days from
-   {workspace}/memory/ to {workspace}/memory/archive/.
+    return merged
 
-7. **Update MEMORY.md**: Consolidate today's insights — new entities learned, key
-   relationships discovered, patterns noticed. Append a dated section to MEMORY.md.
 
-8. **Write maintenance report**: Write a summary of everything you did to
-   {workspace}/memory/maintenance/{today}.md.
+def _run_orphan_cleanup() -> int:
+    """Task 3: Delete low-value orphan entities."""
+    from memory.graph import get_driver
 
-9. **Relationship type review**: Review all WORKS_AT and USES relationships where the
-   target entity is an educational institution (universities, MBA programs, schools).
-   Check context_snippets for classmate/student/alumni/cohort/program indicators and
-   reclassify to CLASSMATE_OF, STUDIED_AT, or ALUMNI_OF as appropriate. USES should
-   never apply to a school — reclassify those too.
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """MATCH (e:Entity)
+               WHERE NOT (e)--()
+                 AND e.mention_count <= 1
+                 AND (e.strength IS NULL OR e.strength < 0.3)
+               DELETE e
+               RETURN count(e) AS deleted"""
+        )
+        deleted = result.single()["deleted"]
 
-10. **Semantic consistency check**: Review relationship types that don't make semantic
-    sense (e.g., USES with a Person, WORKS_AT with a Concept, MANAGES a Place). Propose
-    or execute reclassifications to the correct relationship type.
+    log.info("Orphan cleanup: deleted %d entities", deleted)
+    return deleted
 
-11. **Shared institution relationships**: When multiple people appear in the same
-    institutional context (same school, same program, same cohort), check if they should
-    share a CLASSMATE_OF relationship. Create missing CLASSMATE_OF links between people
-    who both have STUDIED_AT or CLASSMATE_OF relationships with the same institution.
 
-Use Neo4j Cypher queries via Bash (cypher-shell) for graph operations.
-Be thorough but concise. This runs unattended.
+def _run_self_ref_cleanup() -> int:
+    """Task 3b: Delete self-referencing relationships."""
+    from memory.graph import delete_self_referencing_rels
+    return delete_self_referencing_rels()
+
+
+def _run_blocklist_cleanup() -> int:
+    """Task 3c: Delete blocklisted entities from graph."""
+    from memory.graph import delete_blocklisted_entities
+    from memory.processor import _ENTITY_BLOCKLIST
+    return delete_blocklisted_entities(_ENTITY_BLOCKLIST)
+
+
+def _prune_daily_logs() -> int:
+    """Task 6: Archive daily logs older than 30 days."""
+    memory_dir = config.WORKSPACE / "memory"
+    archive_dir = memory_dir / "archive"
+    cutoff = (date.today() - timedelta(days=30)).isoformat()
+    moved = 0
+
+    for path in memory_dir.glob("????-??-??.md"):
+        if path.stem < cutoff:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(archive_dir / path.name))
+            moved += 1
+
+    if moved:
+        log.info("Archived %d daily logs older than %s", moved, cutoff)
+    return moved
+
+
+def _build_maintenance_report(results: dict) -> str:
+    """Build a markdown maintenance report from task results."""
+    today = date.today().isoformat()
+    lines = [f"# Maintenance Report — {today}\n"]
+
+    lines.append("## Task Results\n")
+    lines.append("| Task | Result |")
+    lines.append("|------|--------|")
+    for task, result in results.items():
+        lines.append(f"| {task} | {result} |")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Opus analysis pass (text-only, no tools)
+# ---------------------------------------------------------------------------
+
+ANALYSIS_SYSTEM_PROMPT = """\
+You are Molly's maintenance analyst. Review the maintenance report and graph data below.
+Produce a brief analysis with:
+
+1. **Summary**: Key observations about the knowledge graph health.
+2. **New insights**: Any patterns, clusters, or notable entities from today.
+3. **MEMORY.md update**: A dated section to append to MEMORY.md with the most important
+   facts learned today. Format: `## {date}` followed by bullet points. Only include
+   genuinely important, durable facts — skip noise and ephemeral details.
+
+Be concise. Output ONLY the MEMORY.md section (starting with ## {date}).
 """
 
 
-async def run_maintenance():
-    """Run the full nightly maintenance cycle."""
-    from agent import handle_message
+async def _run_opus_analysis(report: str, graph_summary: str, today: str) -> str:
+    """Run a text-only Claude query for analysis — no tools, no permissions needed."""
+    from claude_agent_sdk import (
+        ClaudeAgentOptions, query, AssistantMessage, TextBlock, ResultMessage,
+    )
 
+    prompt_text = (
+        f"Today is {today}.\n\n"
+        f"## Maintenance Report\n{report}\n\n"
+        f"## Graph Summary\n{graph_summary}\n\n"
+        "Based on this data, produce the MEMORY.md update section."
+    )
+
+    options = ClaudeAgentOptions(
+        system_prompt=ANALYSIS_SYSTEM_PROMPT.format(date=today),
+        model="sonnet",
+        allowed_tools=[],  # No tools — text-only analysis
+        cwd=str(config.WORKSPACE),
+    )
+
+    async def _prompt():
+        yield {
+            "type": "user",
+            "session_id": "",
+            "message": {"role": "user", "content": prompt_text},
+            "parent_tool_use_id": None,
+        }
+
+    response_text = ""
+    async for message in query(prompt=_prompt(), options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    response_text += block.text
+        elif isinstance(message, ResultMessage):
+            if message.is_error:
+                log.error("Maintenance analysis error: %s", message.result)
+
+    return response_text
+
+
+async def run_maintenance(molly=None):
+    """Run the full nightly maintenance cycle using direct Python calls.
+
+    No Agent SDK tools, no bypassPermissions. All graph operations use
+    the Neo4j driver directly. File I/O is direct Python. The only Claude
+    call is a text-only analysis pass with no tools available.
+
+    Args:
+        molly: Optional Molly instance for sending summary to owner DM.
+    """
     today = date.today().isoformat()
     log.info("Starting nightly maintenance for %s", today)
+
+    results: dict[str, str] = {}
 
     # Step 1: Programmatic health check
     try:
         write_health_check()
+        results["Health check"] = "completed"
     except Exception:
         log.error("Health check failed", exc_info=True)
+        results["Health check"] = "failed"
 
-    # Step 2: Opus agent maintenance turn
+    # Step 2: Strength decay
     try:
-        system_prompt = MAINTENANCE_SYSTEM_PROMPT.format(
-            workspace=config.WORKSPACE,
-            today=today,
+        updated = _run_strength_decay()
+        results["Strength decay"] = f"{updated} entities updated"
+    except Exception:
+        log.error("Strength decay failed", exc_info=True)
+        results["Strength decay"] = "failed"
+
+    # Step 3: Deduplication sweep
+    try:
+        merged = _run_dedup_sweep()
+        results["Deduplication"] = f"{merged} entities merged"
+    except Exception:
+        log.error("Dedup sweep failed", exc_info=True)
+        results["Deduplication"] = "failed"
+
+    # Step 4: Orphan cleanup
+    try:
+        deleted = _run_orphan_cleanup()
+        self_refs = _run_self_ref_cleanup()
+        blocked = _run_blocklist_cleanup()
+        results["Orphan cleanup"] = (
+            f"{deleted} orphans, {self_refs} self-refs, {blocked} blocklisted"
+        )
+    except Exception:
+        log.error("Orphan cleanup failed", exc_info=True)
+        results["Orphan cleanup"] = "failed"
+
+    # Step 5: Prune stale daily logs
+    try:
+        moved = _prune_daily_logs()
+        results["Daily log pruning"] = f"{moved} logs archived"
+    except Exception:
+        log.error("Daily log pruning failed", exc_info=True)
+        results["Daily log pruning"] = "failed"
+
+    # Step 6: Write maintenance report
+    report = _build_maintenance_report(results)
+    report_path = MAINTENANCE_DIR / f"{today}.md"
+    MAINTENANCE_DIR.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report)
+    log.info("Maintenance report written to %s", report_path)
+
+    # Step 7: Opus analysis pass (text-only, no tools)
+    try:
+        from memory.graph import get_graph_summary
+        summary = get_graph_summary()
+        graph_text = (
+            f"Entities: {summary['entity_count']}, "
+            f"Relationships: {summary['relationship_count']}\n"
+            f"Top connected: {summary['top_connected']}\n"
+            f"Recent: {summary['recent']}"
         )
 
-        from claude_agent_sdk import ClaudeAgentOptions, query, AssistantMessage, TextBlock, ResultMessage
-        from tools.calendar import calendar_server
-        from tools.contacts import contacts_server
-        from tools.gmail import gmail_server
-        from tools.imessage import imessage_server
+        analysis = await _run_opus_analysis(report, graph_text, today)
 
-        options = ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            model="opus",
-            permission_mode="bypassPermissions",
-            allowed_tools=config.ALLOWED_TOOLS,
-            mcp_servers={
-                "google-calendar": calendar_server,
-                "gmail": gmail_server,
-                "apple-contacts": contacts_server,
-                "imessage": imessage_server,
-            },
-            cwd=str(config.WORKSPACE),
-        )
+        if analysis.strip():
+            # Append to MEMORY.md
+            memory_path = config.WORKSPACE / "MEMORY.md"
+            if memory_path.exists():
+                existing = memory_path.read_text()
+                memory_path.write_text(existing.rstrip() + "\n\n" + analysis.strip() + "\n")
+            else:
+                memory_path.write_text(analysis.strip() + "\n")
 
-        async def _maintenance_prompt(text: str):
-            yield {
-                "type": "user",
-                "session_id": "",
-                "message": {"role": "user", "content": text},
-                "parent_tool_use_id": None,
-            }
+            # Also append analysis to the report
+            with open(report_path, "a") as f:
+                f.write(f"\n## Analysis\n\n{analysis}\n")
 
-        prompt_text = (
-            f"Run nightly maintenance for {today}. "
-            "Work through all maintenance tasks. Be thorough."
-        )
-
-        response_text = ""
-        async for message in query(prompt=_maintenance_prompt(prompt_text), options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response_text += block.text
-            elif isinstance(message, ResultMessage):
-                if message.is_error:
-                    log.error("Maintenance agent error: %s", message.result)
-
-        log.info("Maintenance completed: %d chars output", len(response_text))
+            log.info("MEMORY.md updated with maintenance analysis")
+        else:
+            log.warning("Opus analysis returned empty response")
 
     except Exception:
-        log.error("Opus maintenance turn failed", exc_info=True)
+        log.error("Opus analysis pass failed", exc_info=True)
+
+    # Step 8: Send brief summary to owner DM
+    if molly and molly.wa:
+        try:
+            owner_jid = molly._get_owner_dm_jid()
+            if owner_jid:
+                from memory.graph import entity_count, relationship_count
+                e_count = entity_count()
+                r_count = relationship_count()
+
+                summary_parts = [f"Nightly maintenance done ({today})."]
+                for task_name, result in results.items():
+                    summary_parts.append(f"{task_name}: {result}")
+                summary_parts.append(f"Graph: {e_count} entities, {r_count} relationships.")
+
+                summary_msg = "\n".join(summary_parts)
+                # Cap at ~100 words
+                words = summary_msg.split()
+                if len(words) > 100:
+                    summary_msg = " ".join(words[:100]) + "..."
+
+                molly._track_send(molly.wa.send_message(owner_jid, summary_msg))
+        except Exception:
+            log.error("Failed to send maintenance summary", exc_info=True)
+
+    log.info("Nightly maintenance completed for %s", today)

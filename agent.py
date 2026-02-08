@@ -49,17 +49,42 @@ def load_identity_stack() -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def make_tool_checker(approval_manager, molly, chat_jid: str):
+def _normalize_tool_name(tool_name: str) -> str:
+    """Normalize MCP-prefixed tool names to short names for tier lookup.
+
+    The CLI sends tool names like 'mcp__gmail__gmail_send' for MCP tools
+    but our ACTION_TIERS use short names like 'gmail_send'.
+    Built-in tools ('Bash', 'Write') are passed through unchanged.
+    """
+    if tool_name.startswith("mcp__"):
+        # mcp__servername__toolname → toolname
+        parts = tool_name.split("__")
+        if len(parts) >= 3:
+            return "__".join(parts[2:])
+    return tool_name
+
+
+def make_tool_checker(approval_manager=None, molly=None, chat_jid: str = ""):
     """Create a can_use_tool callback for code-enforced action tiers.
 
     AUTO    → PermissionResultAllow (immediate)
-    CONFIRM → WhatsApp approval flow → Allow/Deny
+    CONFIRM → WhatsApp approval flow → Allow/Deny (or deny if no approval_manager)
     BLOCKED → PermissionResultDeny (immediate)
+
+    This callback only fires for tools NOT in allowed_tools (i.e., CONFIRM and
+    BLOCKED tier tools). AUTO-tier tools are pre-approved via allowed_tools and
+    never reach this callback.
+
+    This callback MUST always be set so the SDK uses the stdio control protocol
+    instead of interactive terminal prompts. When no approval_manager is available
+    (heartbeat, terminal), CONFIRM-tier tools are denied with a message.
     """
 
     async def can_use_tool(tool_name: str, tool_input: dict, _context) -> PermissionResultAllow | PermissionResultDeny:
-        tier = get_action_tier(tool_name)
+        short_name = _normalize_tool_name(tool_name)
+        tier = get_action_tier(short_name)
         t0 = time.time()
+        log.info("can_use_tool fired: %s (normalized: %s) → tier=%s", tool_name, short_name, tier)
 
         if tier == "AUTO":
             _log_tool(tool_name, tool_input, True, t0)
@@ -78,10 +103,21 @@ def make_tool_checker(approval_manager, molly, chat_jid: str):
 
         # CONFIRM tier
         # Check if this is a file write to an auto-approved path
-        if is_auto_approved_path(tool_name, tool_input):
+        if is_auto_approved_path(short_name, tool_input):
             log.info("Auto-approved %s to memory path: %s", tool_name, tool_input.get("file_path", ""))
             _log_tool(tool_name, tool_input, True, t0)
             return PermissionResultAllow()
+
+        # No approval manager (headless/heartbeat) — deny CONFIRM-tier
+        if not approval_manager or not molly:
+            log.info("No approval manager — denying CONFIRM tool: %s", tool_name)
+            _log_tool(tool_name, tool_input, False, t0, "no_approval_manager")
+            return PermissionResultDeny(
+                message=(
+                    f"This action ({tool_name}) requires Brian's approval, "
+                    f"but no approval channel is available right now."
+                )
+            )
 
         # Request approval via WhatsApp and wait
         log.info("CONFIRM tier — requesting approval for %s", tool_name)
@@ -222,11 +258,15 @@ async def handle_message(
     if skill_context:
         system_prompt += "\n\n---\n\n" + skill_context
 
+    # Only pre-approve AUTO-tier tools. CONFIRM/BLOCKED-tier tools remain
+    # available (built-in + MCP) but require permission — which fires the
+    # can_use_tool callback for our approval system and tool logging.
+    auto_tools = sorted(config.ACTION_TIERS["AUTO"])
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=config.CLAUDE_MODEL,
-        permission_mode="bypassPermissions",
-        allowed_tools=config.ALLOWED_TOOLS,
+        allowed_tools=auto_tools,
         agents=_build_agents(),
         hooks={
             "SubagentStart": [HookMatcher(hooks=[_on_subagent_start])],
@@ -242,15 +282,15 @@ async def handle_message(
             "grok": grok_server,
         },
         cwd=str(config.WORKSPACE),
+        # Always set can_use_tool so the SDK uses the stdio control protocol
+        # (no interactive terminal prompts). Approval manager is optional —
+        # without it, CONFIRM-tier tools are denied gracefully.
+        can_use_tool=make_tool_checker(
+            approval_manager, molly_instance, chat_id,
+        ),
     )
     if session_id:
         options.resume = session_id
-
-    # Wire in code-enforced tool interception
-    if approval_manager and molly_instance:
-        options.can_use_tool = make_tool_checker(
-            approval_manager, molly_instance, chat_id,
-        )
 
     response_text = ""
     new_session_id = None
@@ -274,8 +314,13 @@ async def handle_message(
 
     # Async post-processing: embed + store conversation turn
     if response_text and not response_text.startswith("Something went wrong"):
-        asyncio.create_task(
-            process_conversation(user_message, response_text, chat_id)
+        task = asyncio.create_task(
+            process_conversation(user_message, response_text, chat_id),
+            name=f"post-process:{chat_id[:20]}",
+        )
+        task.add_done_callback(
+            lambda t: log.error("Post-processing failed: %s", t.exception(), exc_info=t.exception())
+            if not t.cancelled() and t.exception() else None
         )
 
     log.info(
