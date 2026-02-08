@@ -39,11 +39,14 @@ async def run_heartbeat(molly):
         log.debug("No owner DM JID available for heartbeat")
         return
 
-    # Phase 3D: morning digest (7 AM)
-    await _check_morning_digest(molly, chat_jid)
+    # Phase 3D: proactive skills — only run if enabled in HEARTBEAT_SKILLS
+    from skills import HEARTBEAT_SKILLS
 
-    # Phase 3D: meeting prep (30 min before meetings)
-    await _check_meeting_prep(molly, chat_jid)
+    if "daily-digest" in HEARTBEAT_SKILLS:
+        await _check_morning_digest(molly, chat_jid)
+
+    if "meeting-prep" in HEARTBEAT_SKILLS:
+        await _check_meeting_prep(molly, chat_jid)
 
     # Standard heartbeat: HEARTBEAT.md evaluation
     from agent import handle_message

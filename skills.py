@@ -59,7 +59,7 @@ def _load_all() -> dict[str, Skill]:
     if _skills_cache is not None:
         return _skills_cache
 
-    skills_dir = config.WORKSPACE / "skills"
+    skills_dir = config.SKILLS_DIR
     skills: dict[str, Skill] = {}
 
     if not skills_dir.exists():
