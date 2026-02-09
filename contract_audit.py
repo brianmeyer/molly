@@ -1,5 +1,6 @@
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -62,7 +63,104 @@ def _summarize_checks(checks: list[dict[str, str]]) -> str:
     return f"{_overall_status(checks)} ({failed} failed, {warned} warned, {total} checks)"
 
 
-def run_nightly_deterministic_checks(task_results: Mapping[str, str]) -> dict[str, Any]:
+def query_underperforming_skills(
+    *,
+    db_path: Path | None = None,
+    min_invocations: int = 5,
+    success_rate_threshold: float = 0.6,
+) -> list[dict[str, Any]]:
+    """Query low-performing skills from analytics table with execution fallback."""
+    path = Path(db_path or config.MOLLYGRAPH_PATH)
+    if not path.exists():
+        return []
+
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            if row and row[0]
+        }
+
+        rows: list[sqlite3.Row] = []
+        if "skill_analytics" in tables:
+            rows = conn.execute(
+                """
+                SELECT skill_name, invocations, success_rate
+                FROM skill_analytics
+                WHERE invocations >= ?
+                  AND success_rate < ?
+                ORDER BY success_rate ASC, invocations DESC, skill_name ASC
+                """,
+                (int(min_invocations), float(success_rate_threshold)),
+            ).fetchall()
+        elif "skill_executions" in tables:
+            rows = conn.execute(
+                """
+                SELECT skill_name,
+                       COUNT(*) AS invocations,
+                       AVG(
+                           CASE
+                               WHEN lower(coalesce(outcome, '')) IN (
+                                   'success', 'ok', 'completed', 'succeeded', 'approved', 'active', 'activated'
+                               )
+                                   THEN 1.0
+                               ELSE 0.0
+                           END
+                       ) AS success_rate
+                FROM skill_executions
+                WHERE trim(coalesce(skill_name, '')) <> ''
+                GROUP BY skill_name
+                HAVING COUNT(*) >= ?
+                   AND AVG(
+                       CASE
+                           WHEN lower(coalesce(outcome, '')) IN (
+                               'success', 'ok', 'completed', 'succeeded', 'approved', 'active', 'activated'
+                           )
+                               THEN 1.0
+                           ELSE 0.0
+                       END
+                   ) < ?
+                ORDER BY success_rate ASC, invocations DESC, skill_name ASC
+                """,
+                (int(min_invocations), float(success_rate_threshold)),
+            ).fetchall()
+
+        underperforming: list[dict[str, Any]] = []
+        for row in rows:
+            skill_name = str(row["skill_name"] or "").strip()
+            if not skill_name:
+                continue
+            try:
+                invocations = int(row["invocations"] or 0)
+            except (TypeError, ValueError):
+                invocations = 0
+            try:
+                success_rate = float(row["success_rate"] or 0.0)
+            except (TypeError, ValueError):
+                success_rate = 0.0
+            underperforming.append(
+                {
+                    "skill_name": skill_name,
+                    "invocations": max(0, invocations),
+                    "success_rate": round(success_rate, 4),
+                }
+            )
+        return underperforming
+    except Exception:
+        log.debug("Failed to load underperforming skills", exc_info=True)
+        return []
+    finally:
+        conn.close()
+
+
+def run_nightly_deterministic_checks(
+    task_results: Mapping[str, str],
+    *,
+    underperforming_skills: list[dict[str, Any]] | None = None,
+    enforce_underperforming: bool | None = None,
+) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     missing_steps = [step for step in REQUIRED_NIGHTLY_STEPS if step not in task_results]
     if missing_steps:
@@ -112,10 +210,37 @@ def run_nightly_deterministic_checks(task_results: Mapping[str, str]) -> dict[st
         }
     )
 
+    candidates = underperforming_skills or []
+    enforce = bool(
+        bool(getattr(config, "CONTRACT_AUDIT_ENFORCE_UNDERPERFORMING_SKILLS", False))
+        if enforce_underperforming is None
+        else enforce_underperforming
+    )
+    if candidates:
+        checks.append(
+            {
+                "check_id": "nightly.underperforming_skills",
+                "status": "fail" if enforce else "warn",
+                "detail": (
+                    f"{len(candidates)} underperforming skills "
+                    "(invocations>=5, success_rate<0.60)"
+                ),
+            }
+        )
+    else:
+        checks.append(
+            {
+                "check_id": "nightly.underperforming_skills",
+                "status": "pass",
+                "detail": "no underperforming skills detected",
+            }
+        )
+
     return {
         "status": _overall_status(checks),
         "summary": _summarize_checks(checks),
         "checks": checks,
+        "underperforming_skills": candidates,
     }
 
 
@@ -504,6 +629,30 @@ def _render_check_lines(checks: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _render_underperforming_skills_output(rows: list[dict[str, Any]]) -> str:
+    lines = [
+        "### Deterministic Check Output",
+        "- Criteria: invocations >= 5 and success_rate < 0.60",
+    ]
+    if not rows:
+        lines.append("- Underperforming skills: none")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "",
+            "| Skill | Invocations | Success Rate |",
+            "|---|---:|---:|",
+        ]
+    )
+    for row in rows:
+        skill = str(row.get("skill_name", "-") or "-")
+        invocations = int(row.get("invocations", 0) or 0)
+        success_rate = float(row.get("success_rate", 0.0) or 0.0)
+        lines.append(f"| {skill} | {invocations} | {success_rate:.2f} |")
+    return "\n".join(lines)
+
+
 def _render_model_section(title: str, result: Mapping[str, str]) -> str:
     lines = [
         f"## {title}",
@@ -546,6 +695,7 @@ def _render_audit_report(
     weekly_deterministic: Mapping[str, Any],
     nightly_model: Mapping[str, str],
     weekly_model: Mapping[str, str],
+    underperforming_skills: list[dict[str, Any]],
 ) -> str:
     lines = [
         f"# Contract Audit — {today}",
@@ -553,6 +703,8 @@ def _render_audit_report(
         "## Nightly Deterministic",
         f"- Status: {nightly_deterministic.get('status', '-')}",
         f"- Summary: {nightly_deterministic.get('summary', '-')}",
+        "",
+        _render_underperforming_skills_output(underperforming_skills),
         "",
         _render_check_lines(list(nightly_deterministic.get("checks", []))),
         "",
@@ -577,7 +729,11 @@ async def run_contract_audits(
     maintenance_dir: Path,
     health_dir: Path,
 ) -> dict[str, Any]:
-    nightly_deterministic = run_nightly_deterministic_checks(task_results)
+    underperforming_skills = query_underperforming_skills()
+    nightly_deterministic = run_nightly_deterministic_checks(
+        task_results,
+        underperforming_skills=underperforming_skills,
+    )
     weekly_deterministic = run_weekly_deterministic_checks(
         weekly_due=weekly_due,
         weekly_result=weekly_result,
@@ -588,6 +744,7 @@ async def run_contract_audits(
         "weekly_due": bool(weekly_due),
         "weekly_result": str(weekly_result),
         "task_results": dict(task_results),
+        "underperforming_skills": underperforming_skills,
     }
     nightly_model = await run_model_audit(
         audit_pass="nightly",
@@ -611,6 +768,7 @@ async def run_contract_audits(
         weekly_deterministic=weekly_deterministic,
         nightly_model=nightly_model,
         weekly_model=weekly_model,
+        underperforming_skills=underperforming_skills,
     )
 
     maintenance_path = Path(maintenance_dir) / f"{today}-contract-audit.md"
@@ -630,6 +788,7 @@ async def run_contract_audits(
         "weekly_deterministic": weekly_deterministic,
         "nightly_model": nightly_model,
         "weekly_model": weekly_model,
+        "underperforming_skills": underperforming_skills,
         "artifacts": {
             "maintenance": str(maintenance_path),
             "health": str(health_path),

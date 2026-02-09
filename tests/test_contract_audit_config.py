@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -27,12 +28,101 @@ def _baseline_results() -> dict[str, str]:
     }
 
 
+def _seed_skill_executions(db_path: Path, skill_name: str, outcomes: list[str]):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_executions (
+            id TEXT PRIMARY KEY,
+            skill_name TEXT,
+            trigger TEXT,
+            outcome TEXT,
+            user_approval TEXT,
+            edits_made TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    rows = [
+        (
+            f"{skill_name}-{idx}",
+            skill_name,
+            "weekly",
+            outcome,
+            "",
+            "",
+            "2026-02-09T00:00:00+00:00",
+        )
+        for idx, outcome in enumerate(outcomes)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO skill_executions
+        (id, skill_name, trigger, outcome, user_approval, edits_made, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestContractAuditUnderperforming(unittest.IsolatedAsyncioTestCase):
+    async def test_underperforming_skills_rendered_and_warn_only_by_default(self):
+        temp_root = Path(tempfile.mkdtemp(prefix="contract-audit-underperforming-"))
+        db_path = temp_root / "mollygraph.db"
+        _seed_skill_executions(
+            db_path,
+            skill_name="daily-digest",
+            outcomes=["success", "failure", "failure", "failure", "success"],
+        )
+
+        with patch.object(config, "MOLLYGRAPH_PATH", db_path), patch.object(
+            config, "CONTRACT_AUDIT_LLM_ENABLED", False
+        ):
+            result = await contract_audit.run_contract_audits(
+                today="2026-02-09",
+                task_results=_baseline_results(),
+                weekly_due=False,
+                weekly_result="not due",
+                maintenance_dir=temp_root / "memory" / "maintenance",
+                health_dir=temp_root / "memory" / "health",
+            )
+
+        self.assertEqual(result["nightly_deterministic"]["status"], "warn")
+        checks = result["nightly_deterministic"].get("checks", [])
+        underperforming = [row for row in checks if row.get("check_id") == "nightly.underperforming_skills"]
+        self.assertEqual(len(underperforming), 1)
+        self.assertEqual(underperforming[0]["status"], "warn")
+        self.assertEqual(result["underperforming_skills"][0]["skill_name"], "daily-digest")
+        self.assertIn("Deterministic Check Output", result["markdown"])
+        self.assertIn("daily-digest", result["markdown"])
+
+    def test_underperforming_skills_can_be_explicitly_enforced(self):
+        deterministic = contract_audit.run_nightly_deterministic_checks(
+            _baseline_results(),
+            underperforming_skills=[
+                {
+                    "skill_name": "daily-digest",
+                    "invocations": 8,
+                    "success_rate": 0.25,
+                }
+            ],
+            enforce_underperforming=True,
+        )
+
+        self.assertEqual(deterministic["status"], "fail")
+        check = [row for row in deterministic["checks"] if row.get("check_id") == "nightly.underperforming_skills"]
+        self.assertEqual(len(check), 1)
+        self.assertEqual(check[0]["status"], "fail")
+
+
 class TestContractAuditConfig(unittest.IsolatedAsyncioTestCase):
     async def test_deterministic_checks_run_before_model_audits(self):
         temp_root = Path(tempfile.mkdtemp(prefix="contract-audit-order-"))
         order: list[str] = []
 
-        def _nightly(_task_results):
+        def _nightly(_task_results, **_kwargs):
             order.append("nightly_deterministic")
             return {"status": "pass", "summary": "pass", "checks": []}
 

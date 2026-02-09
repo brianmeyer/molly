@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +200,157 @@ class TestSelfImproveSuggestionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ask_mock.await_count >= 1)
         propose_mock.assert_not_awaited()
         neg_pref_mock.assert_called_once()
+
+
+class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
+    def _setup_skill_gap_schema(self, db_path: Path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skill_gaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_key TEXT NOT NULL,
+                status TEXT,
+                addressed INTEGER DEFAULT 0,
+                cooldown_until TEXT,
+                proposal_id TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS self_improvement_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                payload TEXT,
+                status TEXT DEFAULT 'proposed',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    async def test_skill_gap_cluster_creates_pending_proposal_and_marks_addressed(self):
+        tmpdir = Path(tempfile.mkdtemp(prefix="self-improve-skill-gap-"))
+        db_path = tmpdir / "mollygraph.db"
+        self._setup_skill_gap_schema(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.executemany(
+            "INSERT INTO skill_gaps (cluster_key, status, addressed) VALUES (?, ?, ?)",
+            [
+                ("calendar-followups", "open", 0),
+                ("calendar-followups", "open", 0),
+                ("calendar-followups", "open", 0),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        hook = AsyncMock(return_value={"status": "pending", "proposal_id": "track-a-1"})
+        fake_molly = SimpleNamespace(
+            track_a_hooks=SimpleNamespace(draft_pending_skill_proposal=hook),
+        )
+        engine = SelfImprovementEngine(molly=fake_molly)
+
+        old_path = config.MOLLYGRAPH_PATH
+        config.MOLLYGRAPH_PATH = db_path
+        rows = []
+        events = 0
+        try:
+            result = await engine._propose_skill_updates_from_gap_clusters(min_cluster_size=3)
+            conn = sqlite3.connect(str(db_path))
+            rows = conn.execute(
+                "SELECT status, addressed, proposal_id, cooldown_until FROM skill_gaps WHERE cluster_key = ?",
+                ("calendar-followups",),
+            ).fetchall()
+            events = conn.execute(
+                "SELECT COUNT(*) FROM self_improvement_events WHERE category = ? AND title = ?",
+                ("skill-gap", "Skill gap cluster: calendar-followups"),
+            ).fetchone()[0]
+            conn.close()
+        finally:
+            config.MOLLYGRAPH_PATH = old_path
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["drafted"], 1)
+        hook.assert_awaited_once()
+
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(str(row[0]).lower() == "proposed" for row in rows))
+        self.assertTrue(all(int(row[1] or 0) == 1 for row in rows))
+        self.assertTrue(all(str(row[2] or "") == "track-a-1" for row in rows))
+        self.assertTrue(all(str(row[3] or "").strip() for row in rows))
+        self.assertGreaterEqual(int(events or 0), 1)
+
+    async def test_skill_gap_cluster_skips_when_cooldown_or_duplicate_exists(self):
+        tmpdir = Path(tempfile.mkdtemp(prefix="self-improve-skill-gap-cooldown-"))
+        db_path = tmpdir / "mollygraph.db"
+        self._setup_skill_gap_schema(db_path)
+        now = datetime.now(timezone.utc)
+        future = (now + timedelta(days=2)).isoformat()
+
+        conn = sqlite3.connect(str(db_path))
+        conn.executemany(
+            "INSERT INTO skill_gaps (cluster_key, status, addressed, cooldown_until) VALUES (?, ?, ?, ?)",
+            [
+                ("ops-workflow", "open", 0, future),
+                ("ops-workflow", "open", 0, future),
+                ("ops-workflow", "open", 0, future),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO self_improvement_events
+            (id, event_type, category, title, payload, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "evt-1",
+                    "proposal",
+                    "skill-gap",
+                    "Skill gap cluster: duplicate-cluster",
+                    "{}",
+                    "pending",
+                    now.isoformat(),
+                    now.isoformat(),
+                )
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO skill_gaps (cluster_key, status, addressed) VALUES (?, ?, ?)",
+            [
+                ("duplicate-cluster", "open", 0),
+                ("duplicate-cluster", "open", 0),
+                ("duplicate-cluster", "open", 0),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        hook = AsyncMock(return_value={"status": "pending", "proposal_id": "track-a-2"})
+        fake_molly = SimpleNamespace(
+            track_a_hooks=SimpleNamespace(draft_pending_skill_proposal=hook),
+        )
+        engine = SelfImprovementEngine(molly=fake_molly)
+
+        old_path = config.MOLLYGRAPH_PATH
+        config.MOLLYGRAPH_PATH = db_path
+        try:
+            result = await engine._propose_skill_updates_from_gap_clusters(min_cluster_size=3)
+        finally:
+            config.MOLLYGRAPH_PATH = old_path
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.assertEqual(result["status"], "skipped")
+        hook.assert_not_awaited()
 
 
 if __name__ == "__main__":
