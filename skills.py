@@ -64,6 +64,57 @@ def _is_pending_skill_name(name: str) -> bool:
     return lowered.endswith(_PENDING_SUFFIXES)
 
 
+def _extract_front_matter_block(content: str) -> str:
+    """Extract raw YAML front matter block text from a markdown document."""
+    match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|\s*\Z)", content, re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def _extract_front_matter_triggers(content: str) -> list[str]:
+    """Extract trigger phrases from YAML front matter `triggers:` list."""
+    front_matter = _extract_front_matter_block(content)
+    if not front_matter:
+        return []
+
+    lines = front_matter.splitlines()
+    triggers: list[str] = []
+    in_triggers_block = False
+    triggers_indent = 0
+
+    for line in lines:
+        if not in_triggers_block:
+            match = re.match(r"^(\s*)triggers\s*:\s*$", line)
+            if match:
+                in_triggers_block = True
+                triggers_indent = len(match.group(1))
+            continue
+
+        if not line.strip():
+            continue
+
+        line_indent = len(line) - len(line.lstrip())
+        # Exit when another key at the same or shallower indentation starts.
+        if line_indent <= triggers_indent and re.match(r"^[\w-]+\s*:", line.strip()):
+            break
+
+        item_match = re.match(r"^\s*-\s+(.+?)\s*$", line)
+        if not item_match:
+            continue
+
+        item = item_match.group(1).strip()
+        if (
+            len(item) >= 2
+            and item[0] == item[-1]
+            and item[0] in {'"', "'"}
+        ):
+            item = item[1:-1]
+
+        if item:
+            triggers.append(item)
+
+    return triggers
+
+
 def _is_pending_skill_path(path: Path) -> bool:
     """Return True if a markdown path points to a pending/temp skill file."""
     return _is_pending_skill_name(path.stem)
@@ -127,15 +178,14 @@ def _build_patterns_for_skills(
     patterns: list[tuple[str, re.Pattern]] = []
 
     for name, skill in skills.items():
-        if _is_pending_skill_name(name) or not skill.trigger:
+        if _is_pending_skill_name(name):
             continue
 
-        phrases = _extract_trigger_phrases(skill.trigger)
-        if not phrases:
+        trigger_values = _collect_skill_trigger_values(skill)
+        if not trigger_values:
             continue
 
-        commands = re.findall(r'`(/\w+)`', skill.trigger)
-        regex_parts = [_phrase_to_regex(p) for p in phrases] + [re.escape(c) for c in commands]
+        regex_parts = [_phrase_to_regex(trigger_value) for trigger_value in trigger_values]
         if not regex_parts:
             continue
 
@@ -282,6 +332,38 @@ def _extract_trigger_phrases(trigger_text: str) -> list[str]:
     E.g.: '"daily digest", "morning briefing"' -> ["daily digest", "morning briefing"]
     """
     return re.findall(r'"([^"]+)"', trigger_text)
+
+
+def _normalize_trigger_value(value: str) -> str:
+    """Normalize trigger values for stable, case-insensitive de-duplication."""
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def _ordered_dedup(values: list[str]) -> list[str]:
+    """De-duplicate values while preserving first-seen order."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _normalize_trigger_value(value)
+        if not key or key in seen:
+            continue
+        deduped.append(value)
+        seen.add(key)
+    return deduped
+
+
+def _collect_skill_trigger_values(skill: Skill) -> list[str]:
+    """Collect trigger values with deterministic precedence.
+
+    Precedence:
+    1. YAML front matter `triggers:` items
+    2. Quoted phrases from legacy `## Trigger` section
+    3. Legacy command patterns in backticks (e.g. `/digest`)
+    """
+    yaml_triggers = _extract_front_matter_triggers(skill.content)
+    legacy_phrases = _extract_trigger_phrases(skill.trigger)
+    legacy_commands = re.findall(r'`(/\w+)`', skill.trigger)
+    return _ordered_dedup(yaml_triggers + legacy_phrases + legacy_commands)
 
 
 def _phrase_to_regex(phrase: str) -> str:
