@@ -507,7 +507,7 @@ class ApprovalManager:
                     result = await asyncio.wait_for(
                         asyncio.shield(inflight), timeout=config.APPROVAL_TIMEOUT
                     )
-                except asyncio.TimeoutError:
+                except (asyncio.TimeoutError, asyncio.CancelledError):
                     return False
                 except asyncio.CancelledError:
                     return False
@@ -740,13 +740,15 @@ class ApprovalManager:
         required_keyword: str = "YES",
         timeout_s: int | None = None,
         allow_edit: bool = True,
-    ) -> bool | str:
+        return_reasoned_denial: bool = False,
+    ) -> bool | str | tuple[str, str]:
         """Request approval with a custom required keyword (for DEPLOY gating).
 
         Returns:
             True if approved,
             False if denied/timeout,
-            str edit instruction if allow_edit and owner replied EDIT: ...
+            str edit instruction if allow_edit and owner replied EDIT: ...,
+            ("deny", reason) when return_reasoned_denial=True and owner replied NO with a reason.
         """
         response_chat_jid = self._resolve_response_chat_jid(chat_jid, molly)
         self._cancel_pending(chat_jid)
@@ -804,6 +806,11 @@ class ApprovalManager:
             if isinstance(result, tuple) and result[0] == "edit":
                 _log_approval_decision(category, "edited", elapsed)
                 return result[1]
+            if isinstance(result, tuple) and result[0] == "deny":
+                _log_approval_decision(category, "denied", elapsed)
+                if return_reasoned_denial:
+                    return ("deny", str(result[1] if len(result) > 1 else "").strip())
+                return False
             _log_approval_decision(category, "denied", elapsed)
             return False
         except asyncio.TimeoutError:
@@ -865,19 +872,31 @@ class ApprovalManager:
             log.info("Approval GRANTED: %s", approval.category)
             return True
 
-        if normalized in NO_WORDS:
+        if normalized in NO_WORDS or normalized.startswith("no:") or normalized.startswith("no "):
+            reason = ""
+            if normalized not in NO_WORDS:
+                raw = text.strip()
+                if len(raw) > 2:
+                    reason = raw[2:].lstrip(": ").strip()
             approval = self._pop_pending_for_chat(chat_jid)
             if not approval:
                 return False
             if not approval.future.done():
-                approval.future.set_result(False)
-            log.info("Approval DENIED: %s", approval.category)
+                approval.future.set_result(("deny", reason))
+            if reason:
+                log.info("Approval DENIED: %s (reason=%s)", approval.category, reason)
+            else:
+                log.info("Approval DENIED: %s", approval.category)
             return True
 
-        if normalized.startswith("edit:"):
+        if normalized.startswith("edit:") or normalized.startswith("edit "):
             if not pending.allow_edit:
                 return False
-            edit_instruction = text.strip()[5:].strip()
+            raw = text.strip()
+            if normalized.startswith("edit:"):
+                edit_instruction = raw[5:].strip()
+            else:
+                edit_instruction = raw[4:].strip()
             approval = self._pop_pending_for_chat(chat_jid)
             if not approval:
                 return False
