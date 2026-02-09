@@ -59,6 +59,15 @@ _MCP_SERVER_TOOL_NAMES = {
 _CHAT_RUNTIME_LOCK = asyncio.Lock()
 _CHAT_RUNTIME_IDLE_SECONDS = 30 * 60
 _CHAT_RUNTIME_MAX_ENTRIES = 200
+_SKILL_GAP_META_PREFIXES = ("routing:", "approval:")
+_SKILL_GAP_BASELINE_TOOLS = {
+    "memory_search",
+}
+_SKILL_GAP_BASELINE_SUFFIXES = (
+    "__memory_search",
+    ":memory_search",
+    ".memory_search",
+)
 
 
 @dataclass
@@ -180,12 +189,12 @@ def make_tool_checker(
         log.info("can_use_tool fired: %s (normalized: %s) → tier=%s", tool_name, short_name, tier)
 
         if tier == "AUTO":
-            _log_tool(tool_name, tool_input, True, t0)
+            _log_tool(tool_name, tool_input, True, t0, request_state=request_state)
             return PermissionResultAllow()
 
         if tier == "BLOCKED":
             log.warning("BLOCKED tool call: %s", tool_name)
-            _log_tool(tool_name, tool_input, False, t0, "BLOCKED")
+            _log_tool(tool_name, tool_input, False, t0, "BLOCKED", request_state=request_state)
             return PermissionResultDeny(
                 message=(
                     f"This action ({tool_name}) is blocked. "
@@ -198,13 +207,20 @@ def make_tool_checker(
         # Check if this is a file write to an auto-approved path
         if is_auto_approved_path(short_name, tool_input):
             log.info("Auto-approved %s to memory path: %s", tool_name, tool_input.get("file_path", ""))
-            _log_tool(tool_name, tool_input, True, t0)
+            _log_tool(tool_name, tool_input, True, t0, request_state=request_state)
             return PermissionResultAllow()
 
         # No approval manager (headless/heartbeat) — deny CONFIRM-tier
         if not approval_manager or not molly:
             log.info("No approval manager — denying CONFIRM tool: %s", tool_name)
-            _log_tool(tool_name, tool_input, False, t0, "no_approval_manager")
+            _log_tool(
+                tool_name,
+                tool_input,
+                False,
+                t0,
+                "no_approval_manager",
+                request_state=request_state,
+            )
             return PermissionResultDeny(
                 message=(
                     f"This action ({tool_name}) requires Brian's approval, "
@@ -221,12 +237,19 @@ def make_tool_checker(
 
         if result is True:
             log.info("Tool approved: %s", tool_name)
-            _log_tool(tool_name, tool_input, True, t0)
+            _log_tool(tool_name, tool_input, True, t0, request_state=request_state)
             return PermissionResultAllow()
         elif isinstance(result, str):
             # Edit instruction from Brian — deny with modification guidance
             log.info("Tool edit requested: %s → %s", tool_name, result)
-            _log_tool(tool_name, tool_input, False, t0, "edit_requested")
+            _log_tool(
+                tool_name,
+                tool_input,
+                False,
+                t0,
+                "edit_requested",
+                request_state=request_state,
+            )
             return PermissionResultDeny(
                 message=(
                     f"Brian wants you to modify this action before retrying. "
@@ -235,7 +258,14 @@ def make_tool_checker(
             )
         else:
             log.info("Tool denied: %s", tool_name)
-            _log_tool(tool_name, tool_input, False, t0, "denied/timed out")
+            _log_tool(
+                tool_name,
+                tool_input,
+                False,
+                t0,
+                "denied/timed out",
+                request_state=request_state,
+            )
             return PermissionResultDeny(
                 message="Brian denied this action or it timed out."
             )
@@ -243,8 +273,45 @@ def make_tool_checker(
     return can_use_tool
 
 
-def _log_tool(tool_name: str, tool_input: dict, success: bool, t0: float, error: str = ""):
+def _record_turn_tool_call(
+    request_state: RequestApprovalState | None,
+    tool_name: str,
+):
+    if request_state is None:
+        return
+    name = str(tool_name or "").strip()
+    if not name:
+        return
+    request_state.turn_tool_calls.append(name)
+
+
+def _is_excluded_skill_gap_tool(tool_name: str) -> bool:
+    name = str(tool_name or "").strip().lower()
+    if not name:
+        return True
+    if any(name.startswith(prefix) for prefix in _SKILL_GAP_META_PREFIXES):
+        return True
+    if name in _SKILL_GAP_BASELINE_TOOLS:
+        return True
+    if any(name.endswith(suffix) for suffix in _SKILL_GAP_BASELINE_SUFFIXES):
+        return True
+    return False
+
+
+def _filter_workflow_tool_calls(tool_names: list[str]) -> list[str]:
+    return [name for name in tool_names if not _is_excluded_skill_gap_tool(name)]
+
+
+def _log_tool(
+    tool_name: str,
+    tool_input: dict,
+    success: bool,
+    t0: float,
+    error: str = "",
+    request_state: RequestApprovalState | None = None,
+):
     """Log a tool call to operational memory (best-effort)."""
+    _record_turn_tool_call(request_state, tool_name)
     try:
         from memory.retriever import get_vectorstore
         vs = get_vectorstore()
@@ -542,6 +609,38 @@ def _emit_approval_metrics(request_state: RequestApprovalState):
     )
 
 
+def _maybe_log_skill_gap(
+    user_message: str,
+    matched_skills: list,
+    request_state: RequestApprovalState | None,
+    session_id: str | None,
+):
+    if matched_skills or request_state is None:
+        return
+
+    workflow_calls = _filter_workflow_tool_calls(request_state.turn_tool_calls)
+    if len(workflow_calls) < 3:
+        return
+
+    try:
+        from memory.retriever import get_vectorstore
+
+        vs = get_vectorstore()
+        gap_id = vs.log_skill_gap(
+            user_message=user_message,
+            tools_used=workflow_calls,
+            session_id=session_id or "",
+        )
+        log.info(
+            "Skill gap logged: id=%s tools=%d session=%s",
+            gap_id,
+            len(workflow_calls),
+            session_id or "",
+        )
+    except Exception:
+        log.debug("Failed to log skill gap", exc_info=True)
+
+
 def _build_agents() -> dict[str, AgentDefinition]:
     """Define sub-agents for intelligent task routing.
 
@@ -696,6 +795,12 @@ async def handle_message(
         runtime.last_used_monotonic = time.monotonic()
 
     _emit_approval_metrics(request_state)
+    _maybe_log_skill_gap(
+        user_message=user_message,
+        matched_skills=matched_skills,
+        request_state=request_state,
+        session_id=new_session_id,
+    )
 
     if matched_skills:
         outcome = "success"
