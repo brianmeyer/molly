@@ -15,7 +15,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if "numpy" not in sys.modules:
-    sys.modules["numpy"] = types.SimpleNamespace(array=lambda x: x, dot=lambda _a, _b: 0.0)
+    sys.modules["numpy"] = types.SimpleNamespace(
+        array=lambda x: x,
+        asarray=lambda x: x,
+        dot=lambda _a, _b: 0.0,
+        isscalar=lambda obj: isinstance(obj, (int, float, complex, bool, str, bytes)),
+        bool_=bool,
+        ndarray=tuple,
+    )
 if "sqlite_vec" not in sys.modules:
     sys.modules["sqlite_vec"] = types.SimpleNamespace(load=lambda _conn: None)
 
