@@ -33,6 +33,8 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Kimi K2.5 (Moonshot) | External research model via MCP tool |
 | Grok (xAI) | External reasoning model via MCP tool |
 | Health Doctor (`health.py`) | Daily/preflight health reports with regression checks |
+| Contract Audit (`contract_audit.py`) | Nightly/weekly deterministic contracts + optional LLM audit layer |
+| Track F Pre-Prod Audit (`scripts/run_preprod_readiness_audit.py`) | Report-first rollout checks before production promotion |
 | Self-Improvement Engine (`self_improve.py`) | Guarded self-edit loop (branch, tests, approval, rollback/restart) |
 
 ## Project Structure
@@ -44,6 +46,9 @@ molly/
 ├── whatsapp.py          # Neonize client wrapper
 ├── formatting.py        # WhatsApp-safe markdown rendering + chunking
 ├── health.py            # Health Doctor checks + report generation
+├── contract_audit.py    # Deterministic + model-backed maintenance/weekly audits
+├── foundry_adapter.py   # Foundry observation signal adapter for self-improvement
+├── health_remediation.py # Health signal routing policy (auto-fix/propose/escalate)
 ├── self_improve.py      # Self-improvement engine (guarded self-edit loop)
 ├── web.py               # FastAPI web UI backend (WebSocket chat)
 ├── terminal.py          # Standalone CLI REPL for debugging
@@ -57,7 +62,8 @@ molly/
 ├── maintenance.py       # Nightly maintenance (direct Python, no SDK tools)
 ├── skills.py            # Dynamic skill trigger matching + loading
 ├── scripts/
-│   └── run_molly.sh     # Supervisor loop with restart-on-exit-code support
+│   ├── run_molly.sh     # Supervisor loop with restart-on-exit-code support
+│   └── run_preprod_readiness_audit.py # Track F pre-prod gate/report generator
 ├── web/
 │   └── index.html       # Chat UI (single-page, no framework)
 ├── tools/
@@ -76,6 +82,8 @@ molly/
     ├── processor.py     # Post-response: embed, extract, store
     ├── extractor.py     # GLiNER2 entity/relation/classification
     ├── triage.py        # Local Qwen3 message triage
+    ├── dedup.py         # Shared dedup engine used by maintenance + health
+    ├── issue_registry.py # Persistent issue/event registry + notification cooldown
     └── graph.py         # Neo4j client + Cypher queries
 ```
 
@@ -141,10 +149,16 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 - Added guarded self-improvement workflows in `self_improve.py`: proposal drafting, branch/test gates, owner approval, deploy restart, and post-deploy rollback checks.
 - Added Health Doctor in `health.py` with startup preflight snapshots, daily reports, and green→red regression detection.
+- Added health remediation routing + issue registry persistence (`health_remediation.py`, `memory/issue_registry.py`) to separate observe/auto-fix/escalate behavior and avoid repeat alert spam.
 - Added WhatsApp output hardening via `formatting.py` plus message chunking and JID guards in `whatsapp.py`.
+- Added stable timestamp normalization in `database.py`/`whatsapp.py` for mixed epoch units (sec/ms/us/ns) and ISO values.
 - Expanded commitment automation to sync with Apple Reminders and exposed commitment/reminder status via `/followups`.
 - Added automation proposal mining from repeated tool traces and improved email-trigger high-water deduplication.
 - Improved approval runtime behavior with request-scoped coalescing and owner-routed approvals for non-WhatsApp channels.
+- Added Foundry signal ingestion (`foundry_adapter.py`) so self-improvement can use real observed workflow sequences as additive evidence.
+- Added contract audits (`contract_audit.py`) with deterministic checks first and optional model audits (Opus/Kimi/Gemini, fallback-capable).
+- Added Track F pre-prod readiness audit (`scripts/run_preprod_readiness_audit.py`) and report-first enforcement toggles in `config.py`.
+- Added promotion contract/drift gates in workspace `promote-tool.py` (`validate`, `promote --dry-run`, force override with reason).
 - Added `scripts/run_molly.sh` supervisor for restart-safe runtime operation.
 
 ## Preference Signals
@@ -153,7 +167,33 @@ Passive feedback logging for future learning loops. When the owner dismisses a s
 
 ## Skills
 
-Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parsed dynamically from each skill's `## Trigger` section. Matched skills inject their instructions into the system prompt for that turn. Adding a new `.md` file with quoted trigger phrases is picked up automatically after restart.
+Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parsed dynamically from:
+- YAML front matter `triggers:` lists
+- legacy `## Trigger` quoted phrases/commands
+
+Matched skills inject their instructions into the system prompt for that turn. This keeps runtime matching compatible with both old and new skill authoring formats.
+
+## Pre-Prod Readiness Audit
+
+Before promoting major behavior changes, run:
+
+```bash
+python scripts/run_preprod_readiness_audit.py --output-dir /tmp/molly-audits
+```
+
+Strict mode fails on red checks:
+
+```bash
+python scripts/run_preprod_readiness_audit.py --strict
+```
+
+Track F checks cover:
+- parser compatibility
+- skill telemetry presence
+- Foundry ingestion health
+- promotion drift status
+
+Default posture is report-first (`MOLLY_TRACK_F_REPORT_ONLY=true`) so rollout safety can be observed before hard enforcement.
 
 ## Commands
 
