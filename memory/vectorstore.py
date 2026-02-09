@@ -73,6 +73,16 @@ class VectorStore:
                 created_at TEXT
             );
 
+            -- Operational memory: detected skill gaps
+            CREATE TABLE IF NOT EXISTS skill_gaps (
+                id INTEGER PRIMARY KEY,
+                user_message TEXT,
+                tools_used TEXT,
+                session_id TEXT,
+                created_at TEXT,
+                addressed INTEGER DEFAULT 0
+            );
+
             -- Operational memory: corrections
             CREATE TABLE IF NOT EXISTS corrections (
                 id TEXT PRIMARY KEY,
@@ -294,6 +304,31 @@ class VectorStore:
             ),
         )
         self.conn.commit()
+
+    def log_skill_gap(
+        self,
+        user_message: str,
+        tools_used: list[str],
+        session_id: str = "",
+        addressed: bool = False,
+    ) -> int:
+        """Log a missing-skill candidate based on turn-level workflow activity."""
+        now = datetime.now(timezone.utc).isoformat()
+        tools_payload = json.dumps(tools_used, ensure_ascii=True)
+        cursor = self.conn.execute(
+            """INSERT INTO skill_gaps
+               (user_message, tools_used, session_id, created_at, addressed)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                user_message[:4000],
+                tools_payload[:4000],
+                session_id[:200],
+                now,
+                int(bool(addressed)),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
 
     def chunk_count(self) -> int:
         cursor = self.conn.execute("SELECT COUNT(*) FROM conversation_chunks")

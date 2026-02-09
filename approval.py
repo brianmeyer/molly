@@ -231,11 +231,13 @@ class RequestApprovalState:
     tool_asks: int = 0
     prompts_sent: int = 0
     auto_approved: int = 0
+    turn_tool_calls: list[str] = field(default_factory=list)
 
     def reset_for_retry(self):
         """Clear transient deny/inflight state before a transport retry."""
         self.denied_tools.clear()
         self.inflight_tool_approvals.clear()
+        self.turn_tool_calls.clear()
 
 
 @dataclass
@@ -507,6 +509,8 @@ class ApprovalManager:
                     )
                 except asyncio.TimeoutError:
                     return False
+                except asyncio.CancelledError:
+                    return False
                 final = self._apply_tool_approval_result(tool_name, result, request_state)
                 if final is True:
                     request_state.auto_approved += 1
@@ -585,7 +589,7 @@ class ApprovalManager:
         t0 = asyncio.get_event_loop().time()
         try:
             result = await asyncio.wait_for(
-                future, timeout=config.APPROVAL_TIMEOUT
+                asyncio.shield(future), timeout=config.APPROVAL_TIMEOUT
             )
             elapsed = asyncio.get_event_loop().time() - t0
             final = self._apply_tool_approval_result(tool_name, result, request_state)
