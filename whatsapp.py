@@ -2,6 +2,7 @@ import logging
 from typing import Callable
 
 import config
+from database import normalize_timestamp
 from formatting import render_for_whatsapp, split_for_whatsapp
 from neonize import NewClient
 from neonize.proto.Neonize_pb2 import Connected, GroupInfo, Message as MessageEv
@@ -11,6 +12,8 @@ from neonize.utils.jid import Jid2String, build_jid
 
 log = logging.getLogger(__name__)
 SendResult = str | list[str] | None
+WHATSAPP_JID_SERVER_SUFFIX = ".whatsapp.net"
+WHATSAPP_JID_ALLOWED_SERVERS = {"lid", "g.us", "broadcast"}
 
 
 def _resolve_sender_name(sender_jid: str, pushname: str) -> str:
@@ -72,6 +75,7 @@ class WhatsAppClient:
             timestamp = raw_ts.isoformat()
         else:
             timestamp = str(raw_ts)
+        timestamp = normalize_timestamp(timestamp)
         pushname = info.Pushname or ""
 
         # Extract text content from any message type
@@ -107,7 +111,15 @@ class WhatsAppClient:
 
     @staticmethod
     def _is_whatsapp_jid(jid_str: str) -> bool:
-        return isinstance(jid_str, str) and "@" in jid_str
+        if not isinstance(jid_str, str) or "@" not in jid_str:
+            return False
+        user, server = jid_str.split("@", 1)
+        if not user or not server:
+            return False
+        return (
+            server.endswith(WHATSAPP_JID_SERVER_SUFFIX)
+            or server in WHATSAPP_JID_ALLOWED_SERVERS
+        )
 
     @staticmethod
     def _parse_jid(jid_str: str):
@@ -149,7 +161,7 @@ class WhatsAppClient:
 
     def send_message(self, chat_jid: str, text: str) -> SendResult:
         """Send a text message. Returns one or many message IDs for send tracking."""
-        if chat_jid.startswith("web:"):
+        if isinstance(chat_jid, str) and chat_jid.startswith("web:"):
             routed = self._route_non_whatsapp_message(chat_jid, text)
             if routed is not None:
                 return routed

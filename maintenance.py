@@ -1,29 +1,98 @@
+import asyncio
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import config
+from contract_audit import run_contract_audits
+from health_remediation import route_health_signal
+from memory.issue_registry import (
+    append_issue_event,
+    ensure_issue_registry_tables,
+    should_notify,
+    upsert_issue,
+)
 
 log = logging.getLogger(__name__)
 
 MAINTENANCE_DIR = config.WORKSPACE / "memory" / "maintenance"
 HEALTH_LOG_PATH = MAINTENANCE_DIR / "health-log.md"
 MAINTENANCE_HOUR = 23  # 11 PM
+MAINTENANCE_NOTIFY_COOLDOWN_HOURS = 24
+MAINTENANCE_STEP_PREFIX = "maintenance."
+
+
+@dataclass
+class MaintenanceRunState:
+    status: str = "idle"  # queued | running | success | partial | failed
+    run_id: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    last_error: str = ""
+    queued_requests: int = 0
+    failed_steps: list[str] = field(default_factory=list)
+    results: dict[str, str] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "run_id": self.run_id,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "last_error": self.last_error,
+            "queued_requests": int(self.queued_requests),
+            "failed_steps": list(self.failed_steps),
+            "results": dict(self.results),
+        }
+
+
+_MAINTENANCE_LOCK: asyncio.Lock | None = None
+_MAINTENANCE_LOCK_LOOP_ID: int | None = None
+_RUN_STATE = MaintenanceRunState()
+
+
+def get_maintenance_run_state() -> dict[str, Any]:
+    return _RUN_STATE.as_dict()
+
+
+def _get_maintenance_lock() -> asyncio.Lock:
+    """Return a loop-safe singleton lock for single-flight maintenance runs."""
+    global _MAINTENANCE_LOCK, _MAINTENANCE_LOCK_LOOP_ID
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    if _MAINTENANCE_LOCK is None or _MAINTENANCE_LOCK_LOOP_ID != loop_id:
+        _MAINTENANCE_LOCK = asyncio.Lock()
+        _MAINTENANCE_LOCK_LOOP_ID = loop_id
+    return _MAINTENANCE_LOCK
 
 
 def should_run_maintenance(last_run: datetime | None) -> bool:
-    """Check if nightly maintenance is due (once per day at 11 PM)."""
+    """Check if nightly maintenance is due.
+
+    Normal window: once per day at/after 11 PM local.
+    Catch-up: if maintenance was missed for at least one full day, run on next opportunity.
+    """
     now = datetime.now()
-    if now.hour != MAINTENANCE_HOUR:
-        return False
     if last_run is None:
+        return now.hour >= MAINTENANCE_HOUR
+
+    if last_run.date() >= now.date():
+        return False
+
+    if now.hour >= MAINTENANCE_HOUR:
         return True
-    # Run once per calendar day
-    return last_run.date() < now.date()
+
+    missed_days = (now.date() - last_run.date()).days
+    return missed_days > 1
 
 
 # ---------------------------------------------------------------------------
@@ -272,54 +341,74 @@ def _run_strength_decay() -> int:
 
 
 def _run_dedup_sweep() -> int:
-    """Task 2: Find and merge duplicate entities with fuzzy matching."""
+    """Task 2: Find and merge duplicate entities with the shared dedup engine."""
+    from memory.dedup import find_near_duplicates
     from memory.graph import get_driver
-    from difflib import SequenceMatcher
 
     driver = get_driver()
     merged = 0
+    already_merged: set[str] = set()
 
     with driver.session() as session:
-        # Get all entities grouped by type
         result = session.run(
-            "MATCH (e:Entity) RETURN e.name AS name, e.entity_type AS type "
-            "ORDER BY e.entity_type, e.name"
+            """
+            MATCH (e:Entity)
+            RETURN e.name AS name, coalesce(e.entity_type, 'unknown') AS type
+            ORDER BY e.entity_type, e.name
+            """
         )
-        entities = [dict(r) for r in result]
+        entities = [dict(row) for row in result if row.get("name")]
 
-    # Group by type
     by_type: dict[str, list[str]] = {}
     for ent in entities:
-        by_type.setdefault(ent["type"], []).append(ent["name"])
+        by_type.setdefault(str(ent.get("type") or "unknown"), []).append(str(ent["name"]))
 
-    for etype, names in by_type.items():
-        for i, name_a in enumerate(names):
-            for name_b in names[i + 1:]:
-                ratio = SequenceMatcher(
-                    None, name_a.lower(), name_b.lower()
-                ).ratio()
-                if ratio >= 0.85 and name_a != name_b:
-                    # Merge name_b into name_a (keep first alphabetically)
-                    keep, drop = sorted([name_a, name_b])
-                    with driver.session() as session:
-                        session.run(
-                            """MATCH (keep:Entity {name: $keep}), (drop:Entity {name: $drop})
-                               SET keep.mention_count = keep.mention_count + drop.mention_count,
-                                   keep.aliases = keep.aliases + drop.aliases + [$drop_name],
-                                   keep.first_mentioned = CASE
-                                       WHEN keep.first_mentioned < drop.first_mentioned
-                                       THEN keep.first_mentioned ELSE drop.first_mentioned END
-                               WITH keep, drop
-                               CALL {
-                                   WITH keep, drop
-                                   MATCH (drop)-[r]->()
-                                   RETURN collect(r) AS rels
-                               }
-                               DETACH DELETE drop""",
-                            keep=keep, drop=drop, drop_name=drop,
-                        )
-                    merged += 1
-                    log.debug("Merged '%s' into '%s'", drop, keep)
+    for _etype, names in by_type.items():
+        for pair in find_near_duplicates(names):
+            left = str(pair.left)
+            right = str(pair.right)
+            if left in already_merged or right in already_merged:
+                continue
+            keep, drop = sorted((left, right))
+            with driver.session() as session:
+                session.run(
+                    """
+                    MATCH (keep:Entity {name: $keep}), (drop:Entity {name: $drop})
+                    SET keep.mention_count = coalesce(keep.mention_count, 0) + coalesce(drop.mention_count, 0),
+                        keep.aliases = reduce(
+                            acc = coalesce(keep.aliases, []),
+                            alias IN coalesce(drop.aliases, []) + [$drop_name] |
+                            CASE
+                                WHEN toLower(alias) IN [x IN acc | toLower(x)] THEN acc
+                                ELSE acc + alias
+                            END
+                        ),
+                        keep.first_mentioned = CASE
+                            WHEN keep.first_mentioned IS NULL THEN drop.first_mentioned
+                            WHEN drop.first_mentioned IS NULL THEN keep.first_mentioned
+                            WHEN keep.first_mentioned <= drop.first_mentioned THEN keep.first_mentioned
+                            ELSE drop.first_mentioned
+                        END,
+                        keep.last_mentioned = CASE
+                            WHEN keep.last_mentioned IS NULL THEN drop.last_mentioned
+                            WHEN drop.last_mentioned IS NULL THEN keep.last_mentioned
+                            WHEN keep.last_mentioned >= drop.last_mentioned THEN keep.last_mentioned
+                            ELSE drop.last_mentioned
+                        END,
+                        keep.confidence = CASE
+                            WHEN coalesce(drop.confidence, 0.0) > coalesce(keep.confidence, 0.0)
+                            THEN drop.confidence
+                            ELSE keep.confidence
+                        END
+                    DETACH DELETE drop
+                    """,
+                    keep=keep,
+                    drop=drop,
+                    drop_name=drop,
+                )
+            already_merged.add(drop)
+            merged += 1
+            log.debug("Merged '%s' into '%s' via shared dedup sweep", drop, keep)
 
     return merged
 
@@ -375,10 +464,146 @@ def _prune_daily_logs() -> int:
     return moved
 
 
-def _build_maintenance_report(results: dict) -> str:
+def _slugify(text: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(text or ""))
+    collapsed = "_".join(part for part in cleaned.split("_") if part)
+    return collapsed or "unknown"
+
+
+def _latest_scheduled_weekly_date(now_local: datetime) -> date:
+    weekday_map = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    target_day = config.WEEKLY_ASSESSMENT_DAY.strip().lower()
+    target_idx = weekday_map.get(target_day, 6)
+    delta = (now_local.weekday() - target_idx) % 7
+    return (now_local - timedelta(days=delta)).date()
+
+
+def _parse_iso_date(value: str) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _weekly_assessment_due_or_overdue(improver: Any, now_local: datetime) -> bool:
+    state = getattr(improver, "_state", {}) or {}
+    last_date = _parse_iso_date(str(state.get("last_weekly_assessment", "")))
+    target_date = _latest_scheduled_weekly_date(now_local)
+
+    if last_date and last_date >= target_date:
+        return False
+
+    if now_local.date() > target_date:
+        return True
+
+    return now_local.hour >= int(config.WEEKLY_ASSESSMENT_HOUR)
+
+
+def _issue_last_notified_at(conn: sqlite3.Connection, fingerprint: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT created_at
+        FROM maintenance_issue_events
+        WHERE issue_fingerprint = ? AND event_type = 'notified'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (fingerprint,),
+    ).fetchone()
+    if not row:
+        return None
+    return str(row[0] or "")
+
+
+def _severity_from_result(result_text: str) -> str:
+    lowered = str(result_text or "").strip().lower()
+    if lowered == "failed":
+        return "red"
+    if lowered in {"skipped", "not due"} or lowered.startswith("skipped"):
+        return "yellow"
+    return "green"
+
+
+def _record_maintenance_issues(
+    results: dict[str, str],
+    run_status: str,
+) -> tuple[int, int]:
+    synced = 0
+    notified = 0
+    try:
+        conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+        ensure_issue_registry_tables(conn)
+        now = datetime.now(timezone.utc).isoformat()
+        for task_name, result in results.items():
+            check_id = f"{MAINTENANCE_STEP_PREFIX}{_slugify(task_name)}"
+            severity = _severity_from_result(result)
+            issue = upsert_issue(
+                conn,
+                check_id=check_id,
+                severity=severity,
+                detail=str(result),
+                source="maintenance",
+                observed_at=now,
+            )
+            synced += 1
+            if severity not in {"yellow", "red"}:
+                continue
+            last_notified = _issue_last_notified_at(conn, issue["fingerprint"])
+            if should_notify(
+                fingerprint=issue["fingerprint"],
+                cooldown_hours=MAINTENANCE_NOTIFY_COOLDOWN_HOURS,
+                last_notified_at=last_notified,
+                severity_changed=bool(issue.get("severity_changed", False)),
+            ):
+                plan = route_health_signal(check_id, severity)
+                append_issue_event(
+                    conn,
+                    issue_fingerprint=issue["fingerprint"],
+                    event_type="notified",
+                    created_at=now,
+                    payload={
+                        "task": task_name,
+                        "result": result,
+                        "run_status": run_status,
+                        "action": plan.action,
+                        "suggested_action": plan.suggested_action,
+                    },
+                )
+                notified += 1
+        conn.commit()
+        conn.close()
+    except Exception:
+        log.debug("Maintenance issue registry sync failed", exc_info=True)
+    return synced, notified
+
+
+def _build_maintenance_report(
+    results: dict[str, str],
+    *,
+    run_status: str = "",
+    failed_steps: list[str] | None = None,
+) -> str:
     """Build a markdown maintenance report from task results."""
     today = date.today().isoformat()
     lines = [f"# Maintenance Report — {today}\n"]
+
+    if run_status:
+        lines.append("## Run Status\n")
+        lines.append(f"- Status: {run_status}")
+        if failed_steps:
+            lines.append(f"- Failed steps: {', '.join(failed_steps)}")
+        lines.append("")
 
     lines.append("## Task Results\n")
     lines.append("| Task | Result |")
@@ -449,185 +674,354 @@ async def _run_opus_analysis(report: str, graph_summary: str, today: str) -> str
     return response_text
 
 
-async def run_maintenance(molly=None):
-    """Run the full nightly maintenance cycle using direct Python calls.
+async def run_maintenance(molly=None) -> dict[str, Any]:
+    """Run the full nightly maintenance cycle using direct Python calls."""
 
-    No Agent SDK tools, no bypassPermissions. All graph operations use
-    the Neo4j driver directly. File I/O is direct Python. The only Claude
-    call is a text-only analysis pass with no tools available.
-
-    Args:
-        molly: Optional Molly instance for sending summary to owner DM.
-    """
-    today = date.today().isoformat()
-    log.info("Starting nightly maintenance for %s", today)
-
-    results: dict[str, str] = {}
-    improver = None
-
-    # Step 1: Programmatic health check
-    try:
-        write_health_check()
-        results["Health check"] = "completed"
-    except Exception:
-        log.error("Health check failed", exc_info=True)
-        results["Health check"] = "failed"
-
-    # Step 2: Strength decay
-    try:
-        updated = _run_strength_decay()
-        results["Strength decay"] = f"{updated} entities updated"
-    except Exception:
-        log.error("Strength decay failed", exc_info=True)
-        results["Strength decay"] = "failed"
-
-    # Step 3: Deduplication sweep
-    try:
-        merged = _run_dedup_sweep()
-        results["Deduplication"] = f"{merged} entities merged"
-    except Exception:
-        log.error("Dedup sweep failed", exc_info=True)
-        results["Deduplication"] = "failed"
-
-    # Step 4: Orphan cleanup
-    try:
-        deleted = _run_orphan_cleanup()
-        self_refs = _run_self_ref_cleanup()
-        blocked = _run_blocklist_cleanup()
-        results["Orphan cleanup"] = (
-            f"{deleted} orphans, {self_refs} self-refs, {blocked} blocklisted"
+    lock = _get_maintenance_lock()
+    if lock.locked():
+        _RUN_STATE.queued_requests += 1
+        log.info(
+            "Maintenance already running; skipping overlapping request (queued=%d)",
+            _RUN_STATE.queued_requests,
         )
-    except Exception:
-        log.error("Orphan cleanup failed", exc_info=True)
-        results["Orphan cleanup"] = "failed"
+        return {
+            "status": "queued",
+            "run_id": _RUN_STATE.run_id,
+            "queued_requests": _RUN_STATE.queued_requests,
+        }
 
-    # Step 4b: Phase 7 memory optimization loop
-    try:
-        from self_improve import SelfImprovementEngine
+    async with lock:
+        today = date.today().isoformat()
+        run_id = uuid.uuid4().hex
+        report_path = MAINTENANCE_DIR / f"{today}.md"
+        results: dict[str, str] = {}
+        failed_steps: list[str] = []
+        analysis_text = ""
+        improver = None
+        weekly_due = False
+        weekly_result = "not evaluated"
 
-        improver = getattr(molly, "self_improvement", None) if molly else None
-        if improver is None:
-            improver = SelfImprovementEngine(molly=molly)
-            await improver.initialize()
-        mem_opt = await improver.run_memory_optimization()
-        results["Memory optimization"] = (
-            f"consolidated={mem_opt.get('entity_consolidations', 0)}, "
-            f"stale={mem_opt.get('stale_entities', 0)}, "
-            f"contradictions={mem_opt.get('contradictions', 0)}"
-        )
-    except Exception:
-        log.error("Memory optimization failed", exc_info=True)
-        results["Memory optimization"] = "failed"
+        def _record_step(step_name: str, result: str, *, failed: bool = False) -> None:
+            results[step_name] = str(result)
+            _RUN_STATE.results[step_name] = str(result)
+            if failed and step_name not in failed_steps:
+                failed_steps.append(step_name)
+                _RUN_STATE.failed_steps = list(failed_steps)
 
-    # Step 5: Prune stale daily logs
-    try:
-        moved = _prune_daily_logs()
-        results["Daily log pruning"] = f"{moved} logs archived"
-    except Exception:
-        log.error("Daily log pruning failed", exc_info=True)
-        results["Daily log pruning"] = "failed"
+        def _derive_run_status() -> str:
+            if not results:
+                return "failed"
+            if not failed_steps:
+                return "success"
+            if len(failed_steps) >= len(results):
+                return "failed"
+            return "partial"
 
-    # Step 6: Write maintenance report
-    report = _build_maintenance_report(results)
-    report_path = MAINTENANCE_DIR / f"{today}.md"
-    MAINTENANCE_DIR.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(report)
-    log.info("Maintenance report written to %s", report_path)
-
-    # Step 7: Opus analysis pass (text-only, no tools)
-    try:
-        from memory.graph import get_graph_summary
-        summary = get_graph_summary()
-        graph_text = (
-            f"Entities: {summary['entity_count']}, "
-            f"Relationships: {summary['relationship_count']}\n"
-            f"Top connected: {summary['top_connected']}\n"
-            f"Recent: {summary['recent']}"
-        )
-
-        analysis = await _run_opus_analysis(report, graph_text, today)
-
-        if analysis.strip():
-            # Append to MEMORY.md
-            memory_path = config.WORKSPACE / "MEMORY.md"
-            if memory_path.exists():
-                existing = memory_path.read_text()
-                memory_path.write_text(existing.rstrip() + "\n\n" + analysis.strip() + "\n")
-            else:
-                memory_path.write_text(analysis.strip() + "\n")
-
-            # Also append analysis to the report
-            with open(report_path, "a") as f:
-                f.write(f"\n## Analysis\n\n{analysis}\n")
-
-            log.info("MEMORY.md updated with maintenance analysis")
-        else:
-            log.warning("Opus analysis returned empty response")
-
-    except Exception:
-        log.error("Opus analysis pass failed", exc_info=True)
-
-    # Step 8: GLiNER training accumulation + conditional fine-tune trigger
-    try:
-        if improver is None:
+        async def _ensure_improver():
+            nonlocal improver
+            if improver is not None:
+                return improver
             from self_improve import SelfImprovementEngine
 
             improver = getattr(molly, "self_improvement", None) if molly else None
             if improver is None:
                 improver = SelfImprovementEngine(molly=molly)
                 await improver.initialize()
+            return improver
 
-        gliner_cycle = await improver.run_gliner_nightly_cycle()
-        loop_status = str(gliner_cycle.get("status", "unknown"))
-        if loop_status in {"insufficient_examples", "cooldown_active"}:
-            results["GLiNER loop"] = str(gliner_cycle.get("message", loop_status))
-        else:
-            pipeline = gliner_cycle.get("pipeline", {}) if isinstance(gliner_cycle, dict) else {}
-            pipeline_status = str(pipeline.get("status", loop_status))
-            if pipeline_status == "deployed":
-                improvement = float(pipeline.get("benchmark", {}).get("improvement", 0.0) or 0.0)
-                results["GLiNER loop"] = f"deployed ({improvement:+.2%} F1)"
-            elif pipeline_status:
-                results["GLiNER loop"] = pipeline_status
-            else:
-                results["GLiNER loop"] = loop_status
-    except Exception:
-        log.error("GLiNER closed-loop run failed", exc_info=True)
-        results["GLiNER loop"] = "failed"
+        _RUN_STATE.status = "running"
+        _RUN_STATE.run_id = run_id
+        _RUN_STATE.started_at = datetime.now(timezone.utc).isoformat()
+        _RUN_STATE.finished_at = ""
+        _RUN_STATE.last_error = ""
+        _RUN_STATE.failed_steps = []
+        _RUN_STATE.results = {}
+        _RUN_STATE.queued_requests = 0
+        MAINTENANCE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Step 9: Health Doctor daily run (after maintenance completes)
-    try:
-        from health import get_health_doctor
+        log.info("Starting nightly maintenance run_id=%s for %s", run_id, today)
 
-        doctor = get_health_doctor(molly=molly)
-        doctor.run_daily()
-        results["Health Doctor"] = "completed"
-    except Exception:
-        log.error("Health Doctor run failed", exc_info=True)
-        results["Health Doctor"] = "failed"
-
-    # Step 10: Send brief summary to owner DM
-    if molly and molly.wa:
         try:
-            owner_jid = molly._get_owner_dm_jid()
-            if owner_jid:
-                from memory.graph import entity_count, relationship_count
-                e_count = entity_count()
-                r_count = relationship_count()
+            # Step 1: Programmatic health check
+            try:
+                write_health_check()
+                _record_step("Health check", "completed")
+            except Exception:
+                log.error("Health check failed", exc_info=True)
+                _record_step("Health check", "failed", failed=True)
 
-                summary_parts = [f"Nightly maintenance done ({today})."]
-                for task_name, result in results.items():
-                    summary_parts.append(f"{task_name}: {result}")
-                summary_parts.append(f"Graph: {e_count} entities, {r_count} relationships.")
+            # Step 2: Strength decay
+            try:
+                updated = _run_strength_decay()
+                _record_step("Strength decay", f"{updated} entities updated")
+            except Exception:
+                log.error("Strength decay failed", exc_info=True)
+                _record_step("Strength decay", "failed", failed=True)
 
-                summary_msg = "\n".join(summary_parts)
-                # Cap at ~100 words
-                words = summary_msg.split()
-                if len(words) > 100:
-                    summary_msg = " ".join(words[:100]) + "..."
+            # Step 3: Deduplication sweep
+            try:
+                merged = _run_dedup_sweep()
+                _record_step("Deduplication", f"{merged} entities merged")
+            except Exception:
+                log.error("Dedup sweep failed", exc_info=True)
+                _record_step("Deduplication", "failed", failed=True)
 
-                molly._track_send(molly.wa.send_message(owner_jid, summary_msg))
-        except Exception:
-            log.error("Failed to send maintenance summary", exc_info=True)
+            # Step 4: Orphan cleanup
+            try:
+                deleted = _run_orphan_cleanup()
+                self_refs = _run_self_ref_cleanup()
+                blocked = _run_blocklist_cleanup()
+                _record_step(
+                    "Orphan cleanup",
+                    f"{deleted} orphans, {self_refs} self-refs, {blocked} blocklisted",
+                )
+            except Exception:
+                log.error("Orphan cleanup failed", exc_info=True)
+                _record_step("Orphan cleanup", "failed", failed=True)
 
-    log.info("Nightly maintenance completed for %s", today)
+            # Step 5: Phase 7 memory optimization loop
+            try:
+                improver = await _ensure_improver()
+                mem_opt = await improver.run_memory_optimization()
+                _record_step(
+                    "Memory optimization",
+                    (
+                        f"consolidated={mem_opt.get('entity_consolidations', 0)}, "
+                        f"stale={mem_opt.get('stale_entities', 0)}, "
+                        f"contradictions={mem_opt.get('contradictions', 0)}"
+                    ),
+                )
+            except Exception:
+                log.error("Memory optimization failed", exc_info=True)
+                _record_step("Memory optimization", "failed", failed=True)
+
+            # Step 6: Prune stale daily logs
+            try:
+                moved = _prune_daily_logs()
+                _record_step("Daily log pruning", f"{moved} logs archived")
+            except Exception:
+                log.error("Daily log pruning failed", exc_info=True)
+                _record_step("Daily log pruning", "failed", failed=True)
+
+            # Step 7: GLiNER training accumulation + conditional fine-tune trigger
+            try:
+                improver = await _ensure_improver()
+                gliner_cycle = await improver.run_gliner_nightly_cycle()
+                loop_status = str(gliner_cycle.get("status", "unknown"))
+                if loop_status in {"insufficient_examples", "cooldown_active"}:
+                    _record_step("GLiNER loop", str(gliner_cycle.get("message", loop_status)))
+                else:
+                    pipeline = (
+                        gliner_cycle.get("pipeline", {})
+                        if isinstance(gliner_cycle, dict)
+                        else {}
+                    )
+                    pipeline_status = str(pipeline.get("status", loop_status))
+                    if pipeline_status == "deployed":
+                        improvement = float(
+                            pipeline.get("benchmark", {}).get("improvement", 0.0) or 0.0
+                        )
+                        _record_step("GLiNER loop", f"deployed ({improvement:+.2%} F1)")
+                    elif pipeline_status:
+                        _record_step("GLiNER loop", pipeline_status)
+                    else:
+                        _record_step("GLiNER loop", loop_status)
+            except Exception:
+                log.error("GLiNER closed-loop run failed", exc_info=True)
+                _record_step("GLiNER loop", "failed", failed=True)
+
+            # Step 8: Weekly assessment catch-up if due/overdue.
+            try:
+                improver = await _ensure_improver()
+                try:
+                    now_local = datetime.now(ZoneInfo(config.TIMEZONE))
+                except Exception:
+                    now_local = datetime.now(timezone.utc)
+                weekly_due = _weekly_assessment_due_or_overdue(improver, now_local)
+                if weekly_due:
+                    weekly_path = await improver.run_weekly_assessment()
+                    weekly_name = Path(str(weekly_path)).name
+                    weekly_result = f"generated {weekly_name}"
+                    _record_step("Weekly assessment", weekly_result)
+                else:
+                    weekly_result = "not due"
+                    _record_step("Weekly assessment", weekly_result)
+            except Exception:
+                log.error("Weekly assessment catch-up failed", exc_info=True)
+                weekly_result = "failed"
+                _record_step("Weekly assessment", "failed", failed=True)
+
+            # Step 9: Health Doctor daily run (after maintenance completes)
+            try:
+                from health import get_health_doctor
+
+                doctor = get_health_doctor(molly=molly)
+                doctor.run_daily()
+                _record_step("Health Doctor", "completed")
+            except Exception:
+                log.error("Health Doctor run failed", exc_info=True)
+                _record_step("Health Doctor", "failed", failed=True)
+
+            # Step 10: Contract audits (deterministic first, model second)
+            try:
+                audit_bundle = await run_contract_audits(
+                    today=today,
+                    task_results=results,
+                    weekly_due=weekly_due,
+                    weekly_result=weekly_result,
+                    maintenance_dir=MAINTENANCE_DIR,
+                    health_dir=config.HEALTH_REPORT_DIR,
+                )
+
+                nightly_det = dict(audit_bundle.get("nightly_deterministic", {}))
+                weekly_det = dict(audit_bundle.get("weekly_deterministic", {}))
+                nightly_model = dict(audit_bundle.get("nightly_model", {}))
+                weekly_model = dict(audit_bundle.get("weekly_model", {}))
+                artifacts = dict(audit_bundle.get("artifacts", {}))
+
+                nightly_det_status = str(nightly_det.get("status", "pass"))
+                weekly_det_status = str(weekly_det.get("status", "pass"))
+                _record_step(
+                    "Contract audit nightly (deterministic)",
+                    str(nightly_det.get("summary", "pass")),
+                    failed=nightly_det_status == "fail",
+                )
+                _record_step(
+                    "Contract audit weekly (deterministic)",
+                    str(weekly_det.get("summary", "pass")),
+                    failed=weekly_det_status == "fail",
+                )
+
+                nightly_model_status = str(nightly_model.get("status", "disabled")).strip().lower()
+                weekly_model_status = str(weekly_model.get("status", "disabled")).strip().lower()
+                model_blocking = bool(config.CONTRACT_AUDIT_LLM_BLOCKING)
+
+                _record_step(
+                    "Contract audit nightly (model)",
+                    str(nightly_model.get("summary", "disabled by config")),
+                    failed=model_blocking and nightly_model_status in {"error", "unavailable"},
+                )
+                _record_step(
+                    "Contract audit weekly (model)",
+                    str(weekly_model.get("summary", "disabled by config")),
+                    failed=model_blocking and weekly_model_status in {"error", "unavailable"},
+                )
+
+                artifact_error = str(artifacts.get("error", "")).strip()
+                if artifact_error:
+                    _record_step("Contract audit artifacts", f"write error: {artifact_error}")
+                else:
+                    _record_step(
+                        "Contract audit artifacts",
+                        (
+                            f"maintenance={Path(str(artifacts.get('maintenance', '-'))).name}, "
+                            f"health={Path(str(artifacts.get('health', '-'))).name}"
+                        ),
+                    )
+            except Exception:
+                log.error("Contract audit pass failed", exc_info=True)
+                _record_step("Contract audit nightly (deterministic)", "failed", failed=True)
+                _record_step("Contract audit weekly (deterministic)", "failed", failed=True)
+                if config.CONTRACT_AUDIT_LLM_BLOCKING:
+                    _record_step("Contract audit nightly (model)", "failed", failed=True)
+                    _record_step("Contract audit weekly (model)", "failed", failed=True)
+                else:
+                    _record_step("Contract audit nightly (model)", "error (report-only)")
+                    _record_step("Contract audit weekly (model)", "error (report-only)")
+                _record_step("Contract audit artifacts", "unavailable")
+
+            # Step 11: Opus analysis pass (text-only, no tools)
+            try:
+                from memory.graph import get_graph_summary
+
+                summary = get_graph_summary()
+                graph_text = (
+                    f"Entities: {summary['entity_count']}, "
+                    f"Relationships: {summary['relationship_count']}\n"
+                    f"Top connected: {summary['top_connected']}\n"
+                    f"Recent: {summary['recent']}"
+                )
+                pre_analysis_report = _build_maintenance_report(
+                    results,
+                    run_status=_derive_run_status(),
+                    failed_steps=failed_steps,
+                )
+                analysis_text = await _run_opus_analysis(
+                    pre_analysis_report,
+                    graph_text,
+                    today,
+                )
+                if analysis_text.strip():
+                    memory_path = config.WORKSPACE / "MEMORY.md"
+                    if memory_path.exists():
+                        existing = memory_path.read_text()
+                        memory_path.write_text(
+                            existing.rstrip() + "\n\n" + analysis_text.strip() + "\n"
+                        )
+                    else:
+                        memory_path.write_text(analysis_text.strip() + "\n")
+                    _record_step("Analysis", "MEMORY.md updated")
+                else:
+                    _record_step("Analysis", "empty response")
+            except Exception:
+                log.error("Opus analysis pass failed", exc_info=True)
+                _record_step("Analysis", "failed", failed=True)
+
+            run_status = _derive_run_status()
+            synced, notified = _record_maintenance_issues(results, run_status)
+            _record_step("Issue registry", f"{synced} synced, {notified} notified")
+            run_status = _derive_run_status()
+
+            report = _build_maintenance_report(
+                results,
+                run_status=run_status,
+                failed_steps=failed_steps,
+            )
+            if analysis_text.strip():
+                report = report.rstrip() + f"\n\n## Analysis\n\n{analysis_text.strip()}\n"
+            report_path.write_text(report)
+            log.info("Maintenance report written to %s", report_path)
+
+            # Step 12: Send brief summary to owner DM
+            if molly and molly.wa:
+                try:
+                    owner_jid = molly._get_owner_dm_jid()
+                    if owner_jid:
+                        from memory.graph import entity_count, relationship_count
+
+                        e_count = entity_count()
+                        r_count = relationship_count()
+
+                        summary_parts = [f"Nightly maintenance done ({today})."]
+                        for task_name, result in results.items():
+                            summary_parts.append(f"{task_name}: {result}")
+                        summary_parts.append(
+                            f"Graph: {e_count} entities, {r_count} relationships."
+                        )
+
+                        summary_msg = "\n".join(summary_parts)
+                        words = summary_msg.split()
+                        if len(words) > 100:
+                            summary_msg = " ".join(words[:100]) + "..."
+
+                        molly._track_send(molly.wa.send_message(owner_jid, summary_msg))
+                except Exception:
+                    log.error("Failed to send maintenance summary", exc_info=True)
+
+            _RUN_STATE.status = run_status
+            _RUN_STATE.last_error = ""
+            log.info(
+                "Nightly maintenance completed run_id=%s status=%s",
+                run_id,
+                run_status,
+            )
+            return _RUN_STATE.as_dict()
+        except Exception as exc:
+            log.error("Nightly maintenance aborted run_id=%s", run_id, exc_info=True)
+            _RUN_STATE.status = "failed"
+            _RUN_STATE.last_error = str(exc)
+            return _RUN_STATE.as_dict()
+        finally:
+            _RUN_STATE.finished_at = datetime.now(timezone.utc).isoformat()
+            _RUN_STATE.failed_steps = list(failed_steps)
+            _RUN_STATE.results = dict(results)

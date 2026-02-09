@@ -1,9 +1,51 @@
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
+_NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _coerce_unix_epoch(value: float) -> float:
+    """Convert unix timestamps in ns/us/ms/sec to seconds."""
+    abs_value = abs(value)
+    if abs_value >= 1e17:
+        return value / 1_000_000_000  # nanoseconds
+    if abs_value >= 1e14:
+        return value / 1_000_000  # microseconds
+    if abs_value >= 1e11:
+        return value / 1_000  # milliseconds
+    return value  # seconds
+
+
+def normalize_timestamp(value: Any) -> str:
+    """Normalize timestamps to timezone-aware UTC ISO-8601 strings."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return datetime.now(timezone.utc).isoformat()
+
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            if not _NUMERIC_TS_RE.fullmatch(raw):
+                return raw
+            try:
+                dt = datetime.fromtimestamp(
+                    _coerce_unix_epoch(float(raw)),
+                    tz=timezone.utc,
+                )
+            except (ValueError, OverflowError):
+                return raw
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 class Database:
@@ -16,6 +58,9 @@ class Database:
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
+        migrated = self._normalize_legacy_timestamps()
+        if migrated:
+            log.info("Normalized %d legacy timestamps to ISO-8601", migrated)
         log.info(f"Database initialized at {self.db_path}")
 
     def _create_tables(self):
@@ -54,6 +99,7 @@ class Database:
         timestamp: str,
         is_from_me: bool,
     ):
+        normalized_timestamp = normalize_timestamp(timestamp)
         # Upsert chat
         self.conn.execute(
             """
@@ -63,7 +109,7 @@ class Database:
                 name = COALESCE(excluded.name, chats.name),
                 last_message_time = excluded.last_message_time
             """,
-            (chat_jid, sender_name, timestamp),
+            (chat_jid, sender_name, normalized_timestamp),
         )
         # Upsert message
         self.conn.execute(
@@ -72,9 +118,55 @@ class Database:
                 (id, chat_jid, sender, sender_name, content, timestamp, is_from_me)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (msg_id, chat_jid, sender, sender_name, content, timestamp, int(is_from_me)),
+            (
+                msg_id,
+                chat_jid,
+                sender,
+                sender_name,
+                content,
+                normalized_timestamp,
+                int(is_from_me),
+            ),
         )
         self.conn.commit()
+
+    def _normalize_legacy_timestamps(self) -> int:
+        """Backfill pre-existing message/chat timestamps into ISO-8601 format."""
+        updates = 0
+
+        message_rows = self.conn.execute("SELECT id, timestamp FROM messages").fetchall()
+        message_updates = []
+        for row in message_rows:
+            old_ts = str(row["timestamp"] or "")
+            new_ts = normalize_timestamp(old_ts)
+            if new_ts != old_ts:
+                message_updates.append((new_ts, row["id"]))
+        if message_updates:
+            self.conn.executemany(
+                "UPDATE messages SET timestamp = ? WHERE id = ?",
+                message_updates,
+            )
+            updates += len(message_updates)
+
+        chat_rows = self.conn.execute(
+            "SELECT jid, last_message_time FROM chats WHERE last_message_time IS NOT NULL"
+        ).fetchall()
+        chat_updates = []
+        for row in chat_rows:
+            old_ts = str(row["last_message_time"] or "")
+            new_ts = normalize_timestamp(old_ts)
+            if new_ts != old_ts:
+                chat_updates.append((new_ts, row["jid"]))
+        if chat_updates:
+            self.conn.executemany(
+                "UPDATE chats SET last_message_time = ? WHERE jid = ?",
+                chat_updates,
+            )
+            updates += len(chat_updates)
+
+        if updates:
+            self.conn.commit()
+        return updates
 
     def get_recent_messages(self, chat_jid: str, limit: int = 20) -> list[dict]:
         cursor = self.conn.execute(

@@ -13,6 +13,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config
+from health_remediation import route_health_signal
+from memory.issue_registry import (
+    append_issue_event,
+    ensure_issue_registry_tables,
+    should_notify,
+    upsert_issue,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +45,27 @@ _STATUS_SEVERITY = {
     "yellow": 1,
     "red": 2,
 }
+_NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+HEALTH_NOTIFY_COOLDOWN_HOURS = max(
+    1,
+    int(os.getenv("MOLLY_HEALTH_NOTIFY_COOLDOWN_HOURS", "24")),
+)
+HEALTH_SKILL_WINDOW_DAYS = max(
+    1,
+    int(os.getenv("MOLLY_HEALTH_SKILL_WINDOW_DAYS", "7")),
+)
+HEALTH_SKILL_LOW_WATERMARK = max(
+    1,
+    int(os.getenv("MOLLY_HEALTH_SKILL_LOW_WATERMARK", "3")),
+)
+HEALTH_SKILL_BASH_RATIO_RED = max(
+    0.0,
+    float(os.getenv("MOLLY_HEALTH_SKILL_BASH_RATIO_RED", "0.30")),
+)
+HEALTH_SKILL_BASH_RATIO_YELLOW = max(
+    HEALTH_SKILL_BASH_RATIO_RED,
+    float(os.getenv("MOLLY_HEALTH_SKILL_BASH_RATIO_YELLOW", "0.75")),
+)
 
 
 def _status_emoji(status: str) -> str:
@@ -54,7 +82,24 @@ def _parse_iso(value: str) -> datetime | None:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return None
+        raw = value.strip()
+        if not _NUMERIC_TS_RE.fullmatch(raw):
+            return None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            return None
+        abs_value = abs(numeric)
+        if abs_value >= 1e17:
+            numeric /= 1_000_000_000  # nanoseconds -> seconds
+        elif abs_value >= 1e14:
+            numeric /= 1_000_000  # microseconds -> seconds
+        elif abs_value >= 1e11:
+            numeric /= 1_000  # milliseconds -> seconds
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
 
 
 def _short_ts(value: str) -> str:
@@ -62,25 +107,6 @@ def _short_ts(value: str) -> str:
     if not dt:
         return value or "-"
     return dt.astimezone(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d %H:%M")
-
-
-def _levenshtein(a: str, b: str) -> int:
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ch_a in enumerate(a, start=1):
-        curr = [i]
-        for j, ch_b in enumerate(b, start=1):
-            ins = curr[j - 1] + 1
-            dele = prev[j] + 1
-            sub = prev[j - 1] + (ch_a != ch_b)
-            curr.append(min(ins, dele, sub))
-        prev = curr
-    return prev[-1]
 
 
 def _load_embedded_report_data(report_path: Path) -> dict[str, Any]:
@@ -158,9 +184,409 @@ class HealthDoctor:
     def run_abbreviated_preflight(self) -> str:
         return self.generate_report(abbreviated=True, trigger="startup")
 
+    def run_track_f_preprod_audit(self, output_dir: Path | None = None) -> Path:
+        checks = self.track_f_preprod_checks()
+        summary = {
+            "green": sum(1 for c in checks if c.status == "green"),
+            "yellow": sum(1 for c in checks if c.status == "yellow"),
+            "red": sum(1 for c in checks if c.status == "red"),
+        }
+        hard_enforcement = {
+            "parser": bool(config.TRACK_F_ENFORCE_PARSER_COMPAT and not config.TRACK_F_REPORT_ONLY),
+            "skill_telemetry": bool(config.TRACK_F_ENFORCE_SKILL_TELEMETRY and not config.TRACK_F_REPORT_ONLY),
+            "foundry_ingestion": bool(
+                config.TRACK_F_ENFORCE_FOUNDRY_INGESTION and not config.TRACK_F_REPORT_ONLY
+            ),
+            "promotion_drift": bool(config.TRACK_F_ENFORCE_PROMOTION_DRIFT and not config.TRACK_F_REPORT_ONLY),
+        }
+        overall = "NO-GO" if summary["red"] > 0 else "GO"
+        generated_at = _now_local().strftime("%Y-%m-%d %H:%M %Z")
+
+        lines = [f"# Track F Pre-Prod Readiness Audit — {generated_at}", ""]
+        lines.append("## Execution Mode")
+        lines.append(f"- report_only: `{bool(config.TRACK_F_REPORT_ONLY)}`")
+        lines.append(
+            "- hard_enforcement_paths: "
+            f"`parser={hard_enforcement['parser']}, "
+            f"skill_telemetry={hard_enforcement['skill_telemetry']}, "
+            f"foundry_ingestion={hard_enforcement['foundry_ingestion']}, "
+            f"promotion_drift={hard_enforcement['promotion_drift']}`"
+        )
+        lines.append("")
+
+        lines.append("## Readiness Checks")
+        for check in checks:
+            lines.append(f"- {_status_emoji(check.status)} `{check.check_id}`: {check.detail}")
+        lines.append("")
+
+        lines.append(
+            f"## Summary: {summary['green']} {_status_emoji('green')} / "
+            f"{summary['yellow']} {_status_emoji('yellow')} / {summary['red']} {_status_emoji('red')}"
+        )
+        lines.append("")
+        lines.append(f"## Verdict: **{overall}**")
+        lines.append("")
+
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "report_only": bool(config.TRACK_F_REPORT_ONLY),
+            "hard_enforcement": hard_enforcement,
+            "summary": summary,
+            "verdict": overall,
+            "checks": [
+                {
+                    "id": c.check_id,
+                    "label": c.label,
+                    "status": c.status,
+                    "detail": c.detail,
+                    "action_required": bool(c.action_required),
+                }
+                for c in checks
+            ],
+        }
+        lines.append(f"<!-- TRACK_F_AUDIT_DATA: {json.dumps(payload, ensure_ascii=True)} -->")
+
+        audit_dir = output_dir or config.TRACK_F_AUDIT_DIR
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        report_path = audit_dir / f"track-f-preprod-{stamp}.md"
+        report_path.write_text("\n".join(lines).rstrip() + "\n")
+        return report_path
+
+    def track_f_preprod_checks(self) -> list[HealthCheck]:
+        return [
+            self._track_f_parser_compatibility_check(),
+            self._track_f_skill_telemetry_presence_check(),
+            self._track_f_foundry_ingestion_health_check(),
+            self._track_f_promotion_drift_status_check(),
+        ]
+
+    def _track_f_check_result(
+        self,
+        *,
+        check_id: str,
+        label: str,
+        ok: bool,
+        success_detail: str,
+        failure_detail: str,
+        enforce_flag: bool,
+    ) -> HealthCheck:
+        if ok:
+            return HealthCheck(
+                check_id=check_id,
+                layer="Track F Pre-Prod",
+                label=label,
+                status="green",
+                detail=success_detail,
+                action_required=False,
+            )
+
+        hard_enforcement = bool(enforce_flag) and not bool(config.TRACK_F_REPORT_ONLY)
+        mode = "enforced" if hard_enforcement else "report-only"
+        return HealthCheck(
+            check_id=check_id,
+            layer="Track F Pre-Prod",
+            label=label,
+            status="red" if hard_enforcement else "yellow",
+            detail=f"{failure_detail} [{mode}]",
+            action_required=hard_enforcement,
+            watch_item=not hard_enforcement,
+        )
+
+    def _track_f_parser_compatibility_check(self) -> HealthCheck:
+        from database import normalize_timestamp
+
+        base = 1770598413
+        variants = {
+            "seconds": str(base),
+            "milliseconds": str(base * 1_000),
+            "microseconds": str(base * 1_000_000),
+            "nanoseconds": str(base * 1_000_000_000),
+        }
+        failures: list[str] = []
+        for label, raw in variants.items():
+            parsed = _parse_iso(raw)
+            if parsed is None or int(parsed.timestamp()) != base:
+                failures.append(f"{label}:parse")
+            normalized = normalize_timestamp(raw)
+            reparsed = _parse_iso(normalized)
+            if reparsed is None or int(reparsed.timestamp()) != base:
+                failures.append(f"{label}:normalize")
+
+        iso_value = "2026-02-09T00:53:33+00:00"
+        iso_parsed = _parse_iso(iso_value)
+        if iso_parsed is None:
+            failures.append("iso:parse")
+
+        ok = not failures
+        success_detail = "seconds/ms/us/ns epoch + ISO parse paths are compatible"
+        failure_detail = f"parser mismatch in {', '.join(failures)}"
+        return self._track_f_check_result(
+            check_id="trackf.parser_compatibility",
+            label="Parser compatibility",
+            ok=ok,
+            success_detail=success_detail,
+            failure_detail=failure_detail,
+            enforce_flag=config.TRACK_F_ENFORCE_PARSER_COMPAT,
+        )
+
+    def _track_f_skill_telemetry_presence_check(self) -> HealthCheck:
+        required_columns = {
+            "id",
+            "skill_name",
+            "trigger",
+            "outcome",
+            "user_approval",
+            "edits_made",
+            "created_at",
+        }
+        try:
+            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            try:
+                if not self._sqlite_table_exists(conn, "skill_executions"):
+                    return self._track_f_check_result(
+                        check_id="trackf.skill_telemetry_presence",
+                        label="Skill telemetry presence",
+                        ok=False,
+                        success_detail="",
+                        failure_detail="table missing: skill_executions",
+                        enforce_flag=config.TRACK_F_ENFORCE_SKILL_TELEMETRY,
+                    )
+                rows = conn.execute("PRAGMA table_info(skill_executions)").fetchall()
+                columns = {str(row[1]) for row in rows}
+                missing = sorted(required_columns - columns)
+                total = int(conn.execute("SELECT COUNT(*) FROM skill_executions").fetchone()[0] or 0)
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(days=max(1, config.TRACK_F_SKILL_TELEMETRY_WINDOW_DAYS))
+                ).isoformat()
+                recent = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM skill_executions WHERE created_at > ?",
+                        (cutoff,),
+                    ).fetchone()[0]
+                    or 0
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            return self._track_f_check_result(
+                check_id="trackf.skill_telemetry_presence",
+                label="Skill telemetry presence",
+                ok=False,
+                success_detail="",
+                failure_detail=f"telemetry probe failed ({exc})",
+                enforce_flag=config.TRACK_F_ENFORCE_SKILL_TELEMETRY,
+            )
+
+        ok = not missing
+        success_detail = (
+            f"schema present; total_rows={total}, recent_{config.TRACK_F_SKILL_TELEMETRY_WINDOW_DAYS}d={recent}"
+        )
+        failure_detail = (
+            "missing columns: " + ", ".join(missing)
+            if missing
+            else "skill telemetry schema unavailable"
+        )
+        return self._track_f_check_result(
+            check_id="trackf.skill_telemetry_presence",
+            label="Skill telemetry presence",
+            ok=ok,
+            success_detail=success_detail,
+            failure_detail=failure_detail,
+            enforce_flag=config.TRACK_F_ENFORCE_SKILL_TELEMETRY,
+        )
+
+    def _track_f_foundry_ingestion_health_check(self) -> HealthCheck:
+        required_columns = {"id", "event_type", "category", "title", "status", "created_at"}
+        categories = ("skill", "tool", "core")
+        try:
+            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            try:
+                if not self._sqlite_table_exists(conn, "self_improvement_events"):
+                    return self._track_f_check_result(
+                        check_id="trackf.foundry_ingestion_health",
+                        label="Foundry ingestion health",
+                        ok=False,
+                        success_detail="",
+                        failure_detail="table missing: self_improvement_events",
+                        enforce_flag=config.TRACK_F_ENFORCE_FOUNDRY_INGESTION,
+                    )
+                rows = conn.execute("PRAGMA table_info(self_improvement_events)").fetchall()
+                columns = {str(row[1]) for row in rows}
+                missing = sorted(required_columns - columns)
+                if missing:
+                    return self._track_f_check_result(
+                        check_id="trackf.foundry_ingestion_health",
+                        label="Foundry ingestion health",
+                        ok=False,
+                        success_detail="",
+                        failure_detail=f"missing columns: {', '.join(missing)}",
+                        enforce_flag=config.TRACK_F_ENFORCE_FOUNDRY_INGESTION,
+                    )
+                placeholders = ",".join("?" for _ in categories)
+                total = int(
+                    conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM self_improvement_events
+                        WHERE category IN ({placeholders})
+                        """,
+                        categories,
+                    ).fetchone()[0]
+                    or 0
+                )
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(hours=max(1, config.TRACK_F_FOUNDRY_INGESTION_WINDOW_HOURS))
+                ).isoformat()
+                recent = int(
+                    conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM self_improvement_events
+                        WHERE category IN ({placeholders})
+                          AND created_at > ?
+                        """,
+                        (*categories, cutoff),
+                    ).fetchone()[0]
+                    or 0
+                )
+                ts_rows = conn.execute(
+                    f"""
+                    SELECT created_at
+                    FROM self_improvement_events
+                    WHERE category IN ({placeholders})
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                    """,
+                    categories,
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:
+            return self._track_f_check_result(
+                check_id="trackf.foundry_ingestion_health",
+                label="Foundry ingestion health",
+                ok=False,
+                success_detail="",
+                failure_detail=f"ingestion probe failed ({exc})",
+                enforce_flag=config.TRACK_F_ENFORCE_FOUNDRY_INGESTION,
+            )
+
+        bad_timestamps = 0
+        for row in ts_rows:
+            value = str(row[0] or "")
+            if value and _parse_iso(value) is None:
+                bad_timestamps += 1
+
+        min_events = max(1, int(config.TRACK_F_FOUNDRY_INGESTION_MIN_EVENTS))
+        ok = recent >= min_events and bad_timestamps == 0
+        success_detail = (
+            f"recent_{config.TRACK_F_FOUNDRY_INGESTION_WINDOW_HOURS}h={recent}/{min_events}, "
+            f"total={total}, timestamp_sample_bad={bad_timestamps}"
+        )
+        failure_parts: list[str] = []
+        if recent < min_events:
+            failure_parts.append(
+                f"recent events below threshold ({recent} < {min_events})"
+            )
+        if bad_timestamps > 0:
+            failure_parts.append(f"invalid timestamps in sample ({bad_timestamps}/20)")
+        failure_detail = "; ".join(failure_parts) or "foundry ingestion unhealthy"
+        return self._track_f_check_result(
+            check_id="trackf.foundry_ingestion_health",
+            label="Foundry ingestion health",
+            ok=ok,
+            success_detail=success_detail,
+            failure_detail=failure_detail,
+            enforce_flag=config.TRACK_F_ENFORCE_FOUNDRY_INGESTION,
+        )
+
+    def _track_f_promotion_drift_status_check(self) -> HealthCheck:
+        categories = ("skill", "tool", "core")
+        try:
+            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            try:
+                if not self._sqlite_table_exists(conn, "self_improvement_events"):
+                    return self._track_f_check_result(
+                        check_id="trackf.promotion_drift_status",
+                        label="Promotion drift status",
+                        ok=False,
+                        success_detail="",
+                        failure_detail="table missing: self_improvement_events",
+                        enforce_flag=config.TRACK_F_ENFORCE_PROMOTION_DRIFT,
+                    )
+                placeholders = ",".join("?" for _ in categories)
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(days=max(1, config.TRACK_F_PROMOTION_DRIFT_WINDOW_DAYS))
+                ).isoformat()
+                rows = conn.execute(
+                    f"""
+                    SELECT lower(status) AS status, COUNT(*) AS c
+                    FROM self_improvement_events
+                    WHERE category IN ({placeholders})
+                      AND created_at > ?
+                    GROUP BY lower(status)
+                    """,
+                    (*categories, cutoff),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:
+            return self._track_f_check_result(
+                check_id="trackf.promotion_drift_status",
+                label="Promotion drift status",
+                ok=False,
+                success_detail="",
+                failure_detail=f"promotion drift probe failed ({exc})",
+                enforce_flag=config.TRACK_F_ENFORCE_PROMOTION_DRIFT,
+            )
+
+        counts: dict[str, int] = {}
+        for status, count in rows:
+            counts[str(status or "").strip().lower()] = int(count or 0)
+
+        proposed = int(counts.get("proposed", 0))
+        promoted = int(counts.get("approved", 0)) + int(counts.get("deployed", 0))
+        rejected = int(counts.get("rejected", 0))
+        pending = max(0, proposed - promoted - rejected)
+        rate = (promoted / proposed) if proposed > 0 else 1.0
+
+        max_pending = max(0, int(config.TRACK_F_PROMOTION_DRIFT_MAX_PENDING))
+        min_rate = float(config.TRACK_F_PROMOTION_DRIFT_MIN_RATE)
+        ok = pending <= max_pending and rate >= min_rate
+
+        success_detail = (
+            f"proposed={proposed}, promoted={promoted}, rejected={rejected}, "
+            f"pending={pending}, promotion_rate={rate:.2f}"
+        )
+        failure_detail = (
+            f"proposed={proposed}, promoted={promoted}, rejected={rejected}, pending={pending}, "
+            f"promotion_rate={rate:.2f}, thresholds(pending<={max_pending}, rate>={min_rate:.2f})"
+        )
+        return self._track_f_check_result(
+            check_id="trackf.promotion_drift_status",
+            label="Promotion drift status",
+            ok=ok,
+            success_detail=success_detail,
+            failure_detail=failure_detail,
+            enforce_flag=config.TRACK_F_ENFORCE_PROMOTION_DRIFT,
+        )
+
+    def _sqlite_table_exists(self, conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
     def generate_report(self, abbreviated: bool = False, trigger: str = "manual") -> str:
         checks = self._run_checks(abbreviated=abbreviated)
         checks = self._apply_yellow_escalation(checks)
+        issue_sync = self._sync_issue_registry(checks)
+        remediation_rows = issue_sync.get("remediation", [])
 
         summary = {
             "green": sum(1 for c in checks if c.status == "green"),
@@ -216,11 +642,37 @@ class HealthDoctor:
             lines.append("- None")
         lines.append("")
 
+        lines.append("### Remediation Routing")
+        routed_non_green = [
+            row
+            for row in remediation_rows
+            if str(row.get("severity", "")).strip().lower() in {"yellow", "red"}
+        ]
+        if routed_non_green:
+            for row in routed_non_green:
+                suffix = ""
+                suggested = str(row.get("suggested_action") or "").strip()
+                if suggested:
+                    suffix = f" (suggested: {suggested})"
+                lines.append(
+                    "- "
+                    f"{row.get('check_id', 'unknown')}: "
+                    f"{row.get('action', 'observe_only')}{suffix}"
+                )
+        else:
+            lines.append("- No active remediation routes")
+        lines.append("")
+
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "trigger": trigger,
             "abbreviated": abbreviated,
             "summary": summary,
+            "issue_registry": {
+                "synced": int(issue_sync.get("synced", 0)),
+                "notified": int(issue_sync.get("notified", 0)),
+            },
+            "remediation": remediation_rows,
             "checks": [
                 {
                     "id": c.check_id,
@@ -323,6 +775,115 @@ class HealthDoctor:
             else:
                 updated.append(check)
         return updated
+
+    def _issue_last_notified_at(
+        self,
+        conn: sqlite3.Connection,
+        fingerprint: str,
+    ) -> str | None:
+        row = conn.execute(
+            """
+            SELECT created_at
+            FROM maintenance_issue_events
+            WHERE issue_fingerprint = ? AND event_type = 'notified'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (fingerprint,),
+        ).fetchone()
+        if not row:
+            return None
+        return str(row[0] or "")
+
+    def _sync_issue_registry(self, checks: list[HealthCheck]) -> dict[str, Any]:
+        synced = 0
+        notified = 0
+        remediation_rows: list[dict[str, Any]] = []
+
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            ensure_issue_registry_tables(conn)
+            observed_at = datetime.now(timezone.utc).isoformat()
+
+            for check in checks:
+                issue = upsert_issue(
+                    conn,
+                    check_id=check.check_id,
+                    severity=check.status,
+                    detail=check.detail,
+                    source="health",
+                    observed_at=observed_at,
+                )
+                synced += 1
+
+                yellow_streak_days = 1
+                if check.status == "yellow":
+                    yellow_streak_days = self._previous_yellow_streak(check.check_id) + 1
+
+                plan = route_health_signal(
+                    check.check_id,
+                    check.status,
+                    yellow_streak_days=yellow_streak_days,
+                )
+                remediation_row = {
+                    "check_id": plan.check_id,
+                    "severity": plan.severity,
+                    "action": plan.action,
+                    "suggested_action": plan.suggested_action,
+                    "rationale": plan.rationale,
+                    "escalate_owner_now": plan.escalation.escalate_owner_now,
+                    "immediate_investigation_candidate": (
+                        plan.escalation.immediate_investigation_candidate
+                    ),
+                    "yellow_streak_days": plan.escalation.yellow_streak_days,
+                    "yellow_days_until_escalation": (
+                        plan.escalation.yellow_days_until_escalation
+                    ),
+                }
+                remediation_rows.append(remediation_row)
+
+                if check.status not in {"yellow", "red"}:
+                    continue
+                last_notified = self._issue_last_notified_at(conn, issue["fingerprint"])
+                if should_notify(
+                    fingerprint=issue["fingerprint"],
+                    cooldown_hours=HEALTH_NOTIFY_COOLDOWN_HOURS,
+                    last_notified_at=last_notified,
+                    severity_changed=bool(issue.get("severity_changed", False)),
+                ):
+                    append_issue_event(
+                        conn,
+                        issue_fingerprint=issue["fingerprint"],
+                        event_type="notified",
+                        created_at=observed_at,
+                        payload={
+                            "check_id": check.check_id,
+                            "status": check.status,
+                            "detail": check.detail,
+                            "action": plan.action,
+                            "suggested_action": plan.suggested_action,
+                            "escalate_owner_now": plan.escalation.escalate_owner_now,
+                        },
+                    )
+                    notified += 1
+
+            conn.commit()
+            return {
+                "synced": synced,
+                "notified": notified,
+                "remediation": remediation_rows,
+            }
+        except Exception:
+            log.debug("Health issue registry sync failed", exc_info=True)
+            return {
+                "synced": synced,
+                "notified": notified,
+                "remediation": remediation_rows,
+            }
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _previous_yellow_streak(self, check_id: str) -> int:
         paths = sorted(self.report_dir.glob("????-??-??.md"))
@@ -860,6 +1421,32 @@ class HealthDoctor:
             )
         )
 
+        skill_status, skill_detail = self._skill_execution_volume_check()
+        checks.append(
+            HealthCheck(
+                check_id="learning.skill_execution_volume",
+                layer="Learning Loop",
+                label="Skill execution volume",
+                status=skill_status,
+                detail=skill_detail,
+                watch_item=(skill_status == "yellow"),
+                action_required=(skill_status == "red"),
+            )
+        )
+
+        ratio_status, ratio_detail = self._skill_vs_direct_bash_ratio_check()
+        checks.append(
+            HealthCheck(
+                check_id="learning.skill_vs_direct_bash_ratio",
+                layer="Learning Loop",
+                label="Skill vs direct Bash ratio",
+                status=ratio_status,
+                detail=ratio_detail,
+                watch_item=(ratio_status == "yellow"),
+                action_required=(ratio_status == "red"),
+            )
+        )
+
         maintenance_status, maintenance_detail = self._maintenance_log_check()
         checks.append(
             HealthCheck(
@@ -1321,6 +1908,7 @@ class HealthDoctor:
 
     def _duplicate_entity_check(self) -> tuple[str, str]:
         try:
+            from memory.dedup import find_near_duplicates
             from memory.graph import get_driver
 
             driver = get_driver()
@@ -1334,23 +1922,21 @@ class HealthDoctor:
                     """
                 )
                 names = [str(r["name"]) for r in rows if r["name"]]
-            near = 0
-            threshold = max(1, int(config.HEALTH_DUPLICATE_THRESHOLD))
-            for i, left in enumerate(names):
-                for right in names[i + 1:]:
-                    if abs(len(left) - len(right)) > threshold:
-                        continue
-                    if _levenshtein(left.lower(), right.lower()) < threshold:
-                        near += 1
-                        if near > 20:
-                            break
-                if near > 20:
-                    break
+
+            near_matches = find_near_duplicates(names)
+            near = len(near_matches)
+            sample = ", ".join(
+                f"{pair.left} ~ {pair.right}" for pair in near_matches[:3]
+            )
+            detail = f"{near} near-duplicates detected"
+            if sample:
+                detail = f"{detail} ({sample})"
+
             if near > 10:
-                return "red", f"{near} near-duplicates detected"
+                return "red", detail
             if near > 3:
-                return "yellow", f"{near} near-duplicates detected"
-            return "green", f"{near} near-duplicates detected"
+                return "yellow", detail
+            return "green", detail
         except Exception as exc:
             return "red", f"duplicate check failed ({exc})"
 
@@ -1401,6 +1987,64 @@ class HealthDoctor:
         if skills == 0 and corrections == 0:
             return "yellow", "skill_executions=0, corrections=0 (7d)"
         return "green", f"skill_executions={skills}, corrections={corrections} (7d)"
+
+    def _skill_execution_volume_check(self) -> tuple[str, str]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=HEALTH_SKILL_WINDOW_DAYS)).isoformat()
+        total = self._count_rows(
+            config.MOLLYGRAPH_PATH,
+            "SELECT COUNT(*) FROM skill_executions WHERE created_at > ?",
+            (cutoff,),
+        )
+        success = self._count_rows(
+            config.MOLLYGRAPH_PATH,
+            "SELECT COUNT(*) FROM skill_executions WHERE created_at > ? AND lower(outcome) = 'success'",
+            (cutoff,),
+        )
+        failure = self._count_rows(
+            config.MOLLYGRAPH_PATH,
+            "SELECT COUNT(*) FROM skill_executions WHERE created_at > ? AND lower(outcome) = 'failure'",
+            (cutoff,),
+        )
+        unknown = max(0, total - success - failure)
+        detail = (
+            f"executions={total} (success={success}, failure={failure}, unknown={unknown}) "
+            f"in last {HEALTH_SKILL_WINDOW_DAYS}d"
+        )
+        if total == 0:
+            return "red", detail
+        if total < HEALTH_SKILL_LOW_WATERMARK:
+            return "yellow", detail
+        if failure > success:
+            return "yellow", detail
+        return "green", detail
+
+    def _skill_vs_direct_bash_ratio_check(self) -> tuple[str, str]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=HEALTH_SKILL_WINDOW_DAYS)).isoformat()
+        skills = self._count_rows(
+            config.MOLLYGRAPH_PATH,
+            "SELECT COUNT(*) FROM skill_executions WHERE created_at > ?",
+            (cutoff,),
+        )
+        bash_calls = self._count_rows(
+            config.MOLLYGRAPH_PATH,
+            "SELECT COUNT(*) FROM tool_calls WHERE created_at > ? AND lower(tool_name) = 'bash'",
+            (cutoff,),
+        )
+        if bash_calls == 0:
+            if skills == 0:
+                return "yellow", f"skill_executions=0, direct_bash=0 (last {HEALTH_SKILL_WINDOW_DAYS}d)"
+            return "green", f"skill_executions={skills}, direct_bash=0 (last {HEALTH_SKILL_WINDOW_DAYS}d)"
+
+        ratio = skills / bash_calls
+        detail = (
+            f"skill_executions={skills}, direct_bash={bash_calls}, "
+            f"ratio={ratio:.2f} (last {HEALTH_SKILL_WINDOW_DAYS}d)"
+        )
+        if ratio < HEALTH_SKILL_BASH_RATIO_RED:
+            return "red", detail
+        if ratio < HEALTH_SKILL_BASH_RATIO_YELLOW:
+            return "yellow", detail
+        return "green", detail
 
     def _load_automation_state(self) -> tuple[bool, dict[str, Any], str]:
         path = config.AUTOMATIONS_STATE_FILE
