@@ -392,6 +392,41 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.manager.has_pending(web_chat))
         self.assertEqual(state.prompts_sent, 0)
 
+    async def test_custom_approval_accepts_edit_with_space_format(self):
+        task = asyncio.create_task(
+            self.manager.request_custom_approval(
+                category="self-improve-skill",
+                description="proposal",
+                chat_jid=self.chat,
+                molly=self.molly,
+                required_keyword="YES",
+                allow_edit=True,
+            )
+        )
+        await asyncio.sleep(0.05)
+        consumed = self.manager.try_resolve("EDIT trigger: use weekly summary flow", self.chat)
+        self.assertTrue(consumed)
+        result = await task
+        self.assertEqual(result, "trigger: use weekly summary flow")
+
+    async def test_custom_approval_can_return_denial_reason(self):
+        task = asyncio.create_task(
+            self.manager.request_custom_approval(
+                category="self-improve-skill",
+                description="proposal",
+                chat_jid=self.chat,
+                molly=self.molly,
+                required_keyword="YES",
+                allow_edit=True,
+                return_reasoned_denial=True,
+            )
+        )
+        await asyncio.sleep(0.05)
+        consumed = self.manager.try_resolve("NO: keep current version", self.chat)
+        self.assertTrue(consumed)
+        result = await task
+        self.assertEqual(result, ("deny", "keep current version"))
+
 
 class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

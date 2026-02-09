@@ -619,6 +619,15 @@ class Molly:
             if has_trigger else content.strip()
         )
 
+        # Explicit owner request to capture a workflow as a skill.
+        if (
+            clean_content
+            and self.self_improvement.should_trigger_owner_skill_phrase(clean_content)
+            and (chat_mode == "owner_dm" or has_trigger)
+        ):
+            await self.self_improvement.propose_skill_from_owner_phrase(clean_content)
+            return
+
         # Commands: available from owner with @Molly (any chat) or directly in DMs
         cmd_text = clean_content
         is_dm_command = (
