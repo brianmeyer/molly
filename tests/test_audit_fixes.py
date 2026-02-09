@@ -238,6 +238,7 @@ class TestDynamicTriggers(unittest.TestCase):
     def test_has_trigger_parsing_functions(self):
         """skills.py must have dynamic trigger parsing functions."""
         self.assertIn("def _extract_trigger_phrases", self.source)
+        self.assertIn("def _extract_front_matter_triggers", self.source)
         self.assertIn("def _phrase_to_regex", self.source)
         self.assertIn("def _build_trigger_patterns", self.source)
 
@@ -250,6 +251,23 @@ class TestDynamicTriggers(unittest.TestCase):
         self.assertEqual(len(phrases), 3)
         self.assertIn("daily digest", phrases)
         self.assertIn("morning briefing", phrases)
+
+    def test_extract_front_matter_triggers(self):
+        """_extract_front_matter_triggers should parse YAML trigger lists."""
+        from skills import _extract_front_matter_triggers
+
+        content = (
+            "---\n"
+            "name: sample\n"
+            "triggers:\n"
+            '  - "daily digest"\n'
+            "  - session startup\n"
+            "---\n"
+            "\n"
+            "# Skill\n"
+        )
+        triggers = _extract_front_matter_triggers(content)
+        self.assertEqual(triggers, ["daily digest", "session startup"])
 
     def test_phrase_to_regex_basic(self):
         """_phrase_to_regex should convert simple phrases."""
