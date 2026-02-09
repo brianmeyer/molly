@@ -1,6 +1,8 @@
 import asyncio
+import inspect
 import sys
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,29 +11,58 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+if "memory.processor" not in sys.modules:
+    processor_stub = types.ModuleType("memory.processor")
+
+    async def _noop_process_conversation(*_args, **_kwargs):
+        return None
+
+    processor_stub.process_conversation = _noop_process_conversation
+    sys.modules["memory.processor"] = processor_stub
+
+if "memory.retriever" not in sys.modules:
+    retriever_stub = types.ModuleType("memory.retriever")
+    retriever_stub.retrieve_context = lambda *_args, **_kwargs: ""
+
+    class _NoopVectorStore:
+        def log_skill_execution(self, *_args, **_kwargs):
+            return None
+
+    retriever_stub.get_vectorstore = lambda: _NoopVectorStore()
+    sys.modules["memory.retriever"] = retriever_stub
+
 import agent
-from approval import ApprovalManager, RequestApprovalState
+from approval import ApprovalManager, OWNER_PRIMARY_WHATSAPP_JID, RequestApprovalState
 from claude_agent_sdk import CLIConnectionError, PermissionResultDeny
 
 
 class _FakeWA:
-    def __init__(self):
+    def __init__(self, fail_jids: set[str] | None = None, always_fail: bool = False):
         self.sent: list[tuple[str, str]] = []
+        self.fail_jids = set(fail_jids or set())
+        self.always_fail = always_fail
 
-    async def send_message(self, chat_jid: str, text: str):
+    def send_message(self, chat_jid: str, text: str):
         self.sent.append((chat_jid, text))
+        if self.always_fail or chat_jid in self.fail_jids:
+            return None
         return {"chat_jid": chat_jid}
 
 
 class _FakeMolly:
-    def __init__(self, owner_jid: str = "123@s.whatsapp.net"):
-        self.wa = _FakeWA()
+    def __init__(
+        self,
+        owner_jid: str = "123@s.whatsapp.net",
+        wa: _FakeWA | None = None,
+    ):
+        self.wa = wa or _FakeWA()
         self.tasks: list[asyncio.Task] = []
         self.owner_jid = owner_jid
         self.registered_chats = {owner_jid: {}}
 
-    def _track_send(self, send_coro):
-        self.tasks.append(asyncio.create_task(send_coro))
+    def _track_send(self, send_result):
+        if inspect.isawaitable(send_result):
+            self.tasks.append(asyncio.create_task(send_result))
 
     def _get_owner_dm_jid(self) -> str:
         return self.owner_jid
@@ -45,6 +76,32 @@ class _CancelAwareApproval:
         self.cancel_calls.append(chat_jid)
 
 
+class _FakeVectorStore:
+    def __init__(self, should_raise: bool = False):
+        self.should_raise = should_raise
+        self.skill_logs: list[dict[str, str]] = []
+
+    def log_skill_execution(
+        self,
+        skill_name: str,
+        trigger: str,
+        outcome: str,
+        user_approval: str = "",
+        edits_made: str = "",
+    ):
+        if self.should_raise:
+            raise RuntimeError("write failed")
+        self.skill_logs.append(
+            {
+                "skill_name": skill_name,
+                "trigger": trigger,
+                "outcome": outcome,
+                "user_approval": user_approval,
+                "edits_made": edits_made,
+            }
+        )
+
+
 class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.manager = ApprovalManager()
@@ -54,6 +111,19 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         if self.molly.tasks:
             await asyncio.gather(*self.molly.tasks, return_exceptions=True)
+
+    async def test_non_whatsapp_reroute_logs_expected_message(self):
+        with self.assertLogs("approval", level="INFO") as logs:
+            resolved = self.manager._resolve_response_chat_jid("web:8d94e06e", self.molly)
+
+        self.assertEqual(resolved, OWNER_PRIMARY_WHATSAPP_JID)
+        self.assertTrue(
+            any(
+                "[approval INFO] - Rerouting approval to WhatsApp (original chat: web:8d94e06e)"
+                in entry
+                for entry in logs.output
+            )
+        )
 
     async def test_coalesces_concurrent_bash_approvals(self):
         state = RequestApprovalState()
@@ -176,16 +246,25 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
                         )
                     )
                 )
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.assertEqual(results, [False, False, False])
+        normalized: list[bool] = []
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                normalized.append(False)
+                continue
+            if isinstance(result, Exception):
+                raise result
+            normalized.append(bool(result))
+
+        self.assertEqual(normalized, [False, False, False])
         self.assertEqual(state.tool_asks, 3)
         self.assertEqual(state.prompts_sent, 1)
         self.assertEqual(state.auto_approved, 0)
         self.assertIn("Bash", state.denied_tools)
 
     async def test_web_request_routes_to_owner_whatsapp_for_resolution(self):
-        owner_chat = "15555550100@s.whatsapp.net"
+        owner_chat = OWNER_PRIMARY_WHATSAPP_JID
         self.molly.owner_jid = owner_chat
         self.molly.registered_chats = {owner_chat: {}}
         web_chat = "web:8d94e06e"
@@ -212,6 +291,106 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(consumed)
         self.assertTrue(await approval_task)
         self.assertFalse(self.manager.has_pending(web_chat))
+
+    async def test_imessage_request_routes_to_primary_owner_whatsapp(self):
+        owner_chat = OWNER_PRIMARY_WHATSAPP_JID
+        self.molly.owner_jid = owner_chat
+        self.molly.registered_chats = {owner_chat: {}}
+        imessage_chat = "imessage:thread:abc123"
+        state = RequestApprovalState()
+
+        approval_task = asyncio.create_task(
+            self.manager.request_tool_approval(
+                "Bash",
+                {"command": "pwd"},
+                imessage_chat,
+                self.molly,
+                request_state=state,
+            )
+        )
+
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(self.molly.wa.sent), 1)
+        routed_chat, _ = self.molly.wa.sent[0]
+        self.assertEqual(routed_chat, OWNER_PRIMARY_WHATSAPP_JID)
+
+        consumed = self.manager.try_resolve("YES", OWNER_PRIMARY_WHATSAPP_JID)
+        self.assertTrue(consumed)
+        self.assertTrue(await approval_task)
+
+    async def test_whatsapp_request_stays_on_origin_chat(self):
+        wa_chat = "15857332025@s.whatsapp.net"
+        state = RequestApprovalState()
+
+        approval_task = asyncio.create_task(
+            self.manager.request_tool_approval(
+                "Bash",
+                {"command": "pwd"},
+                wa_chat,
+                self.molly,
+                request_state=state,
+            )
+        )
+
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(self.molly.wa.sent), 1)
+        routed_chat, _ = self.molly.wa.sent[0]
+        self.assertEqual(routed_chat, wa_chat)
+
+        consumed = self.manager.try_resolve("YES", wa_chat)
+        self.assertTrue(consumed)
+        self.assertTrue(await approval_task)
+
+    async def test_send_failure_retries_owner_fallback_before_timeout(self):
+        fallback_owner = "52660963176533@lid"
+        failing_wa = _FakeWA(fail_jids={OWNER_PRIMARY_WHATSAPP_JID})
+        self.molly = _FakeMolly(owner_jid=fallback_owner, wa=failing_wa)
+        self.chat = "web:8d94e06e"
+        state = RequestApprovalState()
+
+        approval_task = asyncio.create_task(
+            self.manager.request_tool_approval(
+                "Bash",
+                {"command": "pwd"},
+                self.chat,
+                self.molly,
+                request_state=state,
+            )
+        )
+
+        await asyncio.sleep(0.05)
+        sent_targets = [jid for jid, _ in self.molly.wa.sent]
+        self.assertIn(OWNER_PRIMARY_WHATSAPP_JID, sent_targets)
+        self.assertIn(fallback_owner, sent_targets)
+        self.assertGreaterEqual(len(sent_targets), 2)
+
+        consumed = self.manager.try_resolve("YES", fallback_owner)
+        self.assertTrue(consumed)
+        self.assertTrue(await approval_task)
+
+    async def test_delivery_failure_returns_false_without_waiting_for_timeout(self):
+        self.molly = _FakeMolly(
+            owner_jid=OWNER_PRIMARY_WHATSAPP_JID,
+            wa=_FakeWA(always_fail=True),
+        )
+        web_chat = "web:8d94e06e"
+        state = RequestApprovalState()
+
+        t0 = time.monotonic()
+        with patch("approval.config.APPROVAL_TIMEOUT", 5):
+            result = await self.manager.request_tool_approval(
+                "Bash",
+                {"command": "pwd"},
+                web_chat,
+                self.molly,
+                request_state=state,
+            )
+        elapsed = time.monotonic() - t0
+
+        self.assertFalse(result)
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(self.manager.has_pending(web_chat))
+        self.assertEqual(state.prompts_sent, 0)
 
 
 class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
@@ -308,6 +487,92 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, "Recovered")
         self.assertEqual(session_id, "session-ok")
         self.assertEqual(observed_denied_sets, [set(), set()])
+
+
+class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        agent._CHAT_RUNTIMES.clear()
+
+    async def test_logs_success_outcome_for_matched_skills(self):
+        fake_vs = _FakeVectorStore()
+        matched = [
+            type("Skill", (), {"name": "daily-digest"})(),
+            type("Skill", (), {"name": "meeting-prep"})(),
+        ]
+
+        with patch("agent.load_identity_stack", return_value="identity"), \
+                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.match_skills", return_value=matched), \
+                patch("agent.get_skill_context", return_value="skill-context"), \
+                patch("agent._ensure_connected_runtime", new=AsyncMock()), \
+                patch("agent._disconnect_runtime", new=AsyncMock()), \
+                patch("agent._query_with_client", return_value=("ok", "session-skills")), \
+                patch("agent.process_conversation", new=AsyncMock()), \
+                patch("memory.retriever.get_vectorstore", return_value=fake_vs):
+            response, session_id = await agent.handle_message(
+                "what's on today?",
+                "chat-skill-success",
+                source="whatsapp",
+            )
+            await asyncio.sleep(0.05)
+
+        self.assertEqual(response, "ok")
+        self.assertEqual(session_id, "session-skills")
+        self.assertEqual(len(fake_vs.skill_logs), 2)
+        self.assertEqual(
+            {row["skill_name"] for row in fake_vs.skill_logs},
+            {"daily-digest", "meeting-prep"},
+        )
+        self.assertTrue(all(row["outcome"] == "success" for row in fake_vs.skill_logs))
+
+    async def test_logs_failure_outcome_for_matched_skills(self):
+        fake_vs = _FakeVectorStore()
+        matched = [type("Skill", (), {"name": "daily-digest"})()]
+
+        with patch("agent.load_identity_stack", return_value="identity"), \
+                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.match_skills", return_value=matched), \
+                patch("agent.get_skill_context", return_value="skill-context"), \
+                patch("agent._ensure_connected_runtime", new=AsyncMock()), \
+                patch("agent._disconnect_runtime", new=AsyncMock()), \
+                patch("agent._query_with_client", side_effect=RuntimeError("boom")), \
+                patch("agent.process_conversation", new=AsyncMock()), \
+                patch("memory.retriever.get_vectorstore", return_value=fake_vs):
+            response, _session_id = await agent.handle_message(
+                "run digest",
+                "chat-skill-failure",
+                source="whatsapp",
+            )
+            await asyncio.sleep(0.05)
+
+        self.assertTrue(response.startswith("Something went wrong"))
+        self.assertEqual(len(fake_vs.skill_logs), 1)
+        self.assertEqual(fake_vs.skill_logs[0]["skill_name"], "daily-digest")
+        self.assertEqual(fake_vs.skill_logs[0]["outcome"], "failure")
+        self.assertIn("RuntimeError", fake_vs.skill_logs[0]["edits_made"])
+
+    async def test_skill_logging_failure_never_breaks_response(self):
+        fake_vs = _FakeVectorStore(should_raise=True)
+        matched = [type("Skill", (), {"name": "daily-digest"})()]
+
+        with patch("agent.load_identity_stack", return_value="identity"), \
+                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.match_skills", return_value=matched), \
+                patch("agent.get_skill_context", return_value="skill-context"), \
+                patch("agent._ensure_connected_runtime", new=AsyncMock()), \
+                patch("agent._disconnect_runtime", new=AsyncMock()), \
+                patch("agent._query_with_client", return_value=("Recovered", "session-ok")), \
+                patch("agent.process_conversation", new=AsyncMock()), \
+                patch("memory.retriever.get_vectorstore", return_value=fake_vs):
+            response, session_id = await agent.handle_message(
+                "what's on today?",
+                "chat-skill-log-failure",
+                source="whatsapp",
+            )
+            await asyncio.sleep(0.05)
+
+        self.assertEqual(response, "Recovered")
+        self.assertEqual(session_id, "session-ok")
 
 
 class TestToolCheckerNegativeCases(unittest.IsolatedAsyncioTestCase):

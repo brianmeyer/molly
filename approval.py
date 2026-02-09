@@ -35,9 +35,11 @@ APPROVE_ALL_WORDS = frozenset({
     "all yes",
 })
 
-# Intentionally empty: owner routing should come from configured OWNER_IDS
-# or runtime-registered owner chats, not hardcoded personal IDs.
-OWNER_APPROVAL_JID_FALLBACKS: tuple[str, ...] = ()
+# Primary fallback for approvals from non-WhatsApp sessions.
+OWNER_PRIMARY_WHATSAPP_JID = "15857332025@s.whatsapp.net"
+OWNER_APPROVAL_JID_FALLBACKS: tuple[str, ...] = (OWNER_PRIMARY_WHATSAPP_JID,)
+WHATSAPP_JID_SERVER_SUFFIX = ".whatsapp.net"
+WHATSAPP_JID_ALLOWED_SERVERS = {"lid", "g.us", "broadcast"}
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +272,15 @@ class ApprovalManager:
 
     @staticmethod
     def _is_whatsapp_jid(chat_jid: str) -> bool:
-        return isinstance(chat_jid, str) and "@" in chat_jid
+        if not isinstance(chat_jid, str) or "@" not in chat_jid:
+            return False
+        user, server = chat_jid.split("@", 1)
+        if not user or not server:
+            return False
+        return (
+            server.endswith(WHATSAPP_JID_SERVER_SUFFIX)
+            or server in WHATSAPP_JID_ALLOWED_SERVERS
+        )
 
     def _iter_owner_approval_jids(self, molly) -> list[str]:
         candidates: list[str] = []
@@ -278,10 +288,23 @@ class ApprovalManager:
 
         def _add(candidate: str | None):
             jid = (candidate or "").strip()
-            if not jid or jid in seen:
+            if not jid or jid in seen or not self._is_whatsapp_jid(jid):
                 return
             seen.add(jid)
             candidates.append(jid)
+
+        primary_user = OWNER_PRIMARY_WHATSAPP_JID.split("@", 1)[0]
+        _add(OWNER_PRIMARY_WHATSAPP_JID)
+
+        def _add_owner_variants(owner_id: str):
+            oid = owner_id.strip()
+            if not oid:
+                return
+            if "@" in oid:
+                _add(oid)
+                return
+            _add(f"{oid}@s.whatsapp.net")
+            _add(f"{oid}@lid")
 
         if molly and hasattr(molly, "_get_owner_dm_jid"):
             try:
@@ -291,19 +314,20 @@ class ApprovalManager:
 
         registered = getattr(molly, "registered_chats", {}) if molly else {}
         if isinstance(registered, dict):
-            for jid in registered:
-                if jid.split("@")[0] in config.OWNER_IDS:
+            for jid in sorted(registered):
+                if jid.split("@", 1)[0] in config.OWNER_IDS:
                     _add(jid)
 
-        for owner_id in config.OWNER_IDS:
+        def _owner_sort_key(owner_id: str) -> tuple[int, str]:
             oid = owner_id.strip()
             if not oid:
-                continue
-            if "@" in oid:
-                _add(oid)
-                continue
-            _add(f"{oid}@s.whatsapp.net")
-            _add(f"{oid}@lid")
+                return (2, "")
+            if oid == primary_user or oid.startswith(f"{primary_user}@"):
+                return (0, oid)
+            return (1, oid)
+
+        for owner_id in sorted(config.OWNER_IDS, key=_owner_sort_key):
+            _add_owner_variants(owner_id)
 
         for fallback in OWNER_APPROVAL_JID_FALLBACKS:
             _add(fallback)
@@ -318,7 +342,7 @@ class ApprovalManager:
             if self._is_whatsapp_jid(candidate):
                 if candidate != request_chat_jid:
                     log.info(
-                        "Routing approval from non-WhatsApp chat %s to owner WhatsApp chat %s",
+                        "[approval INFO] - Rerouting approval to WhatsApp (original chat: %s) -> %s",
                         request_chat_jid,
                         candidate,
                     )
@@ -337,14 +361,61 @@ class ApprovalManager:
             except Exception:
                 log.debug("Failed to track outbound approval message", exc_info=True)
 
-    def _send_approval_message(self, molly, chat_jid: str, text: str):
+    def _retarget_pending_response_chat(self, approval: PendingApproval, response_chat_jid: str):
+        if approval.response_chat_jid == response_chat_jid:
+            return
+        if self._pending_by_response_chat.get(approval.response_chat_jid) == approval.id:
+            self._pending_by_response_chat.pop(approval.response_chat_jid, None)
+        approval.response_chat_jid = response_chat_jid
+        self._pending_by_response_chat[response_chat_jid] = approval.id
+
+    def _send_approval_message(
+        self,
+        molly,
+        request_chat_jid: str,
+        preferred_chat_jid: str,
+        text: str,
+    ) -> str | None:
         wa = getattr(molly, "wa", None)
         if not wa:
-            log.warning("Approval message not sent (WhatsApp unavailable): %s", chat_jid)
+            log.warning("Approval message not sent (WhatsApp unavailable): %s", preferred_chat_jid)
             return None
-        message_result = wa.send_message(chat_jid, text)
-        self._track_send(molly, message_result)
-        return message_result
+
+        targets: list[str] = []
+        seen: set[str] = set()
+
+        def _add_target(candidate: str | None):
+            target = (candidate or "").strip()
+            if not target or target in seen:
+                return
+            seen.add(target)
+            targets.append(target)
+
+        _add_target(preferred_chat_jid)
+        _add_target(request_chat_jid)
+        for candidate in self._iter_owner_approval_jids(molly):
+            _add_target(candidate)
+
+        for target in targets:
+            if not self._is_whatsapp_jid(target):
+                continue
+            message_result = wa.send_message(target, text)
+            if message_result:
+                self._track_send(molly, message_result)
+                return target
+            log.warning(
+                "Approval send failed for %s (request_chat=%s preferred_chat=%s)",
+                target,
+                request_chat_jid,
+                preferred_chat_jid,
+            )
+
+        log.error(
+            "Approval message delivery failed (request_chat=%s preferred_chat=%s)",
+            request_chat_jid,
+            preferred_chat_jid,
+        )
+        return None
 
     def _lookup_pending_id(self, chat_jid: str) -> str | None:
         pending_id = self._pending_by_response_chat.get(chat_jid)
@@ -477,15 +548,37 @@ class ApprovalManager:
         )
         self._register_pending(approval)
 
-        # Send the structured approval message (non-WhatsApp requests are routed to owner WhatsApp)
+        # Send the structured approval message. If delivery fails, deny now
+        # instead of waiting for a timeout that Brian can never answer.
+        sent_chat_jid = self._send_approval_message(
+            molly,
+            request_chat_jid=chat_jid,
+            preferred_chat_jid=response_chat_jid,
+            text=description,
+        )
+        if not sent_chat_jid:
+            self._remove_pending(approval)
+            if not future.done():
+                future.set_result(False)
+            if request_state is not None:
+                self._apply_tool_approval_result(tool_name, False, request_state)
+            _log_approval_decision(tool_name, "delivery_failed", 0.0)
+            log.warning(
+                "Tool approval prompt delivery failed [%s] request_chat=%s response_chat=%s",
+                tool_name,
+                chat_jid,
+                response_chat_jid,
+            )
+            return False
+        if sent_chat_jid != approval.response_chat_jid:
+            self._retarget_pending_response_chat(approval, sent_chat_jid)
         if request_state is not None:
             request_state.prompts_sent += 1
-        self._send_approval_message(molly, response_chat_jid, description)
         log.info(
             "Tool approval requested [%s] request_chat=%s response_chat=%s",
             tool_name,
             chat_jid,
-            response_chat_jid,
+            approval.response_chat_jid,
         )
 
         # Wait for yes/no/edit or timeout
@@ -518,8 +611,9 @@ class ApprovalManager:
             _log_approval_decision(tool_name, "timed_out", elapsed)
             self._send_approval_message(
                 molly,
-                response_chat_jid,
-                f"Approval timed out for: {tool_name}",
+                request_chat_jid=chat_jid,
+                preferred_chat_jid=approval.response_chat_jid,
+                text=f"Approval timed out for: {tool_name}",
             )
             log.info("Tool approval timed out: %s", tool_name)
             return False
@@ -600,7 +694,19 @@ class ApprovalManager:
         )
         if response_chat_jid != chat_jid:
             msg = f"{msg}\n\nOrigin chat: {chat_jid}"
-        self._send_approval_message(molly, response_chat_jid, msg)
+        sent_chat_jid = self._send_approval_message(
+            molly,
+            request_chat_jid=chat_jid,
+            preferred_chat_jid=response_chat_jid,
+            text=msg,
+        )
+        if not sent_chat_jid:
+            self._remove_pending(approval)
+            if not future.done():
+                future.set_result(False)
+            return False
+        if sent_chat_jid != approval.response_chat_jid:
+            self._retarget_pending_response_chat(approval, sent_chat_jid)
         log.info("Tag approval requested [%s]: %s", category, description)
 
         try:
@@ -612,7 +718,12 @@ class ApprovalManager:
             return False
         except asyncio.TimeoutError:
             self._remove_pending(approval)
-            self._send_approval_message(molly, response_chat_jid, f"Approval timed out for: {description}")
+            self._send_approval_message(
+                molly,
+                request_chat_jid=chat_jid,
+                preferred_chat_jid=approval.response_chat_jid,
+                text=f"Approval timed out for: {description}",
+            )
             log.info("Tag approval timed out: %s", description)
             return False
 
@@ -662,7 +773,20 @@ class ApprovalManager:
         )
         if response_chat_jid != chat_jid:
             msg = f"{msg}\n\nOrigin chat: {chat_jid}"
-        self._send_approval_message(molly, response_chat_jid, msg)
+        sent_chat_jid = self._send_approval_message(
+            molly,
+            request_chat_jid=chat_jid,
+            preferred_chat_jid=response_chat_jid,
+            text=msg,
+        )
+        if not sent_chat_jid:
+            self._remove_pending(approval)
+            if not future.done():
+                future.set_result(False)
+            _log_approval_decision(category, "delivery_failed", 0.0)
+            return False
+        if sent_chat_jid != approval.response_chat_jid:
+            self._retarget_pending_response_chat(approval, sent_chat_jid)
         log.info("Custom approval requested [%s] keyword=%s", category, key)
 
         t0 = asyncio.get_event_loop().time()
@@ -682,7 +806,12 @@ class ApprovalManager:
             self._remove_pending(approval)
             elapsed = asyncio.get_event_loop().time() - t0
             _log_approval_decision(category, "timed_out", elapsed)
-            self._send_approval_message(molly, response_chat_jid, f"Approval timed out for: {category}")
+            self._send_approval_message(
+                molly,
+                request_chat_jid=chat_jid,
+                preferred_chat_jid=approval.response_chat_jid,
+                text=f"Approval timed out for: {category}",
+            )
             return False
 
     # --- Resolution ---

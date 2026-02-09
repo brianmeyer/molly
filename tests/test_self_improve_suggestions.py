@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
+from foundry_adapter import FoundrySequenceSignal
 from self_improve import SelfImprovementEngine
 
 
@@ -114,6 +115,67 @@ class TestSelfImproveSuggestions(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         self.assertEqual(candidates, [])
+
+    def test_detect_workflow_patterns_filters_primitives_and_keeps_tool_call_fallback(self):
+        rows = [
+            {"tool_name": "Write", "created_at": "2026-02-09T10:00:00+00:00"},
+            {"tool_name": "WebSearch", "created_at": "2026-02-09T10:01:00+00:00"},
+            {"tool_name": "kimi_research", "created_at": "2026-02-09T10:02:00+00:00"},
+            {"tool_name": "worker_agent", "created_at": "2026-02-09T10:03:00+00:00"},
+            {"tool_name": "approval:Bash", "created_at": "2026-02-09T10:04:00+00:00"},
+            {"tool_name": "WebSearch", "created_at": "2026-02-09T10:05:00+00:00"},
+            {"tool_name": "kimi_research", "created_at": "2026-02-09T10:06:00+00:00"},
+            {"tool_name": "worker_agent", "created_at": "2026-02-09T10:07:00+00:00"},
+        ]
+        with patch.object(self.engine, "_rows", return_value=rows), \
+                patch.object(self.engine, "_load_foundry_sequence_signals", return_value={}), \
+                patch.object(self.engine, "_existing_automation_ids", return_value=set()):
+            patterns = self.engine._detect_workflow_patterns(days=30, min_occurrences=2)
+
+        target = next(
+            (item for item in patterns if item.get("steps_text") == "WebSearch -> kimi_research -> worker_agent"),
+            None,
+        )
+        self.assertIsNotNone(target)
+        self.assertEqual(target["source"], "tool_calls")
+        self.assertEqual(target["tool_call_count"], 2)
+        self.assertEqual(target["foundry_count"], 0)
+        for item in patterns:
+            for step in item.get("steps", []):
+                lowered = str(step).lower()
+                self.assertNotIn(lowered, {"write", "edit", "bash"})
+                self.assertFalse(lowered.startswith("approval:"))
+
+    def test_detect_workflow_patterns_adds_foundry_signal_to_reach_threshold(self):
+        rows = [
+            {"tool_name": "WebSearch", "created_at": "2026-02-09T10:01:00+00:00"},
+            {"tool_name": "kimi_research", "created_at": "2026-02-09T10:02:00+00:00"},
+            {"tool_name": "worker_agent", "created_at": "2026-02-09T10:03:00+00:00"},
+            {"tool_name": "WebSearch", "created_at": "2026-02-09T10:05:00+00:00"},
+            {"tool_name": "kimi_research", "created_at": "2026-02-09T10:06:00+00:00"},
+            {"tool_name": "worker_agent", "created_at": "2026-02-09T10:07:00+00:00"},
+        ]
+        key = "WebSearch -> kimi_research -> worker_agent"
+        foundry = {
+            key: FoundrySequenceSignal(
+                steps=("WebSearch", "kimi_research", "worker_agent"),
+                count=1,
+                successes=1,
+                latest_at="2026-02-09T13:49:27+00:00",
+            )
+        }
+        with patch.object(self.engine, "_rows", return_value=rows), \
+                patch.object(self.engine, "_load_foundry_sequence_signals", return_value=foundry), \
+                patch.object(self.engine, "_existing_automation_ids", return_value=set()):
+            patterns = self.engine._detect_workflow_patterns(days=30, min_occurrences=3)
+
+        target = next((item for item in patterns if item.get("steps_text") == key), None)
+        self.assertIsNotNone(target)
+        self.assertEqual(target["source"], "tool_calls+foundry")
+        self.assertEqual(target["count"], 3)
+        self.assertEqual(target["tool_call_count"], 2)
+        self.assertEqual(target["foundry_count"], 1)
+        self.assertGreater(target["confidence"], 0.8)
 
 
 class TestSelfImproveSuggestionFlow(unittest.IsolatedAsyncioTestCase):

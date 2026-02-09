@@ -154,6 +154,43 @@ HEALTH_PIPELINE_WINDOW_HOURS = int(os.getenv("MOLLY_HEALTH_PIPELINE_WINDOW_HOURS
 HEALTH_ENTITY_SAMPLE_SIZE = int(os.getenv("MOLLY_HEALTH_ENTITY_SAMPLE_SIZE", "20"))
 HEALTH_DUPLICATE_THRESHOLD = int(os.getenv("MOLLY_HEALTH_DUPLICATE_THRESHOLD", "3"))
 
+# Track F rollout guards (pre-prod audit). Defaults are report-only/safe.
+TRACK_F_REPORT_ONLY = _env_bool("MOLLY_TRACK_F_REPORT_ONLY", True)
+TRACK_F_ENFORCE_PARSER_COMPAT = _env_bool("MOLLY_TRACK_F_ENFORCE_PARSER_COMPAT", False)
+TRACK_F_ENFORCE_SKILL_TELEMETRY = _env_bool("MOLLY_TRACK_F_ENFORCE_SKILL_TELEMETRY", False)
+TRACK_F_ENFORCE_FOUNDRY_INGESTION = _env_bool("MOLLY_TRACK_F_ENFORCE_FOUNDRY_INGESTION", False)
+TRACK_F_ENFORCE_PROMOTION_DRIFT = _env_bool("MOLLY_TRACK_F_ENFORCE_PROMOTION_DRIFT", False)
+TRACK_F_AUDIT_DIR = Path(
+    os.getenv(
+        "MOLLY_TRACK_F_AUDIT_DIR",
+        str(PROJECT_ROOT / "store" / "audits" / "track-f"),
+    )
+).expanduser()
+TRACK_F_SKILL_TELEMETRY_WINDOW_DAYS = max(
+    1,
+    int(os.getenv("MOLLY_TRACK_F_SKILL_TELEMETRY_WINDOW_DAYS", "14")),
+)
+TRACK_F_FOUNDRY_INGESTION_WINDOW_HOURS = max(
+    1,
+    int(os.getenv("MOLLY_TRACK_F_FOUNDRY_INGESTION_WINDOW_HOURS", "24")),
+)
+TRACK_F_FOUNDRY_INGESTION_MIN_EVENTS = max(
+    1,
+    int(os.getenv("MOLLY_TRACK_F_FOUNDRY_INGESTION_MIN_EVENTS", "1")),
+)
+TRACK_F_PROMOTION_DRIFT_WINDOW_DAYS = max(
+    1,
+    int(os.getenv("MOLLY_TRACK_F_PROMOTION_DRIFT_WINDOW_DAYS", "30")),
+)
+TRACK_F_PROMOTION_DRIFT_MAX_PENDING = max(
+    0,
+    int(os.getenv("MOLLY_TRACK_F_PROMOTION_DRIFT_MAX_PENDING", "5")),
+)
+TRACK_F_PROMOTION_DRIFT_MIN_RATE = min(
+    1.0,
+    max(0.0, float(os.getenv("MOLLY_TRACK_F_PROMOTION_DRIFT_MIN_RATE", "0.30"))),
+)
+
 # Approval system — three-tier action classification
 ACTION_TIERS = {
     "AUTO": {
@@ -218,6 +255,29 @@ MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
 MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 XAI_BASE_URL = "https://api.x.ai/v1"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+)
+
+# Contract audit layer (Track D)
+CONTRACT_AUDIT_LLM_ENABLED = _env_bool("MOLLY_CONTRACT_AUDIT_LLM_ENABLED", False)
+CONTRACT_AUDIT_LLM_BLOCKING = _env_bool("MOLLY_CONTRACT_AUDIT_LLM_BLOCKING", False)
+CONTRACT_AUDIT_NIGHTLY_MODEL = os.getenv(
+    "MOLLY_CONTRACT_AUDIT_NIGHTLY_MODEL", "kimi"
+).strip().lower()
+CONTRACT_AUDIT_WEEKLY_MODEL = os.getenv(
+    "MOLLY_CONTRACT_AUDIT_WEEKLY_MODEL", "opus"
+).strip().lower()
+CONTRACT_AUDIT_MODEL_TIMEOUT_SECONDS = max(
+    5, int(os.getenv("MOLLY_CONTRACT_AUDIT_MODEL_TIMEOUT_SECONDS", "45"))
+)
+CONTRACT_AUDIT_KIMI_MODEL = os.getenv(
+    "MOLLY_CONTRACT_AUDIT_KIMI_MODEL", "kimi-k2-0711-preview"
+).strip()
+CONTRACT_AUDIT_GEMINI_MODEL = os.getenv(
+    "MOLLY_CONTRACT_AUDIT_GEMINI_MODEL", "gemini-2.0-flash"
+).strip()
 
 # Local triage model (Qwen3-4B GGUF via llama-cpp-python)
 TRIAGE_MODEL_PATH = Path(

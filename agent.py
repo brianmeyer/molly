@@ -255,6 +255,69 @@ def _log_tool(tool_name: str, tool_input: dict, success: bool, t0: float, error:
         log.debug("Failed to log tool call: %s", tool_name, exc_info=True)
 
 
+def _skill_name_for_log(skill: object) -> str:
+    name = str(getattr(skill, "name", "") or "").strip()
+    if name:
+        return name
+    return str(skill).strip()
+
+
+def _log_skill_executions_best_effort(
+    skill_names: list[str],
+    trigger: str,
+    outcome: str,
+    detail: str = "",
+):
+    """Persist skill execution outcomes without interrupting response flow."""
+    if not skill_names:
+        return
+    try:
+        from memory.retriever import get_vectorstore
+
+        vs = get_vectorstore()
+        for skill_name in skill_names:
+            vs.log_skill_execution(
+                skill_name=skill_name,
+                trigger=trigger,
+                outcome=outcome,
+                edits_made=detail,
+            )
+    except Exception:
+        log.debug("Failed to log skill executions", exc_info=True)
+
+
+def _schedule_skill_execution_logs(
+    matched_skills: list[object],
+    trigger: str,
+    outcome: str,
+    detail: str = "",
+):
+    """Schedule non-blocking skill execution telemetry writes."""
+    seen: set[str] = set()
+    skill_names: list[str] = []
+    for skill in matched_skills:
+        name = _skill_name_for_log(skill)
+        if name and name not in seen:
+            seen.add(name)
+            skill_names.append(name)
+    if not skill_names:
+        return
+
+    async def _emit():
+        # Yield once so response sending is never blocked by telemetry.
+        await asyncio.sleep(0)
+        _log_skill_executions_best_effort(skill_names, trigger, outcome, detail)
+
+    task = asyncio.create_task(
+        _emit(),
+        name=f"skill-telemetry:{','.join(skill_names)[:60]}",
+    )
+    task.add_done_callback(
+        lambda t: log.debug("Skill telemetry task failed", exc_info=t.exception())
+        if not t.cancelled() and t.exception() else None
+    )
+
+
 async def _get_chat_runtime(chat_id: str) -> _ChatRuntime:
     await _evict_stale_chat_runtimes()
 
@@ -577,6 +640,8 @@ async def handle_message(
     response_text = ""
     new_session_id = None
     request_state = RequestApprovalState()
+    query_succeeded = False
+    failure_detail = ""
 
     async with runtime.lock:
         runtime.last_used_monotonic = time.monotonic()
@@ -596,8 +661,11 @@ async def handle_message(
                 try:
                     await _ensure_connected_runtime(runtime, chat_id, system_prompt)
                     response_text, new_session_id = await _query_with_client(runtime, turn_prompt)
+                    query_succeeded = True
+                    failure_detail = ""
                     break
                 except Exception as exc:
+                    failure_detail = type(exc).__name__
                     recoverable = _is_recoverable_transport_error(exc)
                     if recoverable:
                         log.warning(
@@ -628,6 +696,15 @@ async def handle_message(
         runtime.last_used_monotonic = time.monotonic()
 
     _emit_approval_metrics(request_state)
+
+    if matched_skills:
+        outcome = "success"
+        detail = ""
+        if not query_succeeded or response_text.startswith("Something went wrong"):
+            outcome = "failure"
+            detail = failure_detail or "response_error"
+        trigger = f"{source}:{user_message}"
+        _schedule_skill_execution_logs(matched_skills, trigger=trigger, outcome=outcome, detail=detail)
 
     # Async post-processing: embed + store conversation turn
     if response_text and not response_text.startswith("Something went wrong"):

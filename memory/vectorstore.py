@@ -8,6 +8,8 @@ from pathlib import Path
 
 import sqlite_vec
 
+from memory.issue_registry import ensure_issue_registry_tables
+
 log = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 768
@@ -107,6 +109,7 @@ class VectorStore:
             );
         """)
         self._ensure_preference_signal_columns()
+        ensure_issue_registry_tables(self.conn)
 
         # Create virtual vec table (separate statement — can't be in executescript)
         self.conn.execute(f"""

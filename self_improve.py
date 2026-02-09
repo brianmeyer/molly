@@ -18,6 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config
+from foundry_adapter import FoundrySequenceSignal, load_foundry_sequence_signals
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ _POST_DEPLOY_HEALTH_GRACE_SECONDS = 45
 _POST_DEPLOY_HEALTH_RETRY_SECONDS = 60
 _TOOL_GAP_MIN_FAILURES = max(1, int(getattr(config, "TOOL_GAP_MIN_FAILURES", 5)))
 _TOOL_GAP_WINDOW_DAYS = max(1, int(getattr(config, "TOOL_GAP_WINDOW_DAYS", 7)))
+_LOW_VALUE_WORKFLOW_TOOL_NAMES = {"write", "edit", "bash"}
 
 
 @dataclass
@@ -1584,6 +1586,23 @@ class SelfImprovementEngine:
             return [str(step).strip() for step in raw_steps if str(step).strip()]
         return []
 
+    def _is_low_value_workflow_tool(self, tool_name: str) -> bool:
+        normalized = str(tool_name or "").strip()
+        if not normalized:
+            return True
+        lowered = normalized.lower()
+        return lowered in _LOW_VALUE_WORKFLOW_TOOL_NAMES or lowered.startswith("approval:")
+
+    def _load_foundry_sequence_signals(self, days: int = 30) -> dict[str, FoundrySequenceSignal]:
+        try:
+            return load_foundry_sequence_signals(
+                days=days,
+                is_low_value_tool=self._is_low_value_workflow_tool,
+            )
+        except Exception:
+            log.debug("Failed to load Foundry observation signals", exc_info=True)
+            return {}
+
     def _has_recent_event(
         self,
         category: str,
@@ -1898,41 +1917,67 @@ class SelfImprovementEngine:
             """,
             (cutoff,),
         )
-        if len(rows) < 3:
-            return []
+        tools = []
+        for row in rows:
+            tool_name = str(row.get("tool_name", "")).strip()
+            if self._is_low_value_workflow_tool(tool_name):
+                continue
+            tools.append(tool_name)
 
-        tools = [
-            str(row["tool_name"])
-            for row in rows
-            if not str(row["tool_name"]).startswith("approval:")
-        ]
-        counts: dict[str, int] = {}
+        tool_call_counts: dict[str, int] = {}
         for i in range(0, len(tools) - 2):
             seq = tools[i:i + 3]
             if len(set(seq)) == 1:
                 continue
             key = " -> ".join(seq)
-            counts[key] = counts.get(key, 0) + 1
+            tool_call_counts[key] = tool_call_counts.get(key, 0) + 1
+
+        foundry_signals = self._load_foundry_sequence_signals(days=days)
+        if not tool_call_counts and not foundry_signals:
+            return []
 
         existing_ids = self._existing_automation_ids()
         patterns = []
-        for seq, c in counts.items():
-            if c < min_occurrences:
+        all_sequences = set(tool_call_counts) | set(foundry_signals)
+        for seq in sorted(all_sequences):
+            sequence_tools = [step.strip() for step in seq.split(" -> ") if step.strip()]
+            if len(sequence_tools) != 3:
                 continue
-            sequence_tools = seq.split(" -> ")
+            if any(self._is_low_value_workflow_tool(step) for step in sequence_tools):
+                continue
+            tool_count = int(tool_call_counts.get(seq, 0) or 0)
+            foundry_signal = foundry_signals.get(seq)
+            foundry_count = int(foundry_signal.count if foundry_signal else 0)
+            total_count = tool_count + foundry_count
+            if total_count < min_occurrences:
+                continue
             overlap = sum(1 for tid in existing_ids if any(t in tid for t in sequence_tools))
-            confidence = min(0.99, 0.4 + (0.15 * c) + (0.05 * overlap))
-            patterns.append(
-                {
-                    "name": f"Workflow {sequence_tools[0]}",
-                    "steps": sequence_tools,
-                    "steps_text": seq,
-                    "count": c,
-                    "confidence": confidence,
-                    "trigger": "Detected repeated tool-call chain",
-                    "example": seq,
-                }
-            )
+            foundry_success_rate = foundry_signal.success_rate if foundry_signal else 0.0
+            foundry_boost = min(0.35, (0.08 * foundry_count) + (0.10 * foundry_success_rate))
+            confidence = min(0.99, 0.4 + (0.15 * tool_count) + (0.05 * overlap) + foundry_boost)
+
+            source = "tool_calls"
+            if tool_count > 0 and foundry_count > 0:
+                source = "tool_calls+foundry"
+            elif foundry_count > 0:
+                source = "foundry"
+
+            pattern = {
+                "name": f"Workflow {sequence_tools[0]}",
+                "steps": sequence_tools,
+                "steps_text": seq,
+                "count": total_count,
+                "tool_call_count": tool_count,
+                "foundry_count": foundry_count,
+                "foundry_success_rate": round(foundry_success_rate, 2),
+                "confidence": confidence,
+                "trigger": "Detected repeated workflow chain",
+                "example": seq,
+                "source": source,
+            }
+            if foundry_signal and foundry_signal.latest_at:
+                pattern["foundry_latest_at"] = foundry_signal.latest_at
+            patterns.append(pattern)
         return sorted(patterns, key=lambda p: (p["count"], p["confidence"]), reverse=True)
 
     async def _propose_automation_updates_from_patterns(self, patterns: list[dict[str, Any]]):
