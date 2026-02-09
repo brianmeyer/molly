@@ -8,6 +8,7 @@ import config
 log = logging.getLogger(__name__)
 
 HEARTBEAT_SENTINEL = "HEARTBEAT_OK"
+_skill_reload_count = 0
 
 # Morning digest window: first heartbeat between 7:00-7:59
 DIGEST_HOUR = 7
@@ -51,6 +52,21 @@ def should_heartbeat(last_heartbeat: datetime | None) -> bool:
 
 async def run_heartbeat(molly):
     """Run a heartbeat check: HEARTBEAT.md evaluation + skill triggers + iMessage/email monitoring."""
+    global _skill_reload_count
+    import skills
+
+    try:
+        reloaded = skills.check_for_changes()
+        if reloaded:
+            _skill_reload_count += 1
+        log.info(
+            "Heartbeat skill hot-reload: status=%s total_reloads=%d",
+            skills.get_reload_status(),
+            _skill_reload_count,
+        )
+    except Exception:
+        log.error("Heartbeat skill hot-reload check failed", exc_info=True)
+
     # Check for new iMessages and surface urgent ones
     await _check_imessages(molly)
 
@@ -64,12 +80,10 @@ async def run_heartbeat(molly):
         return
 
     # Phase 3D: proactive skills — only run if enabled in HEARTBEAT_SKILLS
-    from skills import HEARTBEAT_SKILLS
-
-    if "daily-digest" in HEARTBEAT_SKILLS:
+    if "daily-digest" in skills.HEARTBEAT_SKILLS:
         await _check_morning_digest(molly, chat_jid)
 
-    if "meeting-prep" in HEARTBEAT_SKILLS:
+    if "meeting-prep" in skills.HEARTBEAT_SKILLS:
         await _check_meeting_prep(molly, chat_jid)
 
     # Standard heartbeat: HEARTBEAT.md evaluation
