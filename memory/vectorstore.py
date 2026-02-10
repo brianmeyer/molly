@@ -117,8 +117,18 @@ class VectorStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            -- Sender tier overrides for triage pre-filtering
+            CREATE TABLE IF NOT EXISTS sender_tiers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_pattern TEXT NOT NULL UNIQUE,
+                tier TEXT NOT NULL DEFAULT 'normal',
+                source TEXT DEFAULT 'manual',
+                updated_at TEXT NOT NULL
+            );
         """)
         self._ensure_preference_signal_columns()
+        self._ensure_sender_tiers_table()
         ensure_issue_registry_tables(self.conn)
 
         # Create virtual vec table (separate statement — can't be in executescript)
@@ -304,6 +314,82 @@ class VectorStore:
             ),
         )
         self.conn.commit()
+
+    def _ensure_sender_tiers_table(self):
+        """Migration safety: ensure sender_tiers exists for older databases."""
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS sender_tiers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_pattern TEXT NOT NULL UNIQUE,
+                tier TEXT NOT NULL DEFAULT 'normal',
+                source TEXT DEFAULT 'manual',
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+    def upsert_sender_tier(
+        self, sender_pattern: str, tier: str, source: str = "manual",
+    ):
+        """Insert or update a sender tier override."""
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO sender_tiers (sender_pattern, tier, source, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(sender_pattern)
+               DO UPDATE SET tier = excluded.tier,
+                             source = excluded.source,
+                             updated_at = excluded.updated_at""",
+            (sender_pattern.strip().lower(), tier.strip().lower(), source[:32], now),
+        )
+        self.conn.commit()
+
+    def get_sender_tier(self, sender_pattern: str) -> str | None:
+        """Look up the tier for a single sender pattern. Returns None if not set."""
+        row = self.conn.execute(
+            "SELECT tier FROM sender_tiers WHERE sender_pattern = ?",
+            (sender_pattern.strip().lower(),),
+        ).fetchone()
+        return row["tier"] if row else None
+
+    def get_sender_tiers(self) -> list[dict]:
+        """Return all non-normal sender tier overrides."""
+        rows = self.conn.execute(
+            "SELECT sender_pattern, tier, source, updated_at "
+            "FROM sender_tiers WHERE tier != 'normal' ORDER BY updated_at DESC"
+        ).fetchall()
+        return [
+            {
+                "sender_pattern": r["sender_pattern"],
+                "tier": r["tier"],
+                "source": r["source"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def get_triage_context_signals(self, limit: int = 20) -> dict:
+        """Aggregate sender tiers + frequently dismissed senders for triage prompt."""
+        tiers = self.get_sender_tiers()
+
+        # Find senders dismissed 2+ times
+        dismissed_rows = self.conn.execute(
+            """SELECT sender_pattern, COUNT(*) as cnt
+               FROM preference_signals
+               WHERE signal_type = 'dismissive_feedback'
+                 AND sender_pattern IS NOT NULL
+                 AND sender_pattern != ''
+               GROUP BY sender_pattern
+               HAVING cnt >= 2
+               ORDER BY cnt DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        dismissed = [
+            {"sender_pattern": r["sender_pattern"], "dismissals": r["cnt"]}
+            for r in dismissed_rows
+        ]
+
+        return {"sender_tiers": tiers, "dismissed_senders": dismissed}
 
     def log_skill_gap(
         self,
