@@ -38,6 +38,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Track F Pre-Prod Audit (`scripts/run_preprod_readiness_audit.py`) | Report-first rollout checks before production promotion |
 | Self-Improvement Engine (`self_improve.py`) | Guarded self-edit loop (branch, tests, approval, rollback/restart) |
 | Skill Analytics (`skill_analytics.py`) | Skill gap telemetry, underperformance detection, gap clustering |
+| Triage Pre-Filter (`memory/triage.py`) | Deterministic sender/subject filtering + channel-aware LLM prompts |
 
 ## Project Structure
 
@@ -58,7 +59,7 @@ molly/
 ├── database.py          # SQLite message store
 ├── agent.py             # Claude Agent SDK wrapper, sub-agents, identity loading
 ├── approval.py          # Action approval flow (WhatsApp yes/no)
-├── commands.py          # /help, /clear, /memory, /graph, /forget, /status
+├── commands.py          # /help, /clear, /memory, /graph, /forget, /status, /upgrade, /mute, /tiers
 ├── heartbeat.py         # Proactive check-in + iMessage/email monitoring + skill hot-reload
 ├── automations.py       # YAML-based proactive automation engine
 ├── automation_triggers.py # Trigger types (schedule, event, email, message, etc.)
@@ -80,11 +81,11 @@ molly/
 │   └── grok.py          # Grok reasoning MCP tool (xAI API)
 └── memory/
     ├── embeddings.py    # EmbeddingGemma-300M wrapper
-    ├── vectorstore.py   # sqlite-vec backed vector store + preference/self-improve logs
+    ├── vectorstore.py   # sqlite-vec backed vector store + preference/self-improve logs + sender tiers
     ├── retriever.py     # Pre-query: semantic search + graph lookup
     ├── processor.py     # Post-response: embed, extract, store
     ├── extractor.py     # GLiNER2 entity/relation/classification
-    ├── triage.py        # Local Qwen3 message triage
+    ├── triage.py        # Local Qwen3 message triage + deterministic pre-filter + sender tiers
     ├── dedup.py         # Shared dedup engine used by maintenance + health
     ├── issue_registry.py # Persistent issue/event registry + notification cooldown
     └── graph.py         # Neo4j client + Cypher queries
@@ -150,6 +151,9 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Recent Updates (February 2026)
 
+- Added triage quality overhaul: deterministic pre-filter skips the local model for automated senders, transactional subjects, and known sender tiers. Channel-aware system prompts (email/iMessage/group) replace the generic classifier. Email prompt is aggressively noise-biased — only real humans writing directly to Brian get through.
+- Added sender tier management: `/upgrade`, `/downgrade`, `/mute`, `/tiers` commands let Brian manually control sender classification. Tiers persist in `sender_tiers` SQLite table and feed into both the pre-filter and LLM context.
+- Added preference signal feedback loop: dismissed sender patterns (2+ dismissals) are now injected into triage context, biasing the model toward noise for repeatedly dismissed senders.
 - Added skill gap telemetry (`skill_analytics.py`): per-turn tool call logging, gap clustering, underperformance detection, and automatic proposal pipeline into self-improvement.
 - Added skill hot-reload: heartbeat checks for skill file changes each cycle, swaps cache atomically, rolls back malformed files.
 - Added skill lifecycle with pending approval flow: self-improvement can propose new skills or edits, owner approves/rejects via WhatsApp, rejections enter 30-day cooldown.
@@ -169,9 +173,21 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 - Added promotion contract/drift gates in workspace `promote-tool.py` (`validate`, `promote --dry-run`, force override with reason).
 - Added `scripts/run_molly.sh` supervisor for restart-safe runtime operation.
 
-## Preference Signals
+## Preference Signals & Sender Tiers
 
-Passive feedback logging for learning loops. When the owner dismisses a surfaced notification (e.g., "not important", "who cares", "stop sending"), the dismissal is logged with the source, summary, and sender pattern. Accumulated signals feed into nightly maintenance assessments and skill gap detection.
+Passive feedback logging for learning loops. When the owner dismisses a surfaced notification (e.g., "not important", "who cares", "stop sending"), the dismissal is logged with the source, summary, and sender pattern. Accumulated signals feed into nightly maintenance assessments, skill gap detection, and triage prompt context (senders dismissed 2+ times are flagged as likely noise).
+
+**Sender tiers** let Brian manually override triage behavior for specific senders:
+
+| Tier | Effect | Set via |
+|------|--------|---------|
+| `vip` | Always urgent (skips model) | `upsert_sender_tier()` with tier="vip" |
+| `upgraded` | Always relevant (skips model) | `/upgrade <sender>` |
+| `downgraded` | Always background (skips model) | `/downgrade <sender>` |
+| `muted` | Always noise (skips model) | `/mute <sender>` |
+| `normal` | Falls through to model | Default / reset |
+
+Config VIP contacts (`MOLLY_VIP_CONTACTS` env var) are checked first and always classify as urgent.
 
 ## Skills
 
@@ -232,6 +248,10 @@ Default posture is report-first (`MOLLY_TRACK_F_REPORT_ONLY=true`) so rollout sa
 /commitments          Alias for /followups
 /health               Show latest health report (or generate one)
 /health history       Show 7-day health trend
+/upgrade <sender>     Mark sender as upgraded (bias toward relevant)
+/downgrade <sender>   Mark sender as downgraded (bias toward background)
+/mute <sender>        Mute sender (always classified as noise)
+/tiers                List all sender tier overrides + config VIPs
 ```
 
 ## Running
