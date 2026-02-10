@@ -36,6 +36,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Contract Audit (`contract_audit.py`) | Nightly/weekly deterministic contracts + optional LLM audit layer |
 | Track F Pre-Prod Audit (`scripts/run_preprod_readiness_audit.py`) | Report-first rollout checks before production promotion |
 | Self-Improvement Engine (`self_improve.py`) | Guarded self-edit loop (branch, tests, approval, rollback/restart) |
+| Skill Analytics (`skill_analytics.py`) | Skill gap telemetry, underperformance detection, gap clustering |
 
 ## Project Structure
 
@@ -50,17 +51,18 @@ molly/
 ├── foundry_adapter.py   # Foundry observation signal adapter for self-improvement
 ├── health_remediation.py # Health signal routing policy (auto-fix/propose/escalate)
 ├── self_improve.py      # Self-improvement engine (guarded self-edit loop)
+├── skill_analytics.py   # Skill gap telemetry, underperformance detection
 ├── web.py               # FastAPI web UI backend (WebSocket chat)
 ├── terminal.py          # Standalone CLI REPL for debugging
 ├── database.py          # SQLite message store
 ├── agent.py             # Claude Agent SDK wrapper, sub-agents, identity loading
 ├── approval.py          # Action approval flow (WhatsApp yes/no)
 ├── commands.py          # /help, /clear, /memory, /graph, /forget, /status
-├── heartbeat.py         # Proactive check-in + iMessage/email monitoring
+├── heartbeat.py         # Proactive check-in + iMessage/email monitoring + skill hot-reload
 ├── automations.py       # YAML-based proactive automation engine
 ├── automation_triggers.py # Trigger types (schedule, event, email, message, etc.)
 ├── maintenance.py       # Nightly maintenance (direct Python, no SDK tools)
-├── skills.py            # Dynamic skill trigger matching + loading
+├── skills.py            # Dynamic skill trigger matching, hot-reload, lifecycle
 ├── scripts/
 │   ├── run_molly.sh     # Supervisor loop with restart-on-exit-code support
 │   └── run_preprod_readiness_audit.py # Track F pre-prod gate/report generator
@@ -147,6 +149,11 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Recent Updates (February 2026)
 
+- Added skill gap telemetry (`skill_analytics.py`): per-turn tool call logging, gap clustering, underperformance detection, and automatic proposal pipeline into self-improvement.
+- Added skill hot-reload: heartbeat checks for skill file changes each cycle, swaps cache atomically, rolls back malformed files.
+- Added skill lifecycle with pending approval flow: self-improvement can propose new skills or edits, owner approves/rejects via WhatsApp, rejections enter 30-day cooldown.
+- Added YAML-first trigger contract parsing alongside legacy `## Trigger` format, with mixed-mode precedence and dedup.
+- Expanded self-improvement engine with skill gap proposals, failure diagnostic tool generation, workflow pattern detection, and Foundry signal integration.
 - Added guarded self-improvement workflows in `self_improve.py`: proposal drafting, branch/test gates, owner approval, deploy restart, and post-deploy rollback checks.
 - Added Health Doctor in `health.py` with startup preflight snapshots, daily reports, and green→red regression detection.
 - Added health remediation routing + issue registry persistence (`health_remediation.py`, `memory/issue_registry.py`) to separate observe/auto-fix/escalate behavior and avoid repeat alert spam.
@@ -163,15 +170,21 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Preference Signals
 
-Passive feedback logging for future learning loops. When the owner dismisses a surfaced notification (e.g., "not important", "who cares", "stop sending"), the dismissal is logged with the source, summary, and sender pattern. Nothing acts on these signals yet — Phase 7 will close the loop.
+Passive feedback logging for learning loops. When the owner dismisses a surfaced notification (e.g., "not important", "who cares", "stop sending"), the dismissal is logged with the source, summary, and sender pattern. Accumulated signals feed into nightly maintenance assessments and skill gap detection.
 
 ## Skills
 
 Markdown skill files in `~/.molly/workspace/skills/` with trigger patterns parsed dynamically from:
 - YAML front matter `triggers:` lists
-- legacy `## Trigger` quoted phrases/commands
+- Legacy `## Trigger` quoted phrases/commands
 
 Matched skills inject their instructions into the system prompt for that turn. This keeps runtime matching compatible with both old and new skill authoring formats.
+
+**Hot-reload:** The heartbeat checks for skill file changes every cycle. Modified or new skills are picked up without restart; malformed files roll back to the previous state.
+
+**Skill lifecycle:** The self-improvement engine can propose new skills or edits to existing skills. Proposals go through owner approval via WhatsApp before activation. Rejected proposals enter a 30-day cooldown.
+
+**Skill gap analytics:** Tool call patterns are logged per-turn. `skill_analytics.py` clusters repeated tool sequences that lack a matching skill, surfaces underperforming skills, and feeds gap candidates into the self-improvement proposal pipeline.
 
 ## Pre-Prod Readiness Audit
 
@@ -276,6 +289,7 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - [x] Phase 4: Multi-channel (Web UI, Terminal REPL, Email monitoring)
 - [x] Phase 5: Sub-agents, model routing, audit hardening
 - [x] Phase 6: Proactive automation engine, preference signal logging, Grok x_search
-- [ ] Phase 7: Learning loops (in progress: preference signals, health doctor, automation proposal mining)
-- [ ] Phase 8: Collaboration
-- [ ] Phase 9: Self-improvement (in progress: guarded self-edit + restart/rollback path)
+- [x] Phase 7: Learning loops (preference signals, health doctor, automation proposal mining, entity dedup)
+- [x] Phase 8: Self-improvement (guarded self-edit, skill lifecycle, skill gap analytics, hot-reload)
+- [ ] Phase 9: Email triage overhaul (deterministic 3-tier classification, digest scheduling)
+- [ ] Phase 10: Collaboration
