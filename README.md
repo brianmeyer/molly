@@ -30,6 +30,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | GLiNER2 | Entity + relationship extraction (DeBERTa-large) |
 | Neo4j | Layer 3: knowledge graph |
 | Qwen3-4B GGUF (`llama-cpp-python`) | Local triage model for message classification |
+| apple-mcp (`bunx`) | Contacts, Notes, Messages (send), Mail, Calendar, Maps |
 | Kimi K2.5 (Moonshot) | External research model via MCP tool |
 | Grok (xAI) | External reasoning model via MCP tool |
 | Health Doctor (`health.py`) | Daily/preflight health reports with regression checks |
@@ -272,6 +273,7 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 
 - Python 3.12
 - Docker (for Neo4j)
+- Node.js / Bun (`bunx` for apple-mcp)
 - Claude Max subscription (for Claude Agent SDK)
 - HuggingFace account (for gated EmbeddingGemma model)
 - `llama-cpp-python` (for local triage)
