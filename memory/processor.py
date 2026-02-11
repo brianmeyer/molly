@@ -71,7 +71,7 @@ async def embed_and_store(
     active conversations (combined user+assistant chunks).
     """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         vec = await loop.run_in_executor(None, embed, content)
         vs = get_vectorstore()
         chunk_id = vs.store_chunk(
@@ -98,7 +98,7 @@ async def batch_embed_and_store(
     if not texts:
         return 0
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         vecs = await loop.run_in_executor(None, embed_batch, texts)
         vs = get_vectorstore()
         chunks = [
@@ -123,7 +123,7 @@ async def extract_to_graph(
         from memory.extractor import extract
         from memory import graph
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, extract, content)
         entities = _filter_entities(result["entities"])
         relations = _filter_relations(result["relations"])
@@ -181,8 +181,11 @@ async def process_conversation(
     Called from agent.py after Molly responds.
     """
     chunk_text = f"User: {user_msg}\nMolly: {assistant_msg}"
-    await embed_and_store(chunk_text, chat_jid, source)
-    await extract_to_graph(chunk_text, chat_jid, source)
+    # Run embed and graph extraction concurrently (no data dependency)
+    await asyncio.gather(
+        embed_and_store(chunk_text, chat_jid, source),
+        extract_to_graph(chunk_text, chat_jid, source),
+    )
     _append_daily_log(user_msg, assistant_msg, chat_jid)
 
 
@@ -209,11 +212,12 @@ def _append_daily_log(user_msg: str, assistant_msg: str, chat_jid: str):
             entry += "..."
         entry += "\n"
 
-        if not log_path.exists():
-            log_path.write_text(f"# Daily Log — {today}\n\n{entry}\n")
-        else:
-            with open(log_path, "a") as f:
-                f.write(f"{entry}\n")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            # If file is empty/new, write the header first
+            if f.tell() == 0:
+                f.write(f"# Daily Log — {today}\n\n")
+            f.write(f"{entry}\n")
 
         log.debug("Appended to daily log: %s", log_path.name)
     except Exception:

@@ -1,5 +1,6 @@
 import logging
 import math
+import threading
 import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -12,6 +13,7 @@ import config
 log = logging.getLogger(__name__)
 
 _driver = None
+_driver_lock = threading.Lock()
 
 VALID_REL_TYPES = {
     "WORKS_ON", "WORKS_AT", "KNOWS", "USES", "LOCATED_IN",
@@ -26,33 +28,38 @@ VALID_REL_TYPES = {
 
 
 def get_driver():
-    """Lazy-initialize the Neo4j driver and create indexes."""
+    """Lazy-initialize the Neo4j driver and create indexes (thread-safe)."""
     global _driver
-    if _driver is None:
-        _driver = GraphDatabase.driver(
-            config.NEO4J_URI,
-            auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
-        )
-        with _driver.session() as session:
-            session.run(
-                "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
+    if _driver is not None:
+        return _driver
+    with _driver_lock:
+        if _driver is None:
+            drv = GraphDatabase.driver(
+                config.NEO4J_URI,
+                auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
             )
-            session.run(
-                "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)"
-            )
-            session.run(
-                "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
-            )
-        log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
+            with drv.session() as session:
+                session.run(
+                    "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
+                )
+                session.run(
+                    "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)"
+                )
+                session.run(
+                    "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
+                )
+            _driver = drv
+            log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
     return _driver
 
 
 def close():
     global _driver
-    if _driver:
-        _driver.close()
-        _driver = None
-        log.info("Neo4j driver closed")
+    with _driver_lock:
+        if _driver:
+            _driver.close()
+            _driver = None
+            log.info("Neo4j driver closed")
 
 
 # --- Strength / decay ---
@@ -333,30 +340,85 @@ def query_entity(name: str) -> dict[str, Any] | None:
 def query_entities_for_context(entity_names: list[str]) -> str:
     """Query Neo4j for multiple entities and format for system prompt injection.
 
+    Uses batched Cypher queries with UNWIND to minimize round-trips.
     Returns formatted string or empty string if no graph context found.
     """
     if not entity_names:
         return ""
 
-    results = []
-    seen = set()
+    driver = get_driver()
+    normalized_names = [_normalize(name) for name in entity_names]
 
-    for name in entity_names:
-        entity = query_entity(name)
-        if entity and entity["name"] not in seen:
-            seen.add(entity["name"])
-            results.append(entity)
+    with driver.session() as session:
+        # Batch query: find all matching entities in one round-trip
+        entity_result = session.run(
+            """UNWIND $names AS lookup_name
+               MATCH (e:Entity)
+               WHERE toLower(e.name) = lookup_name
+                  OR ANY(a IN e.aliases WHERE toLower(a) = lookup_name)
+               RETURN DISTINCT e.name AS name, e.entity_type AS entity_type,
+                      e.mention_count AS mention_count,
+                      e.last_mentioned AS last_mentioned""",
+            names=normalized_names,
+        )
+        entities_by_name: dict[str, dict] = {}
+        for rec in entity_result:
+            name = rec["name"]
+            if name not in entities_by_name:
+                entities_by_name[name] = {
+                    "name": name,
+                    "entity_type": rec["entity_type"],
+                    "mention_count": rec["mention_count"],
+                    "last_mentioned": rec["last_mentioned"] or "",
+                    "relationships": [],
+                }
 
-    if not results:
-        return ""
+        if not entities_by_name:
+            return ""
 
+        found_names = list(entities_by_name.keys())
+
+        # Batch query: all outgoing relationships for found entities
+        rels_out = session.run(
+            """UNWIND $names AS ename
+               MATCH (e:Entity {name: ename})-[r]->(t:Entity)
+               RETURN e.name AS entity_name, type(r) AS rel_type, t.name AS target""",
+            names=found_names,
+        )
+        for rec in rels_out:
+            ent = entities_by_name.get(rec["entity_name"])
+            if ent:
+                ent["relationships"].append({
+                    "type": rec["rel_type"],
+                    "target": rec["target"],
+                    "direction": "outgoing",
+                })
+
+        # Batch query: all incoming relationships for found entities
+        rels_in = session.run(
+            """UNWIND $names AS ename
+               MATCH (s:Entity)-[r]->(e:Entity {name: ename})
+               RETURN e.name AS entity_name, type(r) AS rel_type, s.name AS source""",
+            names=found_names,
+        )
+        for rec in rels_in:
+            ent = entities_by_name.get(rec["entity_name"])
+            if ent:
+                ent["relationships"].append({
+                    "type": rec["rel_type"],
+                    "source": rec["source"],
+                    "direction": "incoming",
+                })
+
+    # Format output
+    results = list(entities_by_name.values())
     lines = ["<!-- Memory Context (knowledge graph) -->"]
     lines.append("Known entities and relationships:\n")
 
     for ent in results:
         etype = ent.get("entity_type", "Unknown")
         mentions = ent.get("mention_count", 0)
-        last = ent.get("last_mentioned", "")[:10]
+        last = str(ent.get("last_mentioned", ""))[:10]
         lines.append(f"- **{ent['name']}** ({etype}, {mentions} mentions, last: {last})")
 
         for rel in ent.get("relationships", []):

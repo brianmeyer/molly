@@ -1,10 +1,12 @@
 import logging
+import threading
 import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _model = None
+_model_lock = threading.Lock()
 
 # Description-enriched entity types for conversational text
 ENTITY_SCHEMA = {
@@ -122,12 +124,15 @@ MESSAGE_LABELS = {
 def _get_model():
     """Lazy-load the GLiNER2 model (unified NER + relations + classification)."""
     global _model
-    if _model is None:
-        from gliner2 import GLiNER2
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            from gliner2 import GLiNER2
 
-        log.info("Loading GLiNER2 model (fastino/gliner2-large-v1)...")
-        _model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
-        log.info("GLiNER2 model loaded.")
+            log.info("Loading GLiNER2 model (fastino/gliner2-large-v1)...")
+            _model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
+            log.info("GLiNER2 model loaded.")
     return _model
 
 

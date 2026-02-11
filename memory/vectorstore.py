@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import threading
+
 import sqlite_vec
 
 from memory.issue_registry import ensure_issue_registry_tables
@@ -26,11 +28,17 @@ class VectorStore:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.conn: sqlite3.Connection | None = None
+        self._write_lock = threading.Lock()
 
     def initialize(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
+        # WAL mode allows concurrent readers + single writer without blocking
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.enable_load_extension(True)
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
@@ -161,19 +169,20 @@ class VectorStore:
         chunk_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
-        self.conn.execute(
-            """
-            INSERT INTO conversation_chunks
-                (id, content, created_at, source, chat_jid, topic_tags, entity_refs)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (chunk_id, content, now, source, chat_jid, topic_tags, entity_refs),
-        )
-        self.conn.execute(
-            "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
-            (chunk_id, _serialize_float32(embedding)),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                """
+                INSERT INTO conversation_chunks
+                    (id, content, created_at, source, chat_jid, topic_tags, entity_refs)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, content, now, source, chat_jid, topic_tags, entity_refs),
+            )
+            self.conn.execute(
+                "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                (chunk_id, _serialize_float32(embedding)),
+            )
+            self.conn.commit()
         return chunk_id
 
     def store_chunks_batch(
@@ -191,24 +200,25 @@ class VectorStore:
         chunk_ids = []
         now = datetime.now(timezone.utc).isoformat()
 
-        for chunk in chunks:
-            chunk_id = str(uuid.uuid4())
-            chunk_ids.append(chunk_id)
-            self.conn.execute(
-                """
-                INSERT INTO conversation_chunks
-                    (id, content, created_at, source, chat_jid, topic_tags, entity_refs)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (chunk_id, chunk["content"], now, chunk["source"],
-                 chunk["chat_jid"], "", ""),
-            )
-            self.conn.execute(
-                "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
-                (chunk_id, _serialize_float32(chunk["embedding"])),
-            )
+        with self._write_lock:
+            for chunk in chunks:
+                chunk_id = str(uuid.uuid4())
+                chunk_ids.append(chunk_id)
+                self.conn.execute(
+                    """
+                    INSERT INTO conversation_chunks
+                        (id, content, created_at, source, chat_jid, topic_tags, entity_refs)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (chunk_id, chunk["content"], now, chunk["source"],
+                     chunk["chat_jid"], "", ""),
+                )
+                self.conn.execute(
+                    "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                    (chunk_id, _serialize_float32(chunk["embedding"])),
+                )
 
-        self.conn.commit()
+            self.conn.commit()
         log.debug("Batch stored %d chunks in single transaction", len(chunk_ids))
         return chunk_ids
 
@@ -259,13 +269,14 @@ class VectorStore:
         """Log a tool call to operational memory."""
         call_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            """INSERT INTO tool_calls
-               (id, tool_name, parameters, success, latency_ms, error_message, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (call_id, tool_name, parameters[:500], int(success), latency_ms, error_message, now),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                """INSERT INTO tool_calls
+                   (id, tool_name, parameters, success, latency_ms, error_message, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (call_id, tool_name, parameters[:500], int(success), latency_ms, error_message, now),
+            )
+            self.conn.commit()
 
     def log_preference_signal(
         self,
@@ -287,23 +298,24 @@ class VectorStore:
             },
             ensure_ascii=True,
         )
-        self.conn.execute(
-            """INSERT INTO preference_signals
-               (id, signal_type, source, surfaced_summary, sender_pattern, owner_feedback, context, timestamp, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                signal_id,
-                signal_type,
-                source[:32],
-                surfaced_summary[:1000],
-                sender_pattern[:500],
-                owner_feedback[:500],
-                context[:2000],
-                now,
-                now,
-            ),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                """INSERT INTO preference_signals
+                   (id, signal_type, source, surfaced_summary, sender_pattern, owner_feedback, context, timestamp, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    signal_id,
+                    signal_type,
+                    source[:32],
+                    surfaced_summary[:1000],
+                    sender_pattern[:500],
+                    owner_feedback[:500],
+                    context[:2000],
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
 
     def log_skill_gap(
         self,
@@ -315,20 +327,21 @@ class VectorStore:
         """Log a missing-skill candidate based on turn-level workflow activity."""
         now = datetime.now(timezone.utc).isoformat()
         tools_payload = json.dumps(tools_used, ensure_ascii=True)
-        cursor = self.conn.execute(
-            """INSERT INTO skill_gaps
-               (user_message, tools_used, session_id, created_at, addressed)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                user_message[:4000],
-                tools_payload[:4000],
-                session_id[:200],
-                now,
-                int(bool(addressed)),
-            ),
-        )
-        self.conn.commit()
-        return int(cursor.lastrowid)
+        with self._write_lock:
+            cursor = self.conn.execute(
+                """INSERT INTO skill_gaps
+                   (user_message, tools_used, session_id, created_at, addressed)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    user_message[:4000],
+                    tools_payload[:4000],
+                    session_id[:200],
+                    now,
+                    int(bool(addressed)),
+                ),
+            )
+            self.conn.commit()
+            return int(cursor.lastrowid)
 
     def chunk_count(self) -> int:
         cursor = self.conn.execute("SELECT COUNT(*) FROM conversation_chunks")
@@ -344,21 +357,22 @@ class VectorStore:
     ):
         execution_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            """INSERT INTO skill_executions
-               (id, skill_name, trigger, outcome, user_approval, edits_made, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                execution_id,
-                skill_name[:200],
-                trigger[:500],
-                outcome[:1000],
-                user_approval[:200],
-                edits_made[:1000],
-                now,
-            ),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                """INSERT INTO skill_executions
+                   (id, skill_name, trigger, outcome, user_approval, edits_made, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    execution_id,
+                    skill_name[:200],
+                    trigger[:500],
+                    outcome[:1000],
+                    user_approval[:200],
+                    edits_made[:1000],
+                    now,
+                ),
+            )
+            self.conn.commit()
 
     def log_correction(
         self,
@@ -369,20 +383,21 @@ class VectorStore:
     ):
         correction_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            """INSERT INTO corrections
-               (id, context, molly_output, user_correction, pattern, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                correction_id,
-                context[:2000],
-                molly_output[:2000],
-                user_correction[:2000],
-                pattern[:200],
-                now,
-            ),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                """INSERT INTO corrections
+                   (id, context, molly_output, user_correction, pattern, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    correction_id,
+                    context[:2000],
+                    molly_output[:2000],
+                    user_correction[:2000],
+                    pattern[:200],
+                    now,
+                ),
+            )
+            self.conn.commit()
 
     def log_self_improvement_event(
         self,
@@ -394,22 +409,23 @@ class VectorStore:
     ) -> str:
         event_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            """INSERT INTO self_improvement_events
-               (id, event_type, category, title, payload, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                event_id,
-                event_type[:64],
-                category[:64],
-                title[:200],
-                payload[:10000],
-                status[:32],
-                now,
-                now,
-            ),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                """INSERT INTO self_improvement_events
+                   (id, event_type, category, title, payload, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    event_type[:64],
+                    category[:64],
+                    title[:200],
+                    payload[:10000],
+                    status[:32],
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
         return event_id
 
     def update_self_improvement_event_status(
@@ -418,11 +434,12 @@ class VectorStore:
         status: str,
     ):
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "UPDATE self_improvement_events SET status = ?, updated_at = ? WHERE id = ?",
-            (status[:32], now, event_id),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE self_improvement_events SET status = ?, updated_at = ? WHERE id = ?",
+                (status[:32], now, event_id),
+            )
+            self.conn.commit()
 
     def close(self):
         if self.conn:
