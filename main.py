@@ -347,6 +347,8 @@ class Molly:
         self.self_improvement = SelfImprovementEngine(self)
         self._automation_tick_task: asyncio.Task | None = None
         self._self_improve_tick_task: asyncio.Task | None = None
+        self._imessage_mention_task: asyncio.Task | None = None
+        self._last_imessage_mention_check: datetime | None = None
         self.exit_code = 0
 
     # --- State persistence ---
@@ -892,6 +894,17 @@ class Molly:
             return f"{owner_id}@s.whatsapp.net"
         return None
 
+    def _should_check_imessage_mentions(self) -> bool:
+        """Check if it's time to poll for @molly mentions in iMessages."""
+        now = datetime.now()
+        hour = now.hour
+        if hour < config.ACTIVE_HOURS[0] or hour >= config.ACTIVE_HOURS[1]:
+            return False
+        if self._last_imessage_mention_check is None:
+            return True
+        elapsed = (now - self._last_imessage_mention_check).total_seconds()
+        return elapsed >= config.IMESSAGE_MENTION_POLL_INTERVAL
+
     async def _selective_extract(self, content: str, chat_jid: str):
         """L3: Selective extraction for listen-only chats.
 
@@ -1085,6 +1098,25 @@ class Molly:
                             name="heartbeat",
                         )
                         task.add_done_callback(_task_done_callback)
+                    # Fast poll: iMessage @molly mentions (every 60s)
+                    if (
+                        self._imessage_mention_task is None
+                        or self._imessage_mention_task.done()
+                    ):
+                        if self._should_check_imessage_mentions():
+                            self._last_imessage_mention_check = datetime.now()
+                            from heartbeat import _check_imessage_mentions
+                            self._imessage_mention_task = asyncio.create_task(
+                                self._run_with_timeout(
+                                    _check_imessage_mentions(self),
+                                    "imessage-mentions",
+                                    timeout=config.APPROVAL_TIMEOUT + 120,
+                                ),
+                                name="imessage-mentions",
+                            )
+                            self._imessage_mention_task.add_done_callback(
+                                _task_done_callback
+                            )
                     if should_run_maintenance(self.last_maintenance):
                         self.last_maintenance = datetime.now()
                         task = asyncio.create_task(
