@@ -95,6 +95,9 @@ async def run_heartbeat(molly):
         log.debug("No owner DM JID available for heartbeat")
         return
 
+    # Check for due commitments and send reminders
+    await _check_due_commitments(molly, chat_jid)
+
     # Phase 3D: proactive skills — only run if enabled in HEARTBEAT_SKILLS
     if "daily-digest" in skills.HEARTBEAT_SKILLS:
         await _check_morning_digest(molly, chat_jid)
@@ -143,6 +146,152 @@ async def run_heartbeat(molly):
             log.info("Heartbeat: nothing to report")
     except Exception:
         log.error("Heartbeat failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Commitment delivery: nudge for due/overdue commitments
+# ---------------------------------------------------------------------------
+
+# How long after sending a nudge before we send another for the same commitment.
+_NUDGE_COOLDOWN_S = 3600  # 1 hour
+
+# How old a dateless commitment must be before we surface it.
+_DATELESS_STALE_HOURS = 24
+
+
+def _in_quiet_hours(now_local) -> bool:
+    """Return True if now_local falls within configured quiet hours."""
+    from datetime import time as _time
+
+    try:
+        sh, sm = config.QUIET_HOURS_START.split(":")
+        eh, em = config.QUIET_HOURS_END.split(":")
+        start = _time(int(sh), int(sm))
+        end = _time(int(eh), int(em))
+    except (ValueError, AttributeError):
+        return False
+
+    t = now_local.time().replace(second=0, microsecond=0)
+    if start <= end:
+        return start <= t < end
+    # Wraps midnight, e.g. 22:00 -> 07:00
+    return t >= start or t < end
+
+
+async def _check_due_commitments(molly, chat_jid: str):
+    """Send WhatsApp nudges for commitments that are due or overdue."""
+    engine = getattr(molly, "automations", None)
+    if engine is None:
+        return
+    try:
+        from datetime import timezone as _tz
+        from zoneinfo import ZoneInfo
+
+        now_utc = datetime.now(_tz.utc)
+        now_local = now_utc.astimezone(ZoneInfo(config.TIMEZONE))
+
+        # Respect quiet hours — don't nudge while the user is sleeping.
+        if _in_quiet_hours(now_local):
+            log.debug("Skipping commitment nudges during quiet hours")
+            return
+
+        # Read commitment state through the engine's state lock.
+        async with engine._state_lock:
+            tracker_state = engine._state.get("automations", {}).get("commitment-tracker", {})
+            commitments = tracker_state.get("commitments", [])
+            if not isinstance(commitments, list):
+                return
+
+        nudge_messages = []
+        for record in commitments:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("status", "open")).lower() != "open":
+                continue
+
+            # Skip if recently nudged
+            last_nudged = str(record.get("last_nudged_at", "")).strip()
+            if last_nudged:
+                try:
+                    nudged_dt = datetime.fromisoformat(last_nudged.replace("Z", "+00:00"))
+                    if nudged_dt.tzinfo is None:
+                        nudged_dt = nudged_dt.replace(tzinfo=_tz.utc)
+                    if (now_utc - nudged_dt).total_seconds() < _NUDGE_COOLDOWN_S:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            title = str(record.get("title", "(untitled)"))
+            due_at_raw = str(record.get("due_at", "")).strip()
+
+            if due_at_raw:
+                try:
+                    due_dt = datetime.fromisoformat(due_at_raw.replace("Z", "+00:00"))
+                    if due_dt.tzinfo is None:
+                        due_dt = due_dt.replace(tzinfo=_tz.utc)
+                    if due_dt <= now_utc:
+                        overdue_mins = int((now_utc - due_dt).total_seconds() / 60)
+                        if overdue_mins < 60:
+                            nudge_messages.append((record, f"Reminder: {title}"))
+                        else:
+                            hours = overdue_mins // 60
+                            nudge_messages.append((record, f"Overdue ({hours}h): {title}"))
+                except (ValueError, TypeError):
+                    pass
+            else:
+                # Dateless commitment: surface if older than _DATELESS_STALE_HOURS
+                created_raw = str(record.get("created_at", "")).strip()
+                if created_raw:
+                    try:
+                        created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                        if created_dt.tzinfo is None:
+                            created_dt = created_dt.replace(tzinfo=_tz.utc)
+                        age_hours = (now_utc - created_dt).total_seconds() / 3600
+                        if age_hours >= _DATELESS_STALE_HOURS:
+                            nudge_messages.append(
+                                (record, f"Needs attention (no due date, {int(age_hours)}h old): {title}")
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
+        if not nudge_messages:
+            return
+
+        # Mark nudged BEFORE sending so a crash during send doesn't cause
+        # duplicate nudges on the next heartbeat.
+        async with engine._state_lock:
+            tracker_state = engine._state.get("automations", {}).get("commitment-tracker", {})
+            all_commitments = tracker_state.get("commitments", [])
+            nudged_ids = {str(r.get("id", "")) for r, _ in nudge_messages}
+            changed = False
+            for record in all_commitments:
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("id", "")) in nudged_ids:
+                    record["last_nudged_at"] = now_utc.isoformat()
+                    record["updated_at"] = now_utc.isoformat()
+                    changed = True
+            if changed:
+                await engine._save_state_locked()
+
+        # Build a single combined nudge message
+        lines = ["Commitment reminders:"]
+        for _, msg in nudge_messages[:10]:  # Cap at 10 per heartbeat
+            lines.append(f"- {msg}")
+
+        _send_surface(
+            molly,
+            chat_jid,
+            "\n".join(lines),
+            source="commitment",
+            surfaced_summary=f"{len(nudge_messages)} commitment(s) due",
+            sender_pattern="heartbeat:commitments",
+        )
+
+        log.info("Sent %d commitment nudge(s) to %s", len(nudge_messages), chat_jid)
+
+    except Exception:
+        log.error("Commitment delivery check failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

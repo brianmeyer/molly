@@ -35,6 +35,19 @@ _COMMITMENT_REMINDERS_LIST = "Molly"
 _COMMITMENT_SYNC_INTERVAL_S = 300
 _COMMITMENT_RECORD_LIMIT = 300
 
+# Vague time words that should default to a sensible time instead of None.
+# Compiled as word-boundary patterns to prevent false positives like "sooner"
+# matching "soon".
+_VAGUE_TIME_PATTERNS = [
+    re.compile(r"\b" + re.escape(w) + r"\b", re.IGNORECASE)
+    for w in (
+        "later", "soon", "in a bit", "in a while", "at some point",
+        "eventually", "when i get a chance", "when you can",
+    )
+]
+_VAGUE_DEFAULT_HOUR = 19  # 7 PM local
+_VAGUE_FALLBACK_HOUR = 9  # 9 AM next day if past default hour
+
 _COMMITMENT_TITLE_PATTERNS = (
     re.compile(r"\bremind me to\s+(.+)$", flags=re.IGNORECASE),
     re.compile(r"\bi['’]?ll\s+(.+)$", flags=re.IGNORECASE),
@@ -44,9 +57,17 @@ _COMMITMENT_TITLE_PATTERNS = (
 
 _COMMITMENT_TRAILING_DUE_RE = re.compile(
     r"\s+\b(?:"
+    r"day\s+after\s+tomorrow|"
     r"today|tomorrow|tonight|"
-    r"this\s+(?:morning|afternoon|evening)|"
-    r"next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"later|soon|eventually|in a bit|in a while|at some point|"
+    r"when i get a chance|when you can|"
+    r"this\s+(?:morning|afternoon|evening|weekend)|"
+    r"next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)|"
+    r"end\s+of\s+(?:day|week)|"
+    r"after\s+(?:lunch|dinner|work)|"
+    r"before\s+(?:lunch|dinner|work|the\s+meeting)|"
+    r"in\s+(?:a\s+(?:few|couple)\s+(?:of\s+)?(?:hours?|minutes?|days?)|an?\s+(?:hour|minute|day)|\d+\s+(?:hours?|minutes?|days?))|"
+    r"(?:some\s*time\s+)?next\s+week|"
     r"by\s+(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2})|"
     r"on\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2})"
     r")(?:\b.*)?$",
@@ -221,7 +242,9 @@ def _extract_due_datetime(message_text: str, now_utc: datetime) -> datetime | No
             due_date = None
 
     if due_date is None:
-        if "tomorrow" in lowered:
+        if "day after tomorrow" in lowered:
+            due_date = now_local.date() + timedelta(days=2)
+        elif "tomorrow" in lowered:
             due_date = now_local.date() + timedelta(days=1)
         elif any(token in lowered for token in ("today", "tonight", "this morning", "this afternoon", "this evening")):
             due_date = now_local.date()
@@ -252,10 +275,78 @@ def _extract_due_datetime(message_text: str, now_utc: datetime) -> datetime | No
         due_date = now_local.date() if today_candidate > now_local else now_local.date() + timedelta(days=1)
 
     if due_date is None:
-        return None
+        # Check for vague time words like "later", "soon", etc.
+        if any(pat.search(lowered) for pat in _VAGUE_TIME_PATTERNS):
+            if now_local.hour < _VAGUE_DEFAULT_HOUR:
+                due_date = now_local.date()
+                hour, minute = _VAGUE_DEFAULT_HOUR, 0
+            else:
+                due_date = now_local.date() + timedelta(days=1)
+                hour, minute = _VAGUE_FALLBACK_HOUR, 0
+        else:
+            return None
 
     due_local = datetime.combine(due_date, time(hour=hour, minute=minute), tzinfo=tz)
-    return due_local.astimezone(timezone.utc)
+    due_utc = due_local.astimezone(timezone.utc)
+
+    # Past-time guard: if the computed datetime is in the past (e.g., "today at
+    # 3pm" when it's already 5pm), bump to the same time tomorrow so the
+    # reminder isn't immediately stale.
+    if due_utc <= now_utc:
+        next_day = due_local.date() + timedelta(days=1)
+        due_local = datetime.combine(next_day, time(hour=hour, minute=minute), tzinfo=tz)
+        due_utc = due_local.astimezone(timezone.utc)
+
+    return due_utc
+
+
+async def _extract_due_datetime_with_llm(
+    message_text: str, now_utc: datetime
+) -> datetime | None:
+    """Extract due datetime, falling back to the local LLM for natural language.
+
+    Tries the fast regex-based :func:`_extract_due_datetime` first.  When that
+    returns ``None`` (no recognised pattern), hands the text to Qwen3-4B for
+    interpretation of expressions like *"end of day"*, *"after lunch"*, or
+    *"this weekend"*.
+    """
+    result = _extract_due_datetime(message_text, now_utc)
+    if result is not None:
+        return result
+
+    # Regex found nothing — try local LLM for natural-language time expressions.
+    try:
+        from memory.triage import parse_time_local_async
+
+        tz = ZoneInfo(config.TIMEZONE)
+        now_local = now_utc.astimezone(tz)
+        llm_result = await parse_time_local_async(message_text, now_local)
+        if llm_result is None:
+            return None
+
+        # Past-time guard: if the LLM produced a time that's already passed
+        # (e.g., "end of day" at 9 PM → 5 PM today), bump to same time
+        # tomorrow so the reminder isn't immediately stale.
+        # Uses now_local.date() (not llm_local.date()) as the bump base so
+        # even hallucinated far-past dates get bumped to tomorrow.
+        if llm_result <= now_utc:
+            llm_local = llm_result.astimezone(tz)
+            next_day = now_local.date() + timedelta(days=1)
+            bumped = datetime.combine(
+                next_day,
+                time(hour=llm_local.hour, minute=llm_local.minute),
+                tzinfo=tz,
+            )
+            log.debug(
+                "LLM result %s is in the past; bumped to %s",
+                llm_result.isoformat(),
+                bumped.isoformat(),
+            )
+            return bumped.astimezone(timezone.utc)
+        return llm_result
+    except Exception:
+        log.debug("LLM time parsing failed, returning None", exc_info=True)
+        return None
 
 
 def _format_due_display(iso_value: str) -> str:
@@ -1135,7 +1226,7 @@ class AutomationEngine:
 
         now_utc = ended_at if ended_at.tzinfo else ended_at.replace(tzinfo=timezone.utc)
         title = _extract_commitment_title(message_text)
-        due_dt = _extract_due_datetime(message_text, now_utc)
+        due_dt = await _extract_due_datetime_with_llm(message_text, now_utc)
         due_iso = due_dt.isoformat() if due_dt else ""
 
         source_dt = _parse_payload_timestamp(trigger_payload.get("timestamp"), fallback=now_utc)
@@ -1210,7 +1301,9 @@ class AutomationEngine:
                 reminder_id = str(record.get("reminder_id", "")).strip()
                 if reminder_id and reminder_id in reminders_by_id:
                     reminder = reminders_by_id[reminder_id]
-                elif not reminder_id:
+                if reminder is None:
+                    # Fallback to title-based matching -- handles stale IDs from
+                    # the Apple Reminders -> Google Tasks migration and new tasks.
                     reminder = self._find_matching_reminder(reminders, str(record.get("title", "")))
 
                 if reminder is None:
@@ -1234,17 +1327,42 @@ class AutomationEngine:
                 await self._save_state_locked()
 
     async def _list_molly_reminders(self, include_completed: bool) -> list[dict]:
-        try:
-            from tools.reminders import list_reminders
+        """List tasks from the Google Tasks 'Molly' list.
 
-            rows = await asyncio.to_thread(
-                list_reminders,
-                _COMMITMENT_REMINDERS_LIST,
-                include_completed,
+        Falls back to an empty list if Google Tasks is unavailable.
+        """
+        try:
+            from tools.google_auth import get_tasks_service
+
+            service = get_tasks_service()
+            tasklist_id = await self._ensure_molly_tasklist(service)
+            if not tasklist_id:
+                return []
+
+            kwargs: dict[str, Any] = {"tasklist": tasklist_id, "maxResults": 100}
+            if not include_completed:
+                kwargs["showCompleted"] = False
+
+            result = await asyncio.to_thread(
+                lambda: service.tasks().list(**kwargs).execute()
             )
-            return [row for row in rows if isinstance(row, dict)]
-        except Exception:
-            log.debug("Failed to read Apple reminders", exc_info=True)
+            tasks = []
+            for t in result.get("items", []):
+                completed = t.get("status") == "completed"
+                tasks.append({
+                    "id": t.get("id", ""),
+                    "title": t.get("title", ""),
+                    "completed": completed,
+                    "due_at": t.get("due", ""),
+                    "completed_at": t.get("completed", ""),
+                    "notes": t.get("notes", ""),
+                })
+            return tasks
+        except Exception as exc:
+            # Invalidate cached list ID on 404 (list may have been deleted externally)
+            if "404" in str(exc) or "HttpError 404" in str(exc):
+                self._invalidate_tasklist_cache()
+            log.debug("Failed to read Google Tasks", exc_info=True)
             return []
 
     async def _create_commitment_reminder(
@@ -1254,49 +1372,76 @@ class AutomationEngine:
         source_note: str,
         owner_jid: str,
     ) -> dict | None:
-        approval_mgr = getattr(self.molly, "approvals", None) if self.molly else None
-        if not approval_mgr or not owner_jid:
-            log.info(
-                "Skipping reminder creation for '%s' because no approval channel is available",
-                title,
+        """Create a Google Task for the commitment.
+
+        Uses the Google Tasks API directly (no MCP approval needed) since
+        commitment-driven task creation is a safe, reversible, internal operation.
+        """
+        try:
+            from tools.google_auth import get_tasks_service
+
+            service = get_tasks_service()
+            tasklist_id = await self._ensure_molly_tasklist(service)
+            if not tasklist_id:
+                log.warning("Could not find or create Molly task list")
+                return None
+
+            body: dict[str, str] = {"title": title}
+            if source_note:
+                body["notes"] = source_note
+            if due_dt:
+                # Google Tasks API expects RFC 3339 date (truncated to midnight UTC)
+                body["due"] = due_dt.strftime("%Y-%m-%dT00:00:00.000Z")
+
+            task = await asyncio.to_thread(
+                lambda: service.tasks().insert(tasklist=tasklist_id, body=body).execute()
             )
+            log.info("Created Google Task '%s' (id=%s) for commitment", title, task.get("id"))
+            return {
+                "id": task.get("id", ""),
+                "title": task.get("title", ""),
+                "notes": task.get("notes", ""),
+                "due_at": task.get("due", ""),
+            }
+        except Exception as exc:
+            if "404" in str(exc) or "HttpError 404" in str(exc):
+                self._invalidate_tasklist_cache()
+            log.error("Failed creating Google Task for commitment", exc_info=True)
             return None
 
-        tool_input = {
-            "operation": "create",
-            "list": _COMMITMENT_REMINDERS_LIST,
-            "title": title,
-            "notes": source_note,
-        }
-        if due_dt:
-            tool_input["due_at"] = due_dt.isoformat()
+    def _invalidate_tasklist_cache(self):
+        """Clear the cached Molly task list ID (e.g. after a 404)."""
+        try:
+            delattr(self, "_molly_tasklist_id")
+        except AttributeError:
+            pass
+
+    async def _ensure_molly_tasklist(self, service) -> str | None:
+        """Get or create the 'Molly' task list. Returns the list ID or None."""
+        cache_key = "_molly_tasklist_id"
+        cached = getattr(self, cache_key, None)
+        if cached:
+            return cached
 
         try:
-            decision = await approval_mgr.request_tool_approval(
-                "reminders",
-                tool_input,
-                owner_jid,
-                self.molly,
+            result = await asyncio.to_thread(
+                lambda: service.tasklists().list(maxResults=100).execute()
             )
-        except Exception:
-            log.debug("Reminder approval request failed", exc_info=True)
-            return None
-        if decision is not True:
-            log.info("Reminder creation not approved for commitment '%s'", title)
-            return None
+            for tl in result.get("items", []):
+                if str(tl.get("title", "")).strip().lower() == _COMMITMENT_REMINDERS_LIST.lower():
+                    setattr(self, cache_key, tl["id"])
+                    return tl["id"]
 
-        try:
-            from tools.reminders import create_reminder
-
-            return await asyncio.to_thread(
-                create_reminder,
-                title,
-                source_note,
-                due_dt,
-                _COMMITMENT_REMINDERS_LIST,
+            # Create the list if it doesn't exist
+            new_list = await asyncio.to_thread(
+                lambda: service.tasklists().insert(body={"title": _COMMITMENT_REMINDERS_LIST}).execute()
             )
+            list_id = new_list.get("id")
+            setattr(self, cache_key, list_id)
+            log.info("Created Google Tasks list '%s' (id=%s)", _COMMITMENT_REMINDERS_LIST, list_id)
+            return list_id
         except Exception:
-            log.error("Failed creating Apple reminder for commitment", exc_info=True)
+            log.error("Failed to ensure Molly task list exists", exc_info=True)
             return None
 
     def _find_matching_reminder(self, reminders: list[dict], title: str) -> dict | None:
@@ -1422,8 +1567,13 @@ class AutomationEngine:
             record["reminder_title"] = reminder_title
             changed = True
         if due_at and due_at != str(record.get("due_at", "")):
-            record["due_at"] = due_at
-            changed = True
+            # Google Tasks truncates due dates to midnight UTC.  Don't overwrite
+            # a more-precise local value with a midnight stub from the API.
+            existing_due = str(record.get("due_at", "")).strip()
+            is_midnight_stub = "T00:00:00" in due_at
+            if not (existing_due and is_midnight_stub):
+                record["due_at"] = due_at
+                changed = True
 
         if bool(record.get("reminder_completed", False)) != completed:
             record["reminder_completed"] = completed
@@ -1465,7 +1615,7 @@ class AutomationEngine:
         ]
         active_commitments = sorted(active_commitments, key=lambda row: str(row.get("created_at", "")))
 
-        lines = [f"Commitments ({len(active_commitments)} internal active, {len(reminders)} Apple active)", ""]
+        lines = [f"Commitments ({len(active_commitments)} internal active, {len(reminders)} Google Tasks active)", ""]
         lines.append("Internal tracking:")
         if not active_commitments:
             lines.append("- No active internal commitments.")
@@ -1484,7 +1634,7 @@ class AutomationEngine:
                     lines.append(f"  Reminder: {reminder_title}")
 
         lines.append("")
-        lines.append(f"Apple Reminders list '{_COMMITMENT_REMINDERS_LIST}':")
+        lines.append(f"Google Tasks list '{_COMMITMENT_REMINDERS_LIST}':")
         if not reminders:
             lines.append("- No active reminders.")
         else:
