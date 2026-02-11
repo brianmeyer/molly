@@ -10,6 +10,7 @@ from datetime import date, timedelta
 from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
+    CLIJSONDecodeError,
     ClaudeSDKClient,
     ClaudeAgentOptions,
     CLIConnectionError,
@@ -493,13 +494,14 @@ def _iter_exceptions(exc: BaseException):
 
 def _is_recoverable_transport_error(exc: BaseException) -> bool:
     for item in _iter_exceptions(exc):
-        if isinstance(item, CLIConnectionError):
+        if isinstance(item, (CLIConnectionError, CLIJSONDecodeError)):
             return True
         message = str(item).lower()
         if (
             "stream closed" in message
             or "not ready for writing" in message
             or "processtransport" in message
+            or "buffer size" in message
         ):
             return True
     return False
@@ -568,6 +570,7 @@ async def _ensure_connected_runtime(
         cwd=str(config.WORKSPACE),
         stderr=_handle_sdk_stderr,
         can_use_tool=can_use_tool,
+        max_buffer_size=10 * 1024 * 1024,  # 10MB (default 1MB too small for long sessions)
     )
     if runtime.session_id:
         options.resume = runtime.session_id
