@@ -16,6 +16,7 @@ REQUIRED_NIGHTLY_STEPS = (
     "Strength decay",
     "Deduplication",
     "Orphan cleanup",
+    "Relationship audit",
     "Memory optimization",
     "Daily log pruning",
     "GLiNER loop",
@@ -429,7 +430,6 @@ async def _invoke_kimi(prompt: str) -> str:
             {"role": "system", "content": _MODEL_AUDIT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.1,
     }
     headers = {
         "Authorization": f"Bearer {config.MOONSHOT_API_KEY}",

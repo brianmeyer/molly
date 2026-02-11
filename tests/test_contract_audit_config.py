@@ -20,6 +20,7 @@ def _baseline_results() -> dict[str, str]:
         "Strength decay": "11 entities updated",
         "Deduplication": "3 entities merged",
         "Orphan cleanup": "2 orphans, 1 self-refs, 0 blocklisted",
+        "Relationship audit": "0 auto-fixed, 0 quarantined (pass)",
         "Memory optimization": "consolidated=0, stale=0, contradictions=0",
         "Daily log pruning": "4 logs archived",
         "GLiNER loop": "not-ready",
