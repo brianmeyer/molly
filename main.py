@@ -735,8 +735,10 @@ class Molly:
 
         # DMs and respond groups: always full processing, skip triage
         if chat_mode in ("owner_dm", "respond"):
-            await embed_and_store(content, chat_jid)
-            await extract_to_graph(content, chat_jid)
+            await asyncio.gather(
+                embed_and_store(content, chat_jid),
+                extract_to_graph(content, chat_jid),
+            )
             return
 
         # listen / store_only: triage first
@@ -758,8 +760,10 @@ class Molly:
 
         if result.classification == "urgent":
             # Notify Brian + full extraction
-            await embed_and_store(content, chat_jid)
-            await extract_to_graph(content, chat_jid)
+            await asyncio.gather(
+                embed_and_store(content, chat_jid),
+                extract_to_graph(content, chat_jid),
+            )
             # Send notification to Brian's DM
             owner_jid = self._get_owner_dm_jid()
             if owner_jid and self.wa:
@@ -779,8 +783,10 @@ class Molly:
                 )
 
         elif result.classification == "relevant":
-            await embed_and_store(content, chat_jid)
-            await extract_to_graph(content, chat_jid)
+            await asyncio.gather(
+                embed_and_store(content, chat_jid),
+                extract_to_graph(content, chat_jid),
+            )
 
         elif result.classification == "background":
             await embed_and_store(content, chat_jid)
