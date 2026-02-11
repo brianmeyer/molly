@@ -205,6 +205,14 @@ ACTION_TIERS = {
         # Google read-only (Phase 3B)
         "calendar_list", "calendar_get", "calendar_search",
         "gmail_search", "gmail_read",
+        # Google People (read-only)
+        "people_search", "people_get", "people_list",
+        # Google Tasks (read-only)
+        "tasks_list", "tasks_list_tasks",
+        # Google Drive (read-only)
+        "drive_search", "drive_get", "drive_read",
+        # Google Meet (read-only)
+        "meet_list", "meet_get", "meet_transcripts", "meet_recordings",
         # Apple read-only (Phase 3C)
         "contacts",
         "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
@@ -221,6 +229,8 @@ ACTION_TIERS = {
         # Google writes (Phase 3B)
         "gmail_send", "gmail_draft", "gmail_reply",
         "calendar_create", "calendar_update", "calendar_delete",
+        # Google Tasks writes
+        "tasks_create", "tasks_complete", "tasks_delete",
         # Apple MCP tools (mixed read/write operations)
         "reminders", "notes", "messages", "mail", "calendar", "maps",
     },
@@ -250,6 +260,10 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/meetings.space.readonly",
 ]
 
 # Apple local databases (Phase 3C)
