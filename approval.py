@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import os
 import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -83,6 +85,235 @@ def _get_operation(tool_input: dict[str, Any] | None) -> str | None:
     return op or None
 
 
+# ---------------------------------------------------------------------------
+# Bash command safety classification (BUG-08)
+# ---------------------------------------------------------------------------
+
+# Single-word commands that are always safe (read-only, no side effects)
+_SAFE_BASH_COMMANDS: frozenset[str] = frozenset({
+    # File reading
+    "cat", "head", "tail", "wc", "less", "more",
+    # Directory listing
+    "ls", "pwd", "tree",
+    # Search
+    "grep", "rg", "ag", "ack", "find", "which", "whereis", "type", "file",
+    # Text processing
+    "sort", "uniq", "cut", "tr", "diff", "comm",
+    # System info
+    "date", "whoami", "hostname", "uname", "env", "printenv",
+    "df", "du", "free", "uptime", "ps", "id", "groups", "stat",
+    # Utility
+    "echo", "printf", "jq", "yq",
+    "readlink", "realpath", "basename", "dirname",
+    "cal", "man", "help",
+    "true", "false", "test", "[",
+})
+
+# Multi-word command prefixes that are safe (read-only operations)
+_SAFE_BASH_PREFIXES: tuple[tuple[str, ...], ...] = (
+    # Git read-only
+    ("git", "status"),
+    ("git", "log"),
+    ("git", "diff"),
+    ("git", "show"),
+    ("git", "branch"),
+    ("git", "tag"),
+    ("git", "remote"),
+    ("git", "describe"),
+    ("git", "rev-parse"),
+    ("git", "ls-files"),
+    ("git", "ls-tree"),
+    ("git", "cat-file"),
+    ("git", "shortlog"),
+    ("git", "blame"),
+    ("git", "stash", "list"),
+    # Docker read-only
+    ("docker", "ps"),
+    ("docker", "images"),
+    ("docker", "logs"),
+    ("docker", "inspect"),
+    ("docker", "stats"),
+    ("docker", "version"),
+    ("docker", "info"),
+    # Package info
+    ("npm", "list"),
+    ("npm", "ls"),
+    ("npm", "outdated"),
+    ("npm", "view"),
+    ("pip", "list"),
+    ("pip", "show"),
+    ("pip", "freeze"),
+    ("brew", "list"),
+    ("brew", "info"),
+    # Version checks
+    ("python", "--version"),
+    ("python3", "--version"),
+    ("node", "--version"),
+    ("ruby", "--version"),
+    ("java", "--version"),
+    ("go", "version"),
+    ("rustc", "--version"),
+    ("cargo", "--version"),
+    ("npm", "--version"),
+    ("pip", "--version"),
+    ("pip3", "--version"),
+    ("git", "--version"),
+    ("docker", "--version"),
+)
+
+# Tokens that indicate danger — if ANY of these appear anywhere in tokens,
+# the command is NOT safe regardless of the base command.
+_BASH_DANGER_TOKENS: frozenset[str] = frozenset({
+    # Destructive
+    "rm", "rmdir", "mv", "cp",
+    "chmod", "chown", "chgrp",
+    "mkfs", "dd", "fdisk", "mount", "umount",
+    # Process control
+    "kill", "killall", "pkill",
+    "shutdown", "reboot", "halt", "poweroff",
+    # Privilege escalation
+    "sudo", "su", "doas",
+    # Network
+    "curl", "wget", "ssh", "scp", "sftp", "rsync",
+    # Shell escapes
+    "eval", "exec", "nohup", "disown",
+    # System modification
+    "crontab", "at",
+    "useradd", "userdel", "usermod", "groupadd", "groupdel",
+    "iptables", "ufw",
+    "systemctl", "service", "launchctl",
+    # Write-capable
+    "tee",
+    # Command execution via find options
+    "-exec", "-execdir", "-ok", "-okdir",
+})
+
+# Commands allowed to write within config.WORKSPACE
+_WORKSPACE_WRITE_COMMANDS: frozenset[str] = frozenset({"mkdir", "touch"})
+
+# Characters/sequences that indicate compound commands — reject before parsing
+_COMPOUND_OPERATORS: tuple[str, ...] = (
+    "|", ";", "&&", "||", "`", "$(", "${", "\n",
+    "<(", ">(",  # process substitution
+)
+
+
+def _contains_compound_operator(raw: str) -> bool:
+    """Check if a raw command string contains shell compound operators or redirects."""
+    for op in _COMPOUND_OPERATORS:
+        if op in raw:
+            return True
+    # Catch all redirect operators: >, >>, <, <<, <<<, 2>, &>, etc.
+    if ">" in raw or "<" in raw:
+        return True
+    return False
+
+
+def is_safe_bash_command(tool_input: dict[str, Any] | None) -> bool:
+    """Determine if a Bash command is safe (read-only) and can be auto-approved.
+
+    Returns True only for simple, single commands whose base executable is in
+    the safe-command whitelist and which contain no compound operators, pipes,
+    redirects, or dangerous tokens.
+
+    Conservative by design: returns False for anything it cannot parse or
+    does not recognize.
+    """
+    if not isinstance(tool_input, dict):
+        return False
+
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return False
+
+    raw = command.strip()
+
+    # Reject compound commands before parsing
+    if _contains_compound_operator(raw):
+        return False
+
+    # Parse with shlex to handle quoting correctly
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return False
+
+    if not tokens:
+        return False
+
+    # Check for danger tokens anywhere in the command
+    for token in tokens:
+        if token in _BASH_DANGER_TOKENS:
+            return False
+
+    base_cmd = tokens[0]
+
+    # Check single-word safe commands
+    if base_cmd in _SAFE_BASH_COMMANDS:
+        return True
+
+    # Check multi-word safe prefixes (e.g., "git status", "docker ps")
+    for prefix in _SAFE_BASH_PREFIXES:
+        if len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix:
+            return True
+
+    return False
+
+
+def is_bash_workspace_safe(tool_input: dict[str, Any] | None) -> bool:
+    """Determine if a Bash command writes only within the Molly workspace.
+
+    Allows ``mkdir`` and ``touch`` when every path argument resolves to a
+    location under ``config.WORKSPACE``.  These commands only create new
+    directories or empty files — they cannot overwrite or delete content.
+
+    Path arguments are resolved with ``os.path.realpath`` to prevent
+    ``../`` escape attacks.
+    """
+    if not isinstance(tool_input, dict):
+        return False
+
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return False
+
+    raw = command.strip()
+
+    # Reject compound commands and redirects
+    if _contains_compound_operator(raw):
+        return False
+
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return False
+
+    if not tokens:
+        return False
+
+    base_cmd = tokens[0]
+    if base_cmd not in _WORKSPACE_WRITE_COMMANDS:
+        return False
+
+    # Build safe prefix from config
+    workspace_prefix = str(config.WORKSPACE) + "/"
+
+    # Collect non-flag arguments (path arguments)
+    path_args = [t for t in tokens[1:] if not t.startswith("-")]
+
+    if not path_args:
+        return False
+
+    for path_arg in path_args:
+        # Expand ~ and resolve symlinks / ..
+        resolved = os.path.realpath(os.path.expanduser(path_arg))
+        # Must start with workspace prefix or be exactly the workspace dir
+        if not (resolved + "/").startswith(workspace_prefix):
+            return False
+
+    return True
+
+
 def get_action_tier(tool_name: str, tool_input: dict[str, Any] | None = None) -> str:
     """Classify a tool into AUTO, CONFIRM, or BLOCKED.
 
@@ -100,6 +331,13 @@ def get_action_tier(tool_name: str, tool_input: dict[str, Any] | None = None) ->
             return "CONFIRM"
         # Conservative fallback for unknown/omitted operations.
         return "CONFIRM"
+
+    # Bash command-level classification: safe read-only commands and
+    # workspace-scoped writes are AUTO, everything else stays CONFIRM.
+    if tool_name == "Bash" and (
+        is_safe_bash_command(tool_input) or is_bash_workspace_safe(tool_input)
+    ):
+        return "AUTO"
 
     for tier in ("AUTO", "CONFIRM", "BLOCKED"):
         if tool_name in config.ACTION_TIERS.get(tier, set()):
