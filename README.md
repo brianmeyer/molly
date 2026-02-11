@@ -40,6 +40,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Skill Analytics (`skill_analytics.py`) | Skill gap telemetry, underperformance detection, gap clustering |
 | Triage Pre-Filter (`memory/triage.py`) | Deterministic sender/subject filtering + channel-aware LLM prompts |
 | Graph Suggestions (`memory/graph_suggestions.py`) | Relationship fallback tracking, RELATED_TO hotspot detection, nightly digest |
+| Relationship Audit (`memory/relationship_audit.py`) | Two-tier edge quality audit: 7 deterministic checks + optional Kimi model review |
 
 ## Project Structure
 
@@ -92,7 +93,8 @@ molly/
     ├── dedup.py         # Shared dedup engine used by maintenance + health
     ├── issue_registry.py # Persistent issue/event registry + notification cooldown
     ├── graph.py         # Neo4j client + Cypher queries
-    └── graph_suggestions.py # Relationship fallback + hotspot JSONL logging, nightly digest
+    ├── graph_suggestions.py # Relationship fallback + hotspot JSONL logging, nightly digest
+    └── relationship_audit.py # Two-tier edge quality audit (deterministic + model)
 ```
 
 ## Channels
@@ -115,6 +117,8 @@ All channels share the same memory pipeline and call `handle_message()`.
 **Layer 3 — Knowledge graph** via Neo4j. GLiNER2 extracts entities (Person, Technology, Organization, Project, Place, Concept) and relationships from every conversation. Graph context is retrieved alongside semantic search results.
 
 **Graph suggestions** — When a relationship type is not in the 18 whitelisted types, it falls back to RELATED_TO and the original type is logged to JSONL. When a RELATED_TO edge reaches 3+ mentions, it is flagged as a reclassification candidate. The nightly digest combines today's JSONL suggestions with a Neo4j hotspot query, deduplicates, and surfaces actionable recommendations.
+
+**Relationship audit** — Nightly two-tier quality audit of knowledge graph edges. Tier 1 runs 7 deterministic checks: self-referencing edges, zombie edges (missing nodes), entity-type mismatches, contradictions (duplicate employers, symmetric conflicts), low-confidence edges, RELATED_TO accumulation, and new relationship type monitoring. Auto-fixes where safe (reclassify via MERGE, delete, merge contradictions), quarantines uncertain edges, and preserves verified/quarantined status across re-mentions. Tier 2 optionally sends flagged edges to Kimi K2.5 for model-based review with correct/reclassify/delete verdicts.
 
 **Correction detection** — When the user replies with correction keywords ("no,", "that's wrong", "actually"), a local LLM (Qwen3-4B) classifies whether it is a genuine correction. Confirmed corrections are logged to the vector store for future retrieval accuracy.
 
@@ -161,6 +165,7 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Recent Updates (February 2026)
 
+- Added relationship quality audit (`memory/relationship_audit.py`): two-tier nightly audit with 7 deterministic checks (self-refs, zombies, type mismatches, contradictions, low-confidence, RELATED_TO accumulation, new types) + optional Kimi K2.5 model review. Auto-fixes via MERGE-based reclassify, quarantines uncertain edges, preserves verified/quarantined status on re-mention. Cross-check `_mutated` set prevents stale-snapshot double-processing. 77 tests.
 - Added graph suggestions system (`memory/graph_suggestions.py`): JSONL logging for relationship type fallbacks and RELATED_TO hotspots, nightly digest builder with case-insensitive deduplication against Neo4j, hotspot query for reclassification candidates.
 - Added correction detection pipeline: keyword fast-path + local LLM (Qwen3-4B) classification to detect user corrections of Molly's responses, with confirmed corrections logged to the vector store.
 - Added LLM-based preference signal detection replacing brittle regex patterns for dismissive response classification.

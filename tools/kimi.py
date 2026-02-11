@@ -48,7 +48,7 @@ async def kimi_research(args: dict) -> dict:
     system_context = args.get("system_context", "You are a helpful research assistant.")
     thinking = args.get("thinking", False)
 
-    model = "kimi-k2-0711-preview"
+    model = config.CONTRACT_AUDIT_KIMI_MODEL
     messages = [
         {"role": "system", "content": system_context},
         {"role": "user", "content": query_text},

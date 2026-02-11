@@ -3395,6 +3395,7 @@ class SelfImprovementEngine:
                 """
                 MATCH (h:Entity)-[r]->(t:Entity)
                 WHERE h.name IN $names AND t.name IN $names
+                  AND (r.audit_status IS NULL OR r.audit_status <> 'quarantined')
                 RETURN h.name AS head,
                        t.name AS tail,
                        type(r) AS label,
