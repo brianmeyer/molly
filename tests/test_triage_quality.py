@@ -415,9 +415,11 @@ class TestSenderTierDB(unittest.TestCase):
         """)
 
         # Build a minimal VectorStore with our test connection (skip __init__)
+        import threading
         from memory.vectorstore import VectorStore
         self.vs = VectorStore.__new__(VectorStore)
         self.vs.conn = self.conn
+        self.vs._write_lock = threading.Lock()
 
     def tearDown(self):
         self.conn.close()

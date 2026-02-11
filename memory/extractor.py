@@ -1,10 +1,12 @@
 import logging
+import threading
 import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _model = None
+_model_lock = threading.Lock()
 
 # Description-enriched entity types for conversational text
 ENTITY_SCHEMA = {
@@ -108,6 +110,26 @@ RELATION_SCHEMA = {
         "description": "Person works together with another person but not at the same organization",
         "threshold": 0.45,
     },
+    "customer of": {
+        "description": "Person is a customer, subscriber, or account holder at a company or service",
+        "threshold": 0.5,
+    },
+    "attends": {
+        "description": "Person attends or is enrolled at a school, program, or recurring event",
+        "threshold": 0.45,
+    },
+    "parent of": {
+        "description": "Person is the parent or guardian of another person (typically a child)",
+        "threshold": 0.5,
+    },
+    "child of": {
+        "description": "Person is the child of another person",
+        "threshold": 0.5,
+    },
+    "received from": {
+        "description": "Person received a delivery, package, email, or communication from an organization or person",
+        "threshold": 0.5,
+    },
 }
 
 # Message type classification
@@ -122,12 +144,15 @@ MESSAGE_LABELS = {
 def _get_model():
     """Lazy-load the GLiNER2 model (unified NER + relations + classification)."""
     global _model
-    if _model is None:
-        from gliner2 import GLiNER2
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            from gliner2 import GLiNER2
 
-        log.info("Loading GLiNER2 model (fastino/gliner2-large-v1)...")
-        _model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
-        log.info("GLiNER2 model loaded.")
+            log.info("Loading GLiNER2 model (fastino/gliner2-large-v1)...")
+            _model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
+            log.info("GLiNER2 model loaded.")
     return _model
 
 
