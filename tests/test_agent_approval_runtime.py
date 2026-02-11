@@ -22,7 +22,9 @@ if "memory.processor" not in sys.modules:
 
 if "memory.retriever" not in sys.modules:
     retriever_stub = types.ModuleType("memory.retriever")
-    retriever_stub.retrieve_context = lambda *_args, **_kwargs: ""
+    async def _noop_retrieve_context(*_args, **_kwargs):
+        return ""
+    retriever_stub.retrieve_context = _noop_retrieve_context
 
     class _NoopVectorStore:
         def log_skill_execution(self, *_args, **_kwargs):
@@ -444,7 +446,7 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
             return "Recovered", "session-recovered"
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=[]), \
                 patch("agent.get_skill_context", return_value=""), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
@@ -478,7 +480,7 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
             return "second-response", "session-2"
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=[]), \
                 patch("agent.get_skill_context", return_value=""), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
@@ -510,7 +512,7 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
             return "Recovered", "session-ok"
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=[]), \
                 patch("agent.get_skill_context", return_value=""), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
@@ -536,7 +538,7 @@ class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=matched), \
                 patch("agent.get_skill_context", return_value="skill-context"), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
@@ -565,7 +567,7 @@ class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
         matched = [type("Skill", (), {"name": "daily-digest"})()]
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=matched), \
                 patch("agent.get_skill_context", return_value="skill-context"), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
@@ -591,7 +593,7 @@ class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
         matched = [type("Skill", (), {"name": "daily-digest"})()]
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=matched), \
                 patch("agent.get_skill_context", return_value="skill-context"), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \

@@ -47,17 +47,242 @@ EVENT_PATTERNS = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-SYSTEM_PROMPT = (
-    "You classify group chat messages for Brian's relevance. "
-    "Respond with JSON: "
+# ---------- Automated sender / noise subject patterns ----------
+
+AUTOMATED_SENDER_PATTERNS = re.compile(
+    r"""(?i)
+    (?:^|\b)(?:
+        no[\-_.]?reply
+        | noreply
+        | donotreply
+        | do[\-_.]?not[\-_.]?reply
+        | notifications?
+        | mailer[\-_.]?daemon
+        | postmaster
+        | receipt[s]?
+        | marketing
+        | newsletter[s]?
+        | promo(?:tions?)?
+        | info@
+        | support@
+        | updates?@
+        | alerts?@
+        | news@
+        | billing@
+        | service@
+        | hello@
+        | rewards@
+        | deals@
+        | offers@
+        | feedback@
+        | survey@
+        | confirm(?:ation)?@
+        | tracking@
+        | shipment@
+        | delivery@
+        | orders?@
+        | account@
+        | security@
+        | team@
+        | digest@
+        | notify@
+    )
+    """,
+    re.VERBOSE,
+)
+
+NOISE_SUBJECT_PATTERNS = re.compile(
+    r"""(?i)
+    (?:
+        order\s+confirm(?:ation|ed)
+        | shipping\s+(?:confirm|notif|update)
+        | delivery\s+(?:confirm|notif|update)
+        | (?:your\s+)?(?:package|shipment)\s+(?:has\s+)?(?:shipped|arrived|delivered|out\s+for)
+        | track(?:ing)?\s+(?:number|update|your)
+        | password\s+reset
+        | verify\s+your\s+(?:email|account)
+        | verification\s+code
+        | one[\-\s]?time\s+(?:code|password|pin)
+        | sign[\-\s]?in\s+(?:code|attempt)
+        | login\s+(?:code|attempt|alert)
+        | your\s+receipt
+        | payment\s+(?:received|confirm|processed|success)
+        | subscription\s+(?:confirm|renew)
+        | unsubscribe
+        | weekly\s+(?:digest|recap|summary|report|update)
+        | daily\s+(?:summary|digest|recap|report)
+        | monthly\s+(?:statement|summary|digest|recap|report|update)
+        | (?:reservation|booking)\s+confirm(?:ation|ed)
+        | check[\-\s]?in\s+(?:confirm|remind|now\s+available|ready|online|details)
+        | hotel\s+(?:confirm|reserv|book|receipt)
+        | your\s+(?:stay|trip|travel|itinerary|flight|booking)
+        | (?:flight|travel)\s+(?:confirm|itinerary|update|receipt)
+        | your\s+(?:statement|balance|account\s+(?:summary|update|activity|statement))
+        | (?:account|portfolio)\s+(?:statement|summary|update|activity|alert)
+        | (?:investment|dividend|market)\s+(?:update|summary|report|alert)
+        | (?:auto[\-\s]?pay|payment)\s+(?:scheduled|processed|received|reminder)
+        | your\s+(?:\w+\s+)?bill\s+is\s+(?:ready|available|due)
+        | (?:smart\s+home|thermostat|sensor|device|camera)\s+(?:alert|update|report|notification|summary)
+        | (?:energy|usage)\s+(?:report|summary|update|alert)
+        | (?:you\s+(?:earned|saved)|points?\s+(?:earned|balance|summary))
+        | (?:rewards?|loyalty|cashback)\s+(?:update|summary|earned|statement)
+        | (?:sale|deal|offer|discount|coupon|save)\s+(?:alert|ends|today|now|inside|up\s+to)
+        | (?:limited[\-\s]?time|flash\s+sale|clearance|exclusive\s+offer)
+        | don.?t\s+miss|act\s+now|last\s+chance|hurry
+        | (?:new\s+arrivals?|back\s+in\s+stock|trending|best\s+sellers?)
+        | (?:ups|fedex|usps|dhl)\s+(?:delivery|shipping|tracking|your\s+package)
+        | (?:your\s+)?(?:home|energy|monthly)\s+report
+    )
+    """,
+    re.VERBOSE,
+)
+
+# ---------- Channel-specific system prompts ----------
+
+_BASE_CLASSIFICATION_SCHEMA = (
+    'Respond with JSON: '
     '{"classification":"urgent|relevant|background|noise",'
     '"score":0.0-1.0,"reason":"brief explanation"}\n\n'
     "Definitions:\n"
-    "- urgent: Directly mentions Brian, requires his immediate attention, or is time-sensitive for him\n"
-    "- relevant: Mentions tracked entities, topics Brian follows, or people he knows\n"
-    "- background: General conversation that might be useful context but needs no action\n"
-    "- noise: Completely irrelevant to Brian (random chat, memes, off-topic)"
+    "- urgent: ONLY for VIP senders or messages that explicitly require Brian to take action within 24 hours (e.g. a real person asking Brian a direct question, a deadline). Most emails are NOT urgent.\n"
+    "- relevant: A real human who Brian knows personally wrote to him about something actionable. NOT automated notifications.\n"
+    "- background: Informational but no action needed — very few emails qualify.\n"
+    "- noise: THE DEFAULT. Automated emails, company notifications, transactional messages, marketing, newsletters, shipping updates, account alerts, financial statements, smart home alerts, travel confirmations, receipts, and anything from a company rather than a person.\n\n"
+    "CRITICAL: When in doubt, classify as noise. 90%+ of emails are noise.\n"
+    "If the sender is flagged as VIP or upgraded, bias toward urgent/relevant.\n"
+    "If the sender is flagged as muted or frequently dismissed, classify as noise."
 )
+
+SYSTEM_PROMPT_EMAIL = (
+    "You classify email messages for Brian's relevance. "
+    + _BASE_CLASSIFICATION_SCHEMA + "\n\n"
+    "Email-specific rules (follow strictly):\n"
+    "- DEFAULT IS NOISE. Assume every email is noise unless you have a strong reason otherwise.\n"
+    "- Company/brand emails = ALWAYS noise (hotels, airlines, banks, retailers, utilities, smart home, package tracking, insurance, SaaS products)\n"
+    "- Newsletters, digests, marketing, promotions = ALWAYS noise\n"
+    "- Transactional: receipts, confirmations, statements, alerts = ALWAYS noise\n"
+    "- Travel: reservations, check-in, itineraries, booking updates = ALWAYS noise\n"
+    "- Financial: statements, balance updates, investment reports, bill reminders = ALWAYS noise\n"
+    "- Smart home / IoT: device alerts, energy reports, sensor notifications = ALWAYS noise\n"
+    "- Shipping / delivery: tracking, delivery status, package updates = ALWAYS noise\n"
+    "- Security: password resets, login alerts, verification codes = ALWAYS noise\n"
+    "- Only classify as relevant/urgent if a REAL PERSON Brian knows is writing to him directly about something that requires his response or action\n"
+    "- Meeting invites from a real person = relevant\n"
+    "- VIP senders = urgent"
+)
+
+SYSTEM_PROMPT_IMESSAGE = (
+    "You classify iMessage messages for Brian's relevance. "
+    + _BASE_CLASSIFICATION_SCHEMA + "\n\n"
+    "iMessage-specific guidance:\n"
+    "- Direct questions to Brian = urgent\n"
+    "- Group mentions of Brian or @Brian = urgent\n"
+    "- Plans, events, logistics involving Brian = relevant\n"
+    "- Reactions, emoji-only, tapbacks = noise\n"
+    "- VIP senders = urgent"
+)
+
+SYSTEM_PROMPT_GROUP = (
+    "You classify group chat messages for Brian's relevance. "
+    + _BASE_CLASSIFICATION_SCHEMA + "\n\n"
+    "Group chat guidance:\n"
+    "- Direct mentions of Brian = urgent\n"
+    "- Events, meetings, plans = relevant\n"
+    "- General conversation = background\n"
+    "- Memes, random chat, off-topic = noise"
+)
+
+# Backward-compat alias
+SYSTEM_PROMPT = SYSTEM_PROMPT_GROUP
+
+
+def _get_channel_prompt(group_name: str) -> str:
+    """Select the right system prompt based on channel/group name."""
+    name = (group_name or "").strip().lower()
+    if name in {"email", "gmail", "mail"}:
+        return SYSTEM_PROMPT_EMAIL
+    if name in {"imessage", "imessages", "messages", "sms"}:
+        return SYSTEM_PROMPT_IMESSAGE
+    return SYSTEM_PROMPT_GROUP
+
+
+def _check_prefilter(
+    message: str, sender_name: str, group_name: str,
+) -> "TriageResult | None":
+    """Deterministic pre-filter: skip the model for obvious cases.
+
+    Returns a TriageResult if a deterministic match is found, or None to
+    fall through to the model.
+    """
+    sender_lower = (sender_name or "").strip().lower()
+
+    # 1. VIP contacts from config
+    for vip in config.VIP_CONTACTS:
+        vip_name = (vip.get("name") or "").lower()
+        vip_email = (vip.get("email") or "").lower()
+        if vip_name and vip_name in sender_lower:
+            log.debug("Triage pre-filter: VIP config match '%s'", sender_name)
+            return TriageResult(
+                classification="urgent", score=1.0,
+                reason=f"VIP sender (config): {sender_name}",
+            )
+        if vip_email and vip_email in sender_lower:
+            log.debug("Triage pre-filter: VIP email match '%s'", sender_name)
+            return TriageResult(
+                classification="urgent", score=1.0,
+                reason=f"VIP sender (config): {sender_name}",
+            )
+
+    # 2. Sender tier from DB
+    try:
+        from memory.retriever import get_vectorstore
+        vs = get_vectorstore()
+        tier = vs.get_sender_tier(sender_lower)
+        if tier == "vip":
+            log.debug("Triage pre-filter: DB VIP tier '%s'", sender_name)
+            return TriageResult(
+                classification="urgent", score=1.0,
+                reason=f"VIP sender (tier): {sender_name}",
+            )
+        if tier == "muted":
+            log.debug("Triage pre-filter: muted tier '%s'", sender_name)
+            return TriageResult(
+                classification="noise", score=0.0,
+                reason=f"Muted sender: {sender_name}",
+            )
+        if tier == "upgraded":
+            log.debug("Triage pre-filter: upgraded tier '%s'", sender_name)
+            return TriageResult(
+                classification="relevant", score=0.8,
+                reason=f"Upgraded sender: {sender_name}",
+            )
+        if tier == "downgraded":
+            log.debug("Triage pre-filter: downgraded tier '%s'", sender_name)
+            return TriageResult(
+                classification="background", score=0.3,
+                reason=f"Downgraded sender: {sender_name}",
+            )
+    except Exception:
+        log.debug("Sender tier lookup failed", exc_info=True)
+
+    # 3. Email only: automated sender regex (address patterns)
+    is_email = (group_name or "").strip().lower() in {"email", "gmail", "mail"}
+    if is_email and AUTOMATED_SENDER_PATTERNS.search(sender_lower):
+        log.debug("Triage pre-filter: automated sender '%s'", sender_name)
+        return TriageResult(
+            classification="noise", score=0.1,
+            reason=f"Automated sender pattern: {sender_name}",
+        )
+
+    # 4. Email only: noise subject patterns (check first 500 chars — covers From+Subject+snippet start)
+    if is_email and NOISE_SUBJECT_PATTERNS.search(message[:500]):
+        log.debug("Triage pre-filter: noise subject in '%s'", message[:60])
+        return TriageResult(
+            classification="noise", score=0.1,
+            reason="Automated/transactional email subject",
+        )
+
+    return None
 
 
 @dataclass
@@ -118,8 +343,8 @@ def preload_model() -> bool:
     return _load_model() is not None
 
 
-def _build_context() -> str:
-    """Build context blob for the triage prompt: who Brian is + tracked entities."""
+def _build_context(sender_name: str = "", group_name: str = "") -> str:
+    """Build context blob for the triage prompt: who Brian is + tracked entities + signals."""
     parts = []
 
     # Load USER.md summary
@@ -144,6 +369,31 @@ def _build_context() -> str:
     except Exception:
         log.debug("Could not load graph entities for triage context", exc_info=True)
 
+    # Sender tiers + dismissed sender signals
+    try:
+        from memory.retriever import get_vectorstore
+        vs = get_vectorstore()
+        signals = vs.get_triage_context_signals(limit=20)
+
+        tier_lines = []
+        for t in signals.get("sender_tiers", []):
+            tier_lines.append(f"- {t['sender_pattern']}: {t['tier']}")
+        if tier_lines:
+            parts.append("Sender tier overrides:\n" + "\n".join(tier_lines))
+
+        dismissed_lines = []
+        for d in signals.get("dismissed_senders", []):
+            dismissed_lines.append(
+                f"- {d['sender_pattern']} (dismissed {d['dismissals']}x)"
+            )
+        if dismissed_lines:
+            parts.append(
+                "Frequently dismissed senders (bias toward noise):\n"
+                + "\n".join(dismissed_lines)
+            )
+    except Exception:
+        log.debug("Could not load triage context signals", exc_info=True)
+
     return "\n\n".join(parts) if parts else "No additional context available."
 
 
@@ -156,6 +406,15 @@ def _build_user_prompt(
     message: str, sender_name: str, group_name: str, context: str,
 ) -> str:
     """Build the user message for the triage chat."""
+    # Channel-aware source label
+    channel = (group_name or "").strip().lower()
+    if channel in {"email", "gmail", "mail"}:
+        source_label = f"Email from {sender_name}"
+    elif channel in {"imessage", "imessages", "messages", "sms"}:
+        source_label = f"iMessage from {sender_name}"
+    else:
+        source_label = f"Message from {sender_name} in {group_name}"
+
     return (
         f"{context}\n\n"
         f"What to look for (relevant/urgent indicators):\n"
@@ -164,7 +423,7 @@ def _build_user_prompt(
         f"- Career opportunities, professional networking\n"
         f"- Topics Brian actively follows (see tracked entities)\n"
         f"- Action items or decisions that affect Brian\n\n"
-        f'Message from {sender_name} in {group_name}:\n"{message}"'
+        f'{source_label}:\n"{message}"'
     )
 
 
@@ -276,16 +535,22 @@ async def triage_message(
 def _sync_triage(
     message: str, sender_name: str, group_name: str, use_think: bool,
 ) -> TriageResult | None:
-    """Synchronous triage: build context + run local model + parse response."""
+    """Synchronous triage: pre-filter → build context → run local model → parse."""
+    # Deterministic pre-filter — skip model for obvious cases
+    prefilter = _check_prefilter(message, sender_name, group_name)
+    if prefilter is not None:
+        return prefilter
+
     model = _load_model()
     if model is None:
         return None
 
-    context = _build_context()
+    context = _build_context(sender_name=sender_name, group_name=group_name)
     user_prompt = _build_user_prompt(message, sender_name, group_name, context)
+    system_prompt = _get_channel_prompt(group_name)
 
     max_tokens = 2048 if use_think else 512
-    raw = _run_model(model, user_prompt, max_tokens=max_tokens)
+    raw = _run_model(model, user_prompt, max_tokens=max_tokens, system_prompt=system_prompt)
     if not raw:
         return TriageResult(
             classification="background", score=0.5,
@@ -294,11 +559,15 @@ def _sync_triage(
     return _parse_response(raw)
 
 
-def _run_model(model: object, user_prompt: str, max_tokens: int) -> str:
+def _run_model(
+    model: object, user_prompt: str, max_tokens: int,
+    system_prompt: str = "",
+) -> str:
     """Run the local model and return raw text output."""
+    prompt_text = system_prompt or SYSTEM_PROMPT
     kwargs = {
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": prompt_text},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
@@ -327,7 +596,7 @@ def _run_model(model: object, user_prompt: str, max_tokens: int) -> str:
 
     # Last fallback: plain completion prompt.
     prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
+        f"{prompt_text}\n\n"
         f"{user_prompt}\n\n"
         "Return JSON only."
     )

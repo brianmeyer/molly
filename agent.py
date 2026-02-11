@@ -723,9 +723,35 @@ async def handle_message(
     """Send a message through Claude and return (response_text, new_session_id)."""
     runtime = await _get_chat_runtime(chat_id)
 
-    system_prompt = load_identity_stack()
-    memory_context = retrieve_context(user_message) or ""
-    matched_skills = match_skills(user_message)
+    # Pre-processing: run independent steps concurrently
+    # retrieve_context is async (runs its own executor threads internally),
+    # while load_identity_stack and match_skills are sync → run in executor.
+    # return_exceptions=True lets us degrade gracefully if retrieval fails.
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(
+        loop.run_in_executor(None, load_identity_stack),
+        retrieve_context(user_message),
+        loop.run_in_executor(None, match_skills, user_message),
+        return_exceptions=True,
+    )
+    # Unpack with graceful degradation: system_prompt is required,
+    # but memory context and skills can fall back to empty defaults.
+    # Use BaseException for system_prompt (re-raise KeyboardInterrupt/SystemExit),
+    # but Exception for optional results (let shutdown signals propagate).
+    system_prompt = results[0]
+    if isinstance(system_prompt, BaseException):
+        raise system_prompt  # Identity stack is required — can't respond without it
+    if isinstance(results[1], Exception):
+        log.warning("Memory retrieval failed, continuing without context: %s", results[1])
+        memory_context_raw = ""
+    else:
+        memory_context_raw = results[1]
+    if isinstance(results[2], Exception):
+        log.warning("Skill matching failed, continuing without skills: %s", results[2])
+        matched_skills = []
+    else:
+        matched_skills = results[2]
+    memory_context = memory_context_raw or ""
     skill_context = get_skill_context(matched_skills) or ""
     response_guidance = _response_guidance_for_source(source)
     turn_prompt = _build_turn_prompt(
