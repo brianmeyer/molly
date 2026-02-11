@@ -80,6 +80,10 @@ ACTIVE_HOURS = (8, 22)  # 8am to 10pm
 TIMEZONE = os.getenv("MOLLY_TIMEZONE", "America/New_York")
 AUTOMATION_TICK_INTERVAL = int(os.getenv("MOLLY_AUTOMATION_TICK_INTERVAL", "20"))  # seconds
 
+# iMessage @molly mention polling (fast check, separate from heartbeat)
+IMESSAGE_MENTION_POLL_INTERVAL = int(os.getenv("MOLLY_IMESSAGE_MENTION_POLL_INTERVAL", "60"))  # seconds
+IMESSAGE_MENTION_CONTEXT_COUNT = int(os.getenv("MOLLY_IMESSAGE_MENTION_CONTEXT_COUNT", "8"))
+
 # Quiet hours / proactive automations (Phase 6)
 QUIET_HOURS_START = os.getenv("MOLLY_QUIET_HOURS_START", "22:00")
 QUIET_HOURS_END = os.getenv("MOLLY_QUIET_HOURS_END", "07:00")

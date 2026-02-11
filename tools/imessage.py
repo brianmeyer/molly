@@ -451,6 +451,98 @@ def get_new_messages_since(unix_ts: float) -> list[dict]:
         return []
 
 
+def get_mention_messages_since(
+    unix_ts: float,
+    trigger_pattern: re.Pattern | None = None,
+) -> list[dict]:
+    """Get iMessages sent by *me* that contain the @molly trigger since *unix_ts*.
+
+    Unlike ``get_new_messages_since`` (which reads received messages), this reads
+    Brian's **own** sent messages (``is_from_me = 1``) to detect when he types
+    ``@molly`` in an iMessage conversation.
+
+    Each returned dict includes a ``chat_id`` key (the ROWID from the ``chat``
+    table via ``chat_message_join``) so the caller can fetch thread context.
+    """
+    if trigger_pattern is None:
+        trigger_pattern = config.TRIGGER_PATTERN
+
+    apple_threshold = _unix_to_apple(unix_ts)
+
+    try:
+        conn = _connect()
+        try:
+            handle_map = _build_handle_map(conn)
+            rows = conn.execute(
+                """SELECT m.ROWID, m.text, m.date, m.is_from_me, m.handle_id
+                   FROM message m
+                   WHERE m.date > ? AND m.is_from_me = 1
+                     AND m.text IS NOT NULL AND m.text != ''
+                   ORDER BY m.date ASC""",
+                (apple_threshold,),
+            ).fetchall()
+
+            results: list[dict] = []
+            for r in rows:
+                text = r["text"] or ""
+                if not trigger_pattern.search(text):
+                    continue
+
+                msg = _format_message(r, handle_map)
+
+                # Resolve the chat this message belongs to
+                chat_row = conn.execute(
+                    "SELECT cmj.chat_id FROM chat_message_join cmj "
+                    "WHERE cmj.message_id = ? LIMIT 1",
+                    (r["ROWID"],),
+                ).fetchone()
+                msg["chat_id"] = chat_row["chat_id"] if chat_row else None
+
+                results.append(msg)
+
+            return results
+        finally:
+            conn.close()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        log.debug("iMessage DB not accessible for mention scan", exc_info=True)
+        return []
+
+
+def get_thread_context(
+    chat_id: int,
+    before_message_id: int,
+    count: int = 8,
+) -> list[dict]:
+    """Fetch recent messages from a chat thread for surrounding context.
+
+    Returns up to *count* messages from the chat identified by *chat_id* that
+    appear **before** *before_message_id*, in chronological order.  Both sent
+    and received messages are included so the caller sees the full conversation.
+    """
+    try:
+        conn = _connect()
+        try:
+            handle_map = _build_handle_map(conn)
+            rows = conn.execute(
+                """SELECT m.ROWID, m.text, m.date, m.is_from_me, m.handle_id
+                   FROM message m
+                   JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+                   WHERE cmj.chat_id = ? AND m.ROWID < ?
+                     AND m.text IS NOT NULL AND m.text != ''
+                   ORDER BY m.date DESC
+                   LIMIT ?""",
+                (chat_id, before_message_id, count),
+            ).fetchall()
+
+            # Reverse to chronological order (query was DESC for LIMIT)
+            return [_format_message(r, handle_map) for r in reversed(rows)]
+        finally:
+            conn.close()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        log.debug("iMessage DB not accessible for thread context", exc_info=True)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
