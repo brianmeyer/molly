@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import logging
+import re
 import shutil
 import signal
 import subprocess
@@ -39,6 +40,15 @@ log = logging.getLogger("molly")
 
 SURFACED_SIGNAL_WINDOW_SECONDS = 6 * 60 * 60
 MAX_RECENT_SURFACED_ITEMS = 100
+LAST_RESPONSE_TTL_SECONDS = 300  # 5 minutes
+
+_CORRECTION_KEYWORDS = re.compile(
+    r"\b(?:no[,.]|that'?s wrong|that is wrong|actually|not (?:that|what)|"
+    r"i said|i meant|it'?s actually|wrong|incorrect|that'?s not right|"
+    r"you got .{1,20} wrong|that'?s not what)\b",
+    re.IGNORECASE,
+)
+
 
 _TOOL_DEPENDENCY_SPECS = [
     {
@@ -330,6 +340,7 @@ class Molly:
         self.last_heartbeat: datetime | None = None
         self.last_maintenance: datetime | None = None
         self._sent_ids: dict[str, float] = {}  # msg_id → timestamp (avoid echo loop)
+        self._last_responses: dict[str, tuple[str, float]] = {}  # chat_jid → (response_text, timestamp)
         self._recent_surfaces: list[dict] = []  # recent surfaced notifications for feedback linking
         self.approvals = ApprovalManager()
         self.automations = AutomationEngine(self)
@@ -506,16 +517,8 @@ class Molly:
         if not feedback:
             return
 
-        from memory.triage import classify_local_async
-
-        prompt = (
-            "The user just received a proactive notification and replied with: "
-            "'{reply}'. Is this dismissive feedback? Respond YES or NO."
-        )
-        result = await classify_local_async(prompt, feedback)
-        if not result.strip().upper().startswith("YES"):
-            return
-
+        # Find the most recent un-logged surfaced item for this chat first
+        # (skip LLM call entirely if nothing to link feedback to)
         now_ts = time.time()
         self._prune_recent_surfaces(now_ts)
 
@@ -528,8 +531,29 @@ class Molly:
         if not surfaced:
             return
 
+        surfaced_summary = surfaced.get("summary", "a proactive notification")
+        surfaced_source = surfaced.get("source", "unknown")
+
+        # LLM classification with full context about what was surfaced
+        from memory.triage import classify_local_async
+
+        prompt = (
+            "You are analyzing a user's reply to a notification from their AI assistant.\n\n"
+            f"The assistant surfaced this {surfaced_source} notification:\n"
+            f"\"{surfaced_summary[:300]}\"\n\n"
+            f"The user replied:\n"
+            f"\"{feedback[:300]}\"\n\n"
+            "Is the user expressing they do NOT want this type of notification? "
+            "Look for: rejection, annoyance, asking to stop, saying it's not useful.\n"
+            "A simple acknowledgement like 'ok' or 'thanks' is NOT dismissive.\n"
+            "Respond YES or NO."
+        )
+        result = await classify_local_async(prompt, "")
+        if not result.strip().upper().startswith("YES"):
+            return
+
         sender_pattern = surfaced.get("sender_pattern", "")
-        feedback_pattern = "feedback_pattern:dismissive"
+        feedback_pattern = "feedback_pattern:llm_classified_dismissive"
         if sender_pattern:
             sender_pattern = f"{sender_pattern} | {feedback_pattern}"
         else:
@@ -545,9 +569,64 @@ class Molly:
                 owner_feedback=feedback,
             )
             surfaced["logged"] = True
-            log.info("Logged preference signal from owner feedback (dismissive)")
+            log.info("preference-signal: logged dismissive feedback (LLM classified)")
         except Exception:
             log.debug("Failed to log preference signal", exc_info=True)
+
+    async def _detect_and_log_correction(self, chat_jid: str, owner_message: str):
+        """Detect when the owner corrects Molly and log it for learning."""
+        message = owner_message.strip()
+        if not message:
+            return
+
+        # Prune stale last-response entries (>5 min old)
+        now = time.time()
+        cutoff = now - LAST_RESPONSE_TTL_SECONDS
+        self._last_responses = {
+            k: v for k, v in self._last_responses.items() if v[1] > cutoff
+        }
+
+        # Need a recent Molly response to compare against
+        last = self._last_responses.get(chat_jid)
+        if not last:
+            return
+        molly_response, _ts = last
+
+        # Step 1: keyword heuristic — fast rejection
+        match = _CORRECTION_KEYWORDS.search(message)
+        if not match:
+            return
+
+        # Step 2: LLM confirmation — avoid false positives
+        try:
+            from memory.triage import classify_local_async
+
+            prompt = (
+                f"The assistant previously responded with: '{molly_response[:300]}'. "
+                f"The user then said: '{message[:300]}'. "
+                "Is the user correcting or contradicting the assistant's response? "
+                "Respond YES or NO."
+            )
+            result = await classify_local_async(prompt, "")
+            if not result.strip().upper().startswith("YES"):
+                return
+        except Exception:
+            log.debug("Correction LLM classification failed", exc_info=True)
+            return
+
+        # Step 3: log the correction
+        try:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            vs.log_correction(
+                context=f"chat:{chat_jid}",
+                molly_output=molly_response[:500],
+                user_correction=message[:500],
+                pattern=match.group(0),
+            )
+            log.info("Logged correction from owner in %s", chat_jid)
+        except Exception:
+            log.debug("Failed to log correction", exc_info=True)
 
     # --- Message processing ---
 
@@ -611,6 +690,13 @@ class Molly:
             name=f"dismissive-feedback:{chat_jid[:20]}",
         )
         dismissive_task.add_done_callback(_task_done_callback)
+
+        # Passive data collection: detect corrections to Molly's responses
+        correction_task = asyncio.create_task(
+            self._detect_and_log_correction(chat_jid, content),
+            name=f"correction-detect:{chat_jid[:20]}",
+        )
+        correction_task.add_done_callback(_task_done_callback)
 
         # Check for @Molly trigger
         has_trigger = config.TRIGGER_PATTERN.search(content)
@@ -687,6 +773,9 @@ class Molly:
 
             if not response:
                 return
+
+            # Track last response for correction detection
+            self._last_responses[chat_jid] = (response, time.time())
 
             # Check if the response contains a prompt-level approval tag
             # (belt-and-suspenders fallback — code-enforced can_use_tool is primary)

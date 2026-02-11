@@ -811,6 +811,18 @@ async def handle_message(
         trigger = f"{source}:{user_message}"
         _schedule_skill_execution_logs(matched_skills, trigger=trigger, outcome=outcome, detail=detail)
 
+    # Best-effort: write foundry observation for multi-step tool sequences
+    if request_state and len(request_state.turn_tool_calls) >= 3:
+        try:
+            from foundry_adapter import write_observation
+            write_observation(
+                tool_sequence=request_state.turn_tool_calls,
+                outcome="success" if query_succeeded else "failure",
+                context=user_message[:200],
+            )
+        except Exception:
+            log.debug("Failed to write foundry observation", exc_info=True)
+
     # Async post-processing: embed + store conversation turn
     if response_text and not response_text.startswith("Something went wrong"):
         task = asyncio.create_task(
