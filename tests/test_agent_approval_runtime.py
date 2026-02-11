@@ -35,7 +35,7 @@ if "memory.retriever" not in sys.modules:
 
 import agent
 from approval import ApprovalManager, OWNER_PRIMARY_WHATSAPP_JID, RequestApprovalState
-from claude_agent_sdk import CLIConnectionError, PermissionResultDeny
+from claude_agent_sdk import CLIConnectionError, PermissionResultAllow, PermissionResultDeny
 
 
 class _FakeWA:
@@ -698,6 +698,549 @@ class TestDependencyPins(unittest.TestCase):
     def test_claude_agent_sdk_minimum_pin(self):
         requirements = (PROJECT_ROOT / "requirements.txt").read_text()
         self.assertIn("claude-agent-sdk>=0.1.33", requirements)
+
+
+class TestSafeBashAutoApproval(unittest.IsolatedAsyncioTestCase):
+    """Tests for BUG-08: safe Bash command auto-approval."""
+
+    # ---- Unit tests for is_safe_bash_command ----
+
+    def test_simple_safe_commands_are_approved(self):
+        """Basic read-only commands should be classified as safe."""
+        from approval import is_safe_bash_command
+
+        safe_commands = [
+            "ls", "ls -la", "ls -la /tmp",
+            "pwd",
+            "cat /etc/hosts",
+            "head -n 10 file.txt",
+            "tail -f log.txt",
+            "echo hello",
+            "grep pattern file.txt",
+            "find . -name '*.py'",
+            "wc -l file.txt",
+            "date",
+            "whoami",
+            "env",
+            "df -h",
+            "du -sh .",
+            "ps aux",
+            "id",
+            "stat file.txt",
+            "tree",
+            "jq '.key' file.json",
+            "sort file.txt",
+            "uniq file.txt",
+            "cut -d, -f1 file.csv",
+            "diff file1.txt file2.txt",
+            "file myfile",
+            "basename /path/to/file",
+            "dirname /path/to/file",
+            "test -f /tmp/foo",
+        ]
+        for cmd in safe_commands:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected safe: {cmd}",
+                )
+
+    def test_git_read_commands_are_safe(self):
+        """Read-only git operations should be auto-approved."""
+        from approval import is_safe_bash_command
+
+        safe_git = [
+            "git status",
+            "git log",
+            "git log --oneline -10",
+            "git diff",
+            "git diff HEAD~3",
+            "git show HEAD",
+            "git branch",
+            "git branch -a",
+            "git tag",
+            "git remote -v",
+            "git describe --tags",
+            "git rev-parse HEAD",
+            "git ls-files",
+            "git blame file.py",
+            "git stash list",
+            "git shortlog -sn",
+        ]
+        for cmd in safe_git:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected safe: {cmd}",
+                )
+
+    def test_docker_read_commands_are_safe(self):
+        """Read-only docker operations should be auto-approved."""
+        from approval import is_safe_bash_command
+
+        safe_docker = [
+            "docker ps",
+            "docker ps -a",
+            "docker images",
+            "docker logs container_name",
+            "docker inspect container_name",
+            "docker stats --no-stream",
+            "docker version",
+            "docker info",
+        ]
+        for cmd in safe_docker:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected safe: {cmd}",
+                )
+
+    def test_dangerous_commands_remain_confirm(self):
+        """Dangerous commands must NOT be auto-approved."""
+        from approval import is_safe_bash_command
+
+        dangerous = [
+            "rm -rf /",
+            "rm file.txt",
+            "sudo ls",
+            "curl https://example.com",
+            "wget https://example.com",
+            "chmod 777 file",
+            "chown root file",
+            "kill -9 1234",
+            "mv old new",
+            "cp src dst",
+            "ssh user@host",
+            "eval 'echo hello'",
+            "exec bash",
+            "crontab -e",
+            "systemctl restart nginx",
+            "dd if=/dev/zero of=/dev/sda",
+            "reboot",
+            "shutdown now",
+        ]
+        for cmd in dangerous:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected dangerous: {cmd}",
+                )
+
+    def test_compound_commands_remain_confirm(self):
+        """Pipes, chaining, and subshells must NOT be auto-approved."""
+        from approval import is_safe_bash_command
+
+        compound = [
+            "ls | grep foo",
+            "echo hello; rm file",
+            "cat file && curl http://evil.com",
+            "echo hello || rm file",
+            "echo `whoami`",
+            "echo $(cat /etc/passwd)",
+            "ls\nrm -rf /",
+        ]
+        for cmd in compound:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected unsafe (compound): {cmd}",
+                )
+
+    def test_redirect_commands_remain_confirm(self):
+        """Output redirection must NOT be auto-approved."""
+        from approval import is_safe_bash_command
+
+        redirects = [
+            "echo hello > file.txt",
+            "cat foo >> bar",
+            "ls > /tmp/listing",
+        ]
+        for cmd in redirects:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected unsafe (redirect): {cmd}",
+                )
+
+    def test_unknown_commands_remain_confirm(self):
+        """Unrecognized commands must NOT be auto-approved."""
+        from approval import is_safe_bash_command
+
+        unknown = [
+            "mycustomtool --flag",
+            "python script.py",
+            "node server.js",
+            "make build",
+            "cargo run",
+        ]
+        for cmd in unknown:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected unsafe (unknown): {cmd}",
+                )
+
+    def test_git_write_commands_remain_confirm(self):
+        """Git write operations should NOT be auto-approved."""
+        from approval import is_safe_bash_command
+
+        git_writes = [
+            "git commit -m 'test'",
+            "git push",
+            "git push origin main",
+            "git checkout main",
+            "git merge branch",
+            "git rebase main",
+            "git reset --hard HEAD",
+            "git clean -fd",
+            "git stash",
+            "git stash pop",
+            "git add .",
+            "git add file.py",
+            "git pull",
+            "git clone https://example.com",
+        ]
+        for cmd in git_writes:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected unsafe (git write): {cmd}",
+                )
+
+    def test_empty_and_none_inputs(self):
+        """Edge cases: empty, None, missing command key."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command(None))
+        self.assertFalse(is_safe_bash_command({}))
+        self.assertFalse(is_safe_bash_command({"command": ""}))
+        self.assertFalse(is_safe_bash_command({"command": "   "}))
+        self.assertFalse(is_safe_bash_command({"not_command": "ls"}))
+
+    def test_malformed_quoting_remains_confirm(self):
+        """Malformed shell quoting should fail safely to CONFIRM."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": "echo 'unterminated"}))
+        self.assertFalse(is_safe_bash_command({"command": 'cat "no close'}))
+
+    def test_process_substitution_rejected(self):
+        """Process substitution <(...) and >(...) must be rejected."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": "cat <(echo test)"}))
+        self.assertFalse(is_safe_bash_command({"command": "diff <(ls dir1) <(ls dir2)"}))
+
+    def test_input_redirect_rejected(self):
+        """Input redirection < must be rejected."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": "cat < /etc/shadow"}))
+        self.assertFalse(is_safe_bash_command({"command": "grep pattern < file.txt"}))
+        self.assertFalse(is_safe_bash_command({"command": "cat <<< 'here-string'"}))
+
+    def test_stderr_redirect_rejected(self):
+        """Stderr redirects (2>, &>) must be rejected."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": "cat /etc/passwd 2> /tmp/x"}))
+        self.assertFalse(is_safe_bash_command({"command": "echo hello &> /tmp/both"}))
+
+    def test_version_check_commands_are_safe(self):
+        """Version check commands should be auto-approved."""
+        from approval import is_safe_bash_command
+
+        version_cmds = [
+            "npm --version",
+            "pip --version",
+            "pip3 --version",
+            "git --version",
+            "docker --version",
+            "python --version",
+            "python3 --version",
+            "node --version",
+        ]
+        for cmd in version_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected safe: {cmd}",
+                )
+
+    def test_unusual_whitespace_handled(self):
+        """Commands with tabs and extra spaces should work."""
+        from approval import is_safe_bash_command
+
+        self.assertTrue(is_safe_bash_command({"command": "ls    -la"}))
+        self.assertTrue(is_safe_bash_command({"command": "  git   status  "}))
+
+    def test_null_byte_in_command_rejected(self):
+        """Null bytes in commands should be rejected."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": "ls\x00rm -rf /"}))
+
+    def test_command_substitution_variants_rejected(self):
+        """All forms of command substitution should be rejected."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": "echo $(whoami)"}))
+        self.assertFalse(is_safe_bash_command({"command": "echo `whoami`"}))
+        self.assertFalse(is_safe_bash_command({"command": "echo ${PATH}"}))
+
+    def test_find_exec_rejected(self):
+        """find -exec enables arbitrary command execution and must be rejected."""
+        from approval import is_safe_bash_command
+
+        dangerous_finds = [
+            "find . -exec python3 -c 'import os' {} +",
+            "find . -exec node -e 'process.exit()' {} +",
+            "find . -execdir make -f evil {} +",
+            "find . -ok rm {} +",
+            "find . -okdir rm {} +",
+        ]
+        for cmd in dangerous_finds:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected unsafe (find -exec): {cmd}",
+                )
+
+    def test_find_without_exec_is_safe(self):
+        """Normal find without -exec should remain safe."""
+        from approval import is_safe_bash_command
+
+        safe_finds = [
+            "find . -name '*.py'",
+            "find . -type f -mtime +30",
+            "find /tmp -maxdepth 1",
+        ]
+        for cmd in safe_finds:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected safe: {cmd}",
+                )
+
+    def test_non_string_command_types_rejected(self):
+        """Non-string command values should be rejected, not crash."""
+        from approval import is_safe_bash_command
+
+        self.assertFalse(is_safe_bash_command({"command": 123}))
+        self.assertFalse(is_safe_bash_command({"command": ["ls"]}))
+        self.assertFalse(is_safe_bash_command({"command": None}))
+        self.assertFalse(is_safe_bash_command({"command": {"nested": "dict"}}))
+
+    # ---- Unit tests for is_bash_workspace_safe ----
+
+    def test_workspace_mkdir_is_safe(self):
+        """mkdir within workspace should be auto-approved."""
+        from approval import is_bash_workspace_safe
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        safe = [
+            f"mkdir {ws}/memory/new_dir",
+            f"mkdir -p {ws}/memory/deep/nested/dir",
+            f"mkdir {ws}/skills/new_skill",
+            f"mkdir {ws}/foundry/observations/2024",
+            f"mkdir -p {ws}/sandbox/test",
+        ]
+        for cmd in safe:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_bash_workspace_safe({"command": cmd}),
+                    f"Expected workspace-safe: {cmd}",
+                )
+
+    def test_workspace_touch_is_safe(self):
+        """touch within workspace should be auto-approved."""
+        from approval import is_bash_workspace_safe
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        safe = [
+            f"touch {ws}/memory/file.json",
+            f"touch {ws}/skills/new_skill.md",
+            f"touch {ws}/foundry/observations/new.jsonl",
+        ]
+        for cmd in safe:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_bash_workspace_safe({"command": cmd}),
+                    f"Expected workspace-safe: {cmd}",
+                )
+
+    def test_workspace_write_outside_workspace_rejected(self):
+        """mkdir/touch outside workspace must be CONFIRM."""
+        from approval import is_bash_workspace_safe
+
+        unsafe = [
+            "mkdir /tmp/something",
+            "touch /tmp/file.txt",
+            "mkdir /etc/new_dir",
+            "touch /etc/new_file",
+        ]
+        for cmd in unsafe:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_bash_workspace_safe({"command": cmd}),
+                    f"Expected unsafe (outside workspace): {cmd}",
+                )
+
+    def test_workspace_write_path_escape_rejected(self):
+        """Path traversal (../) must not escape workspace."""
+        from approval import is_bash_workspace_safe
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        escapes = [
+            f"mkdir {ws}/../../../etc/evil",
+            f"touch {ws}/memory/../../SOUL.md",
+        ]
+        for cmd in escapes:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_bash_workspace_safe({"command": cmd}),
+                    f"Expected unsafe (path escape): {cmd}",
+                )
+
+    def test_workspace_disallowed_commands_rejected(self):
+        """rm/cp/mv to workspace should NOT be auto-approved."""
+        from approval import is_bash_workspace_safe
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        disallowed = [
+            f"rm {ws}/memory/file.json",
+            f"cp src {ws}/memory/dst",
+            f"mv old {ws}/memory/new",
+        ]
+        for cmd in disallowed:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(
+                    is_bash_workspace_safe({"command": cmd}),
+                    f"Expected unsafe (disallowed command): {cmd}",
+                )
+
+    def test_workspace_bare_mkdir_no_path_rejected(self):
+        """mkdir with no path argument should be rejected."""
+        from approval import is_bash_workspace_safe
+
+        self.assertFalse(is_bash_workspace_safe({"command": "mkdir"}))
+        self.assertFalse(is_bash_workspace_safe({"command": "mkdir -p"}))
+        self.assertFalse(is_bash_workspace_safe({"command": "touch"}))
+
+    def test_workspace_compound_rejected(self):
+        """Compound commands targeting workspace must still be CONFIRM."""
+        from approval import is_bash_workspace_safe
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        self.assertFalse(is_bash_workspace_safe({"command": f"mkdir {ws}/a; rm -rf /"}))
+        self.assertFalse(is_bash_workspace_safe({"command": f"touch {ws}/f | cat"}))
+
+    def test_workspace_tilde_outside_workspace_rejected(self):
+        """Tilde expansion to paths outside workspace should be rejected."""
+        from approval import is_bash_workspace_safe
+
+        # ~/some_random_dir expands to home directory, not workspace
+        self.assertFalse(is_bash_workspace_safe({"command": "mkdir ~/some_random_dir"}))
+        self.assertFalse(is_bash_workspace_safe({"command": "touch ~/Desktop/file.txt"}))
+
+    def test_workspace_prefix_sibling_rejected(self):
+        """Paths that share the workspace prefix but aren't inside it must be rejected."""
+        from approval import is_bash_workspace_safe
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        # workspace-evil, workspace123, etc. are NOT inside workspace/
+        self.assertFalse(is_bash_workspace_safe({"command": f"mkdir {ws}-evil/dir"}))
+        self.assertFalse(is_bash_workspace_safe({"command": f"mkdir {ws}123/dir"}))
+
+    # ---- Integration tests: get_action_tier for Bash ----
+
+    def test_get_action_tier_safe_bash_returns_auto(self):
+        """Safe bash commands should get AUTO tier."""
+        from approval import get_action_tier
+
+        self.assertEqual(get_action_tier("Bash", {"command": "ls -la"}), "AUTO")
+        self.assertEqual(get_action_tier("Bash", {"command": "git status"}), "AUTO")
+        self.assertEqual(get_action_tier("Bash", {"command": "pwd"}), "AUTO")
+        self.assertEqual(get_action_tier("Bash", {"command": "cat /etc/hosts"}), "AUTO")
+
+    def test_get_action_tier_dangerous_bash_returns_confirm(self):
+        """Dangerous bash commands should still get CONFIRM tier."""
+        from approval import get_action_tier
+
+        self.assertEqual(get_action_tier("Bash", {"command": "rm -rf /"}), "CONFIRM")
+        self.assertEqual(get_action_tier("Bash", {"command": "curl http://evil.com"}), "CONFIRM")
+        self.assertEqual(get_action_tier("Bash", {"command": "ls | rm"}), "CONFIRM")
+
+    def test_get_action_tier_bash_no_input_returns_confirm(self):
+        """Bash with no tool_input should return CONFIRM (health check compat)."""
+        from approval import get_action_tier
+
+        self.assertEqual(get_action_tier("Bash"), "CONFIRM")
+        self.assertEqual(get_action_tier("Bash", None), "CONFIRM")
+
+    def test_get_action_tier_workspace_write_returns_auto(self):
+        """Workspace-scoped mkdir/touch should get AUTO tier."""
+        from approval import get_action_tier
+
+        import config
+
+        ws = str(config.WORKSPACE)
+        self.assertEqual(get_action_tier("Bash", {"command": f"mkdir {ws}/memory/dir"}), "AUTO")
+        self.assertEqual(get_action_tier("Bash", {"command": f"touch {ws}/skills/f.md"}), "AUTO")
+
+    # ---- Integration test: can_use_tool auto-approves safe Bash ----
+
+    async def test_can_use_tool_auto_approves_safe_bash_without_approval_manager(self):
+        """Safe Bash commands should be allowed even without an approval manager
+        (the heartbeat/headless scenario that caused 92 failures)."""
+        checker = agent.make_tool_checker(
+            approval_manager=None,
+            molly=None,
+            chat_jid="heartbeat:test",
+            request_state=RequestApprovalState(),
+        )
+        # Safe command: should be allowed
+        result = await checker("Bash", {"command": "ls -la"}, None)
+        self.assertIsInstance(result, PermissionResultAllow)
+
+        # Safe git command: should be allowed
+        result = await checker("Bash", {"command": "git status"}, None)
+        self.assertIsInstance(result, PermissionResultAllow)
+
+        # Dangerous command: should be denied (no approval manager)
+        result = await checker("Bash", {"command": "rm -rf /"}, None)
+        self.assertIsInstance(result, PermissionResultDeny)
+
+    async def test_can_use_tool_safe_bash_skips_whatsapp_approval(self):
+        """Safe Bash commands should not trigger WhatsApp approval flow."""
+        from approval import ApprovalManager
+
+        manager = ApprovalManager()
+        molly = _FakeMolly()
+        state = RequestApprovalState()
+        checker = agent.make_tool_checker(
+            approval_manager=manager,
+            molly=molly,
+            chat_jid="123@s.whatsapp.net",
+            request_state=state,
+        )
+
+        result = await checker("Bash", {"command": "pwd"}, None)
+        self.assertIsInstance(result, PermissionResultAllow)
+        # No WhatsApp messages should have been sent
+        self.assertEqual(len(molly.wa.sent), 0)
 
 
 if __name__ == "__main__":
