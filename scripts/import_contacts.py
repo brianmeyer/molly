@@ -15,20 +15,12 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from contacts import normalize_phone
+
 STORE_DIR = Path(__file__).resolve().parent.parent / "store"
 OUTPUT = STORE_DIR / "contacts.json"
-
-_NON_DIGITS = re.compile(r"\D+")
-
-
-def _normalize_phone(raw: str) -> str | None:
-    """Strip non-digits, drop leading country code, return last 10 digits."""
-    digits = _NON_DIGITS.sub("", raw)
-    if len(digits) < 7:
-        return None
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits[-10:]
 
 
 def parse_vcf(path: Path) -> dict:
@@ -53,7 +45,7 @@ def parse_vcf(path: Path) -> dict:
         # All phone numbers
         for tel_match in re.finditer(r"^TEL[^:]*:(.+)$", block, re.MULTILINE):
             raw = tel_match.group(1).strip()
-            norm = _normalize_phone(raw)
+            norm = normalize_phone(raw)
             if norm:
                 contacts[norm] = {
                     "name": name,
@@ -65,19 +57,28 @@ def parse_vcf(path: Path) -> dict:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python scripts/import_contacts.py <path-to-contacts.vcf>")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    merge = "--merge" in sys.argv
+
+    if not args:
+        print("Usage: python scripts/import_contacts.py [--merge] <path-to-contacts.vcf>")
         sys.exit(1)
 
-    vcf_path = Path(sys.argv[1]).expanduser()
+    vcf_path = Path(args[0]).expanduser()
     if not vcf_path.exists():
         print(f"File not found: {vcf_path}")
         sys.exit(1)
 
     contacts = parse_vcf(vcf_path)
     STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if merge and OUTPUT.exists():
+        existing = json.loads(OUTPUT.read_text())
+        existing.update(contacts)
+        contacts = existing
+
     OUTPUT.write_text(json.dumps(contacts, indent=2))
-    print(f"Imported {len(contacts)} phone entries into {OUTPUT}")
+    print(f"{'Merged' if merge else 'Imported'} {len(contacts)} phone entries into {OUTPUT}")
 
 
 if __name__ == "__main__":

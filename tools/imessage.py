@@ -111,16 +111,17 @@ def _resolve_handle(handle_id: str) -> str:
     """Resolve an iMessage handle to a display value."""
     if not handle_id:
         return "Unknown"
-    # For phone-like handles, try Google Contacts resolver
-    digits = _NON_DIGITS.sub("", handle_id)
-    if len(digits) >= 10:
-        try:
-            from contacts import get_resolver
-            name = get_resolver().resolve_phone(digits)
-            if name:
-                return name
-        except Exception:
-            pass
+    # For phone-like handles (not emails), try Google Contacts resolver
+    if "@" not in handle_id:
+        digits = _NON_DIGITS.sub("", handle_id)
+        if len(digits) >= 10:
+            try:
+                from contacts import get_resolver
+                name = get_resolver().resolve_phone(digits)
+                if name:
+                    return name
+            except Exception:
+                log.debug("Contact resolution failed for handle %s", handle_id, exc_info=True)
     return handle_id
 
 
