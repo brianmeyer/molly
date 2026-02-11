@@ -38,6 +38,22 @@ def _send_surface(
         molly._track_send(molly.wa.send_message(chat_jid, text))
 
 
+def _update_state_key(key: str, value) -> None:
+    """Atomically update a single key in state.json.
+
+    Re-reads the file before writing to avoid clobbering concurrent updates
+    from the heartbeat or MCP tools.
+    """
+    config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state_data = (
+        json.loads(config.STATE_FILE.read_text())
+        if config.STATE_FILE.exists()
+        else {}
+    )
+    state_data[key] = value
+    config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+
+
 def should_heartbeat(last_heartbeat: datetime | None) -> bool:
     """Check if it's time for a heartbeat based on interval and active hours."""
     now = datetime.now()
@@ -370,6 +386,129 @@ async def _check_imessages(molly):
 
     except Exception:
         log.debug("iMessage heartbeat check failed", exc_info=True)
+
+
+async def _check_imessage_mentions(molly):
+    """Fast poll for @molly mentions in Brian's sent iMessages.
+
+    Runs on IMESSAGE_MENTION_POLL_INTERVAL (default 60s), separate from the
+    30-minute heartbeat.  When @molly is detected:
+      1. Fetch surrounding thread context (previous 5-8 messages)
+      2. Route through handle_message() so Claude can use tools
+      3. Send the response to Brian via WhatsApp
+    """
+    try:
+        from tools.imessage import get_mention_messages_since, get_thread_context
+
+        # Separate high-water mark from the heartbeat's imessage_heartbeat_hw
+        state_data = (
+            json.loads(config.STATE_FILE.read_text())
+            if config.STATE_FILE.exists()
+            else {}
+        )
+        last_check = float(state_data.get("imessage_mention_hw", 0))
+
+        if last_check == 0:
+            # First run: start from now (don't scan history for old mentions)
+            _update_state_key("imessage_mention_hw", time.time())
+            log.info("iMessage mention polling: initialized high-water mark to now")
+            return
+
+        mentions = get_mention_messages_since(last_check)
+        if not mentions:
+            _update_state_key("imessage_mention_hw", time.time())
+            return
+
+        log.info("iMessage mention poll: %d @molly mention(s) found", len(mentions))
+
+        owner_jid = molly._get_owner_dm_jid()
+        if not owner_jid or not molly.wa:
+            log.warning(
+                "iMessage mention poll: WhatsApp not available, skipping %d mention(s)",
+                len(mentions),
+            )
+            return
+
+        from agent import handle_message
+
+        for mention in mentions:
+            chat_id = mention.get("chat_id")
+            if chat_id is None:
+                log.warning("Could not resolve chat_id for mention message %s", mention.get("id"))
+                continue
+
+            # Fetch surrounding thread context
+            context_messages = get_thread_context(
+                chat_id=chat_id,
+                before_message_id=mention["id"],
+                count=config.IMESSAGE_MENTION_CONTEXT_COUNT,
+            )
+
+            trigger_text = mention.get("text", "")
+
+            # Build context string from surrounding messages (truncate each to 500 chars)
+            context_lines = []
+            for ctx_msg in context_messages:
+                sender = "Me" if ctx_msg.get("is_from_me") else ctx_msg.get("sender", "Unknown")
+                text = ctx_msg.get("text", "")[:500]
+                context_lines.append(f"{sender}: {text}")
+
+            thread_context = "\n".join(context_lines) if context_lines else "(no prior context)"
+
+            prompt = (
+                f"Brian mentioned you (@molly) in an iMessage conversation. "
+                f"Here is the thread context (most recent messages):\n\n"
+                f"{thread_context}\n\n"
+                f"Brian's @molly message: {trigger_text}\n\n"
+                f"Based on this context, figure out what Brian needs and take action. "
+                f"If the intent is clear (calendar invite, reminder, contact lookup, "
+                f"email draft, etc.), go ahead and do it. "
+                f"If you need clarification, ask a specific question. "
+                f"Respond concisely — this will be sent to Brian via WhatsApp."
+            )
+
+            # Use a synthetic iMessage chat ID for session isolation
+            imessage_chat_id = f"imessage:chat:{chat_id}"
+            session_id = molly.sessions.get(imessage_chat_id)
+
+            try:
+                response, new_session_id = await handle_message(
+                    prompt,
+                    imessage_chat_id,
+                    session_id,
+                    approval_manager=molly.approvals,
+                    molly_instance=molly,
+                    source="imessage-mention",
+                )
+
+                if new_session_id:
+                    molly.sessions[imessage_chat_id] = new_session_id
+                    molly.save_sessions()
+
+                if response:
+                    clean_text = config.TRIGGER_PATTERN.sub("", trigger_text).strip()
+                    _send_surface(
+                        molly,
+                        owner_jid,
+                        response,
+                        source="imessage",
+                        surfaced_summary=f"@molly response: {clean_text[:100]}",
+                        sender_pattern="imessage:mention",
+                    )
+                    log.info(
+                        "iMessage @molly response sent (%d chars) for mention in chat %s: %s",
+                        len(response),
+                        chat_id,
+                        trigger_text[:100],
+                    )
+            except Exception:
+                log.error("Failed to process iMessage @molly mention", exc_info=True)
+
+        # Update high-water mark AFTER processing (re-read to avoid race with heartbeat)
+        _update_state_key("imessage_mention_hw", time.time())
+
+    except Exception:
+        log.debug("iMessage mention check failed", exc_info=True)
 
 
 async def _check_email(molly):
