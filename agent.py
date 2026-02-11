@@ -462,7 +462,7 @@ def _response_guidance_for_source(source: str) -> str | None:
         return None
 
     normalized = (source or "").strip().lower()
-    if normalized not in {"whatsapp", "heartbeat", "automation"}:
+    if normalized not in {"whatsapp", "heartbeat", "automation", "imessage-mention"}:
         return None
 
     return (
