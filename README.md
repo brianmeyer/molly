@@ -39,6 +39,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Self-Improvement Engine (`self_improve.py`) | Guarded self-edit loop (branch, tests, approval, rollback/restart) |
 | Skill Analytics (`skill_analytics.py`) | Skill gap telemetry, underperformance detection, gap clustering |
 | Triage Pre-Filter (`memory/triage.py`) | Deterministic sender/subject filtering + channel-aware LLM prompts |
+| Graph Suggestions (`memory/graph_suggestions.py`) | Relationship fallback tracking, RELATED_TO hotspot detection, nightly digest |
 
 ## Project Structure
 
@@ -90,7 +91,8 @@ molly/
     ├── triage.py        # Local Qwen3 message triage + deterministic pre-filter + sender tiers
     ├── dedup.py         # Shared dedup engine used by maintenance + health
     ├── issue_registry.py # Persistent issue/event registry + notification cooldown
-    └── graph.py         # Neo4j client + Cypher queries
+    ├── graph.py         # Neo4j client + Cypher queries
+    └── graph_suggestions.py # Relationship fallback + hotspot JSONL logging, nightly digest
 ```
 
 ## Channels
@@ -111,6 +113,12 @@ All channels share the same memory pipeline and call `handle_message()`.
 **Layer 2 — Semantic search** via sqlite-vec. Every conversation turn is embedded and stored. Pre-query retrieval injects the top 5 most similar past conversations into the system prompt.
 
 **Layer 3 — Knowledge graph** via Neo4j. GLiNER2 extracts entities (Person, Technology, Organization, Project, Place, Concept) and relationships from every conversation. Graph context is retrieved alongside semantic search results.
+
+**Graph suggestions** — When a relationship type is not in the 18 whitelisted types, it falls back to RELATED_TO and the original type is logged to JSONL. When a RELATED_TO edge reaches 3+ mentions, it is flagged as a reclassification candidate. The nightly digest combines today's JSONL suggestions with a Neo4j hotspot query, deduplicates, and surfaces actionable recommendations.
+
+**Correction detection** — When the user replies with correction keywords ("no,", "that's wrong", "actually"), a local LLM (Qwen3-4B) classifies whether it is a genuine correction. Confirmed corrections are logged to the vector store for future retrieval accuracy.
+
+**Preference signal detection** — Dismissive responses ("not important", "who cares") are classified by the local LLM and logged as preference signals, feeding into triage bias and nightly maintenance assessments.
 
 ## Approval System
 
@@ -153,6 +161,14 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Recent Updates (February 2026)
 
+- Added graph suggestions system (`memory/graph_suggestions.py`): JSONL logging for relationship type fallbacks and RELATED_TO hotspots, nightly digest builder with case-insensitive deduplication against Neo4j, hotspot query for reclassification candidates.
+- Added correction detection pipeline: keyword fast-path + local LLM (Qwen3-4B) classification to detect user corrections of Molly's responses, with confirmed corrections logged to the vector store.
+- Added LLM-based preference signal detection replacing brittle regex patterns for dismissive response classification.
+- Added foundry observation logging (`foundry_adapter.py`): tool sequence pattern logging with 3+ step threshold for skill gap analysis.
+- Added nightly operational insights: error rate and latency summaries computed from daily logs and injected into maintenance reports.
+- Expanded maintenance pipeline with graph suggestions digest, foundry skill/tool gap scans, correction pattern analysis, and per-file resilient JSONL/md log pruning.
+- Added Neo4j checkpoint with modern (`SHOW SERVER INFO`) and legacy (`dbms.components()`) syntax fallback.
+- Added `self_improve.py` public wrappers with idempotent `initialize()` guard for safe nightly invocation.
 - Added Google Contacts phone resolution: import contacts from vCard via `scripts/import_contacts.py`, resolve phone→name in WhatsApp sender names, `/groups` DM listings, and iMessage handles. Resolved contacts are enriched into the knowledge graph as `CONTACT_OF` relationships.
 - Added triage quality overhaul: deterministic pre-filter skips the local model for automated senders, transactional subjects, and known sender tiers. Channel-aware system prompts (email/iMessage/group) replace the generic classifier. Email prompt is aggressively noise-biased — only real humans writing directly to Brian get through.
 - Added sender tier management: `/upgrade`, `/downgrade`, `/mute`, `/tiers` commands let Brian manually control sender classification. Tiers persist in `sender_tiers` SQLite table and feed into both the pre-filter and LLM context.
