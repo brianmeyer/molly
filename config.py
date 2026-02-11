@@ -42,6 +42,7 @@ COMMANDS = {
     "/status", "/pending", "/register", "/unregister", "/groups",
     "/skills", "/skill", "/digest", "/automations", "/followups",
     "/commitments", "/health",
+    "/upgrade", "/downgrade", "/mute", "/tiers",
 }
 
 # Chat processing modes (tiered classification)
@@ -56,6 +57,7 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "opus")
 
 # Owner — only this user can trigger Molly (phone + LID)
 OWNER_IDS = set(filter(None, os.getenv("OWNER_IDS", "").split(",")))
+OWNER_NAME = os.getenv("OWNER_NAME", "Brian")
 
 # Web UI (Phase 4)
 WEB_HOST = os.getenv("MOLLY_WEB_HOST", "127.0.0.1")

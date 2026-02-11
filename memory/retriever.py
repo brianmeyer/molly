@@ -1,6 +1,6 @@
+import asyncio
 import logging
-from datetime import datetime
-
+import threading
 import config
 from memory.embeddings import embed
 from memory.vectorstore import VectorStore
@@ -8,33 +8,38 @@ from memory.vectorstore import VectorStore
 log = logging.getLogger(__name__)
 
 _vectorstore: VectorStore | None = None
+_vectorstore_lock = threading.Lock()
 
 
 def get_vectorstore() -> VectorStore:
-    """Lazy-initialize the shared VectorStore singleton."""
+    """Lazy-initialize the shared VectorStore singleton (thread-safe)."""
     global _vectorstore
-    if _vectorstore is None:
-        _vectorstore = VectorStore(config.MOLLYGRAPH_PATH)
-        _vectorstore.initialize()
+    if _vectorstore is not None:
+        return _vectorstore
+    with _vectorstore_lock:
+        if _vectorstore is None:
+            vs = VectorStore(config.MOLLYGRAPH_PATH)
+            vs.initialize()
+            _vectorstore = vs
     return _vectorstore
 
 
-def retrieve_context(message: str, top_k: int = 5) -> str:
+async def retrieve_context(message: str, top_k: int = 5) -> str:
     """Retrieve relevant memory context for a message.
 
     Combines Layer 2 (semantic search) and Layer 3 (knowledge graph).
+    Runs both retrievals concurrently in separate executor threads.
     Returns a formatted string to inject into the system prompt.
     Returns empty string if no relevant memories found.
     """
-    sections = []
-
-    # Layer 2: Semantic search
-    sections.append(_retrieve_semantic(message, top_k))
-
-    # Layer 3: Knowledge graph
-    sections.append(_retrieve_graph(message))
+    loop = asyncio.get_running_loop()
+    semantic_result, graph_result = await asyncio.gather(
+        loop.run_in_executor(None, _retrieve_semantic, message, top_k),
+        loop.run_in_executor(None, _retrieve_graph, message),
+    )
 
     # Combine non-empty sections
+    sections = [semantic_result, graph_result]
     combined = "\n\n".join(s for s in sections if s)
     if combined:
         log.debug("Retrieved memory context: %d chars", len(combined))

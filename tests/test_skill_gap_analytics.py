@@ -119,7 +119,7 @@ class TestSkillGapDetection(unittest.IsolatedAsyncioTestCase):
             return "ok", "session-abc"
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=[]), \
                 patch("agent.get_skill_context", return_value=""), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
@@ -146,7 +146,7 @@ class TestSkillGapDetection(unittest.IsolatedAsyncioTestCase):
             return "ok", "session-has-skill"
 
         with patch("agent.load_identity_stack", return_value="identity"), \
-                patch("agent.retrieve_context", return_value=""), \
+                patch("agent.retrieve_context", new=AsyncMock(return_value="")), \
                 patch("agent.match_skills", return_value=[object()]), \
                 patch("agent.get_skill_context", return_value="skill context"), \
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
