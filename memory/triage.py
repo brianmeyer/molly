@@ -496,6 +496,174 @@ async def classify_local_async(prompt: str, text: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Local LLM time-expression parsing
+# ---------------------------------------------------------------------------
+
+def _parse_time_offset(raw: str, now_local) -> "datetime | None":
+    """Parse a structured time-offset string into a UTC datetime.
+
+    Accepted formats (case-insensitive):
+        +Nm           — relative minutes from *now_local* (e.g. ``+30m``)
+        +Nh           — relative hours from *now_local*   (e.g. ``+2h``)
+        +NdHH:MM      — N days ahead, target local time   (e.g. ``+0d17:00``)
+        +DAY HH:MM    — next occurrence of weekday        (e.g. ``+SAT10:00``)
+        NONE | empty   — no time expression recognised → returns ``None``
+    """
+    from datetime import datetime, time, timedelta, timezone
+
+    cleaned = (raw or "").strip()
+    # Strip Qwen3 <think>...</think> reasoning blocks if present.
+    cleaned = re.sub(r"(?si)<think>.*?</think>", "", cleaned).strip()
+    cleaned = cleaned.upper()
+    if not cleaned or cleaned == "NONE":
+        return None
+
+    # +Nm  — relative minutes
+    # Handles: +30M, +15MIN, +30MINS, +15MINUTES
+    # Negative lookahead (?![A-Z]) prevents matching day-name prefixes
+    # like "+1MON09:00" as 1 minute.
+    m = re.search(r"\+\s*(\d+)M(?:IN(?:UTES?|S)?)?(?![A-Z])", cleaned)
+    if m:
+        minutes = min(int(m.group(1)), 1440)  # cap at 24 hours
+        # Add in UTC to avoid DST wall-clock surprises (e.g., spring-forward
+        # or fall-back shifting the result by ±1 hour).
+        now_utc = now_local.astimezone(timezone.utc)
+        return now_utc + timedelta(minutes=minutes)
+
+    # +Nh  — relative hours
+    # Handles: +2H, +1HR, +3HRS, +1HOUR, +3HOURS
+    # Negative lookahead prevents matching inside hybrid formats like "+17H:00"
+    m = re.search(r"\+\s*(\d+)H(?:(?:OU)?RS?)?(?![A-Z\d:])", cleaned)
+    if m:
+        hours = min(int(m.group(1)), 8760)  # cap at 1 year
+        # Add in UTC to avoid DST wall-clock surprises.
+        now_utc = now_local.astimezone(timezone.utc)
+        return now_utc + timedelta(hours=hours)
+
+    # +NdHH:MM  — relative days + target local time
+    m = re.search(r"\+\s*(\d+)D(\d{1,2}):(\d{2})", cleaned)
+    if m:
+        days = min(int(m.group(1)), 365)  # cap at 1 year
+        hour = min(int(m.group(2)), 23)
+        minute = min(int(m.group(3)), 59)
+        target_date = now_local.date() + timedelta(days=days)
+        tz = now_local.tzinfo
+        result_local = datetime.combine(target_date, time(hour=hour, minute=minute), tzinfo=tz)
+        return result_local.astimezone(timezone.utc)
+
+    # +DAY HH:MM or DAY HH:MM  — next occurrence of weekday
+    # Explicit suffix group handles all full day names:
+    # MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY
+    # Negative lookahead (?![A-Z]) prevents matching non-day words
+    # like MONITOR or SUNLIGHT while allowing digits to follow immediately.
+    m = re.search(r"\+?(MON(?:DAY)?|TUE(?:S(?:DAY)?)?|WED(?:S|NESDAY)?|THU(?:R(?:S(?:DAY)?)?)?|FRI(?:DAY)?|SAT(?:URDAY)?|SUN(?:DAY)?)(?![A-Z])\s*(\d{1,2}):(\d{2})", cleaned)
+    if m:
+        day_abbr = m.group(1)[:3]
+        hour = min(int(m.group(2)), 23)
+        minute = min(int(m.group(3)), 59)
+        day_map = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
+        target_day = day_map.get(day_abbr)
+        if target_day is not None:
+            days_ahead = (target_day - now_local.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # always advance to *next* occurrence
+            target_date = now_local.date() + timedelta(days=days_ahead)
+            tz = now_local.tzinfo
+            result_local = datetime.combine(target_date, time(hour=hour, minute=minute), tzinfo=tz)
+            return result_local.astimezone(timezone.utc)
+
+    log.debug("Could not parse time offset from LLM: %s", raw[:100])
+    return None
+
+
+def parse_time_local(text: str, now_local) -> "datetime | None":
+    """Use the local Qwen3-4B model to interpret a vague time expression.
+
+    Returns a UTC ``datetime`` if a time expression is found, otherwise ``None``.
+    This is the sync version; prefer :func:`parse_time_local_async` from async code.
+    """
+    model = _load_model()
+    if model is None:
+        return None
+
+    day_name = now_local.strftime("%A")
+    time_str = now_local.strftime("%I:%M %p")
+    date_str = now_local.strftime("%Y-%m-%d")
+
+    system_prompt = (
+        "You interpret vague time expressions and return a structured offset. "
+        "Respond with ONLY the offset, nothing else."
+    )
+
+    user_prompt = (
+        "Given the current time, interpret when the person means.\n\n"
+        "Return ONLY one of these formats:\n"
+        "- +Nm (minutes from now, e.g. +30m)\n"
+        "- +Nh (hours from now, e.g. +2h)\n"
+        "- +NdHH:MM (days ahead + local time, e.g. +0d17:00, +1d09:00)\n"
+        "- +DAYNAME HH:MM (next weekday, e.g. +SAT10:00, +MON09:00)\n"
+        "- NONE (no time expression found)\n\n"
+        "Examples:\n"
+        "- 'in 30 minutes' -> +30m\n"
+        "- 'in 15 min' -> +15m\n"
+        "- 'end of day' -> +0d17:00\n"
+        "- 'after lunch' -> +0d13:00\n"
+        "- 'this weekend' -> +SAT10:00\n"
+        "- 'in a couple hours' -> +2h\n"
+        "- 'sometime next week' -> +MON09:00\n"
+        "- 'before dinner' -> +0d17:00\n"
+        "- 'in an hour' -> +1h\n"
+        "- 'in 3 days' -> +3d09:00\n"
+        "- 'day after tomorrow' -> +2d09:00\n"
+        "- 'grab groceries on the way home' -> NONE\n\n"
+        f"Current: {day_name} {date_str} {time_str}\n"
+        f'Message: "{text[:300]}"'
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    raw = ""
+    try:
+        resp = model.create_chat_completion(
+            messages=messages,
+            temperature=0.0,
+            max_tokens=64,
+        )
+        raw = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        log.debug("parse_time_local chat completion failed", exc_info=True)
+
+    if not raw:
+        try:
+            resp = model.create_completion(
+                prompt=f"{system_prompt}\n\n{user_prompt}",
+                temperature=0.0,
+                max_tokens=64,
+            )
+            raw = resp.get("choices", [{}])[0].get("text", "")
+        except Exception:
+            log.debug("parse_time_local completion fallback failed", exc_info=True)
+
+    return _parse_time_offset(raw, now_local)
+
+
+async def parse_time_local_async(text: str, now_local) -> "datetime | None":
+    """Async wrapper — runs :func:`parse_time_local` on the triage executor."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _TRIAGE_EXECUTOR,
+        parse_time_local,
+        text,
+        now_local,
+    )
+
+
 async def triage_message(
     message: str,
     sender_name: str = "Unknown",
