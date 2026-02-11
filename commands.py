@@ -230,6 +230,14 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
                 stored = info.get("name", "")
                 name = stored if stored and stored != phone else None
 
+                # Try Google Contacts resolver
+                if not name:
+                    try:
+                        from contacts import get_resolver
+                        name = get_resolver().resolve_phone(phone)
+                    except Exception:
+                        pass
+
                 # Final fallback: formatted phone number
                 if not name:
                     name = f"+{phone}" if not phone.startswith("+") else phone
