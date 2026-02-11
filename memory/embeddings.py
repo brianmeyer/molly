@@ -1,4 +1,5 @@
 import logging
+import threading
 from typing import Optional
 
 import numpy as np
@@ -6,17 +7,21 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 _model = None
+_model_lock = threading.Lock()
 
 
 def _get_model():
     """Lazy-load EmbeddingGemma-300M. ~200MB RAM, stays resident."""
     global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            from sentence_transformers import SentenceTransformer
 
-        log.info("Loading embedding model (google/embeddinggemma-300m)...")
-        _model = SentenceTransformer("google/embeddinggemma-300m")
-        log.info("Embedding model loaded.")
+            log.info("Loading embedding model (google/embeddinggemma-300m)...")
+            _model = SentenceTransformer("google/embeddinggemma-300m")
+            log.info("Embedding model loaded.")
     return _model
 
 

@@ -1197,6 +1197,16 @@ class SelfImprovementEngine:
         await self._propose_automation_updates_from_patterns(workflow_patterns)
         return report_path
 
+    async def propose_skill_updates(self, patterns: list[dict]) -> dict:
+        """Public API for nightly skill-pattern proposals."""
+        await self.initialize()
+        return await self._propose_skill_updates_from_patterns(patterns)
+
+    async def propose_tool_updates(self, days: int = 7, min_failures: int = 5) -> dict:
+        """Public API for nightly tool-gap proposals."""
+        await self.initialize()
+        return await self._propose_tool_updates_from_failures(days, min_failures)
+
     async def run_gliner_nightly_cycle(self) -> dict[str, Any]:
         """Nightly GLiNER closed-loop: accumulate data, then trigger fine-tune when ready."""
         await self.initialize()

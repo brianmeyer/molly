@@ -7,9 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+import config
+
 log = logging.getLogger(__name__)
 
-FOUNDRY_OBSERVATIONS_DIR = Path("/Users/brianmeyer/.molly/workspace/foundry/observations")
+FOUNDRY_OBSERVATIONS_DIR = config.WORKSPACE / "foundry" / "observations"
 _SUCCESS_OUTCOMES = {"success", "ok", "completed"}
 
 
@@ -120,6 +122,37 @@ def load_foundry_sequence_signals(
             latest_at=latest_at_text,
         )
     return signals
+
+
+def write_observation(
+    tool_sequence: list[str],
+    outcome: str,
+    context: str = "",
+    observations_dir: Path = FOUNDRY_OBSERVATIONS_DIR,
+) -> None:
+    """Append a tool-sequence observation to today's JSONL file.
+
+    Skips sequences shorter than 3 steps (not enough signal for pattern detection).
+
+    See also: memory/graph_suggestions._append_jsonl (similar JSONL pattern).
+    """
+    if len(tool_sequence) < 3:
+        return
+    try:
+        observations_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        path = observations_dir / f"{today}.jsonl"
+        entry = {
+            "timestamp": now.isoformat(),
+            "tool_sequence": list(tool_sequence),
+            "outcome": outcome,
+            "context": (context or "")[:200],
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except OSError:
+        log.debug("Failed to write foundry observation", exc_info=True)
 
 
 def _parse_timestamp(value: object) -> datetime | None:
