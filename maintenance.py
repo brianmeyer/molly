@@ -860,6 +860,25 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 log.error("Orphan cleanup failed", exc_info=True)
                 _record_step("Orphan cleanup", "failed", failed=True)
 
+            # Step 4b: Relationship quality audit
+            try:
+                from memory.relationship_audit import run_relationship_audit
+                rel_audit = await run_relationship_audit(
+                    model_enabled=config.REL_AUDIT_MODEL_ENABLED,
+                    molly=molly,
+                )
+                ra_auto = rel_audit.get("auto_fixes_applied", 0)
+                ra_quar = rel_audit.get("quarantined_count", 0)
+                ra_status = rel_audit.get("deterministic_result", {}).get("status", "pass")
+                _record_step(
+                    "Relationship audit",
+                    f"{ra_auto} auto-fixed, {ra_quar} quarantined ({ra_status})",
+                    failed=ra_status == "fail",
+                )
+            except Exception:
+                log.error("Relationship quality audit failed", exc_info=True)
+                _record_step("Relationship audit", "failed", failed=True)
+
             # Step 4.5: Neo4j transaction log checkpoint
             try:
                 from memory.graph import get_driver

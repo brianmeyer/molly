@@ -234,6 +234,13 @@ def upsert_relationship(
         # Dynamic relationship type requires a workaround since Cypher
         # doesn't allow parameterized relationship types.
         # Validated against whitelist above, so f-string is safe.
+        #
+        # audit_status lifecycle on re-mention:
+        #   'quarantined' → preserved (edge stays flagged until manually reviewed)
+        #   'verified'    → preserved (model-confirmed edges stay trusted)
+        #   'auto_fixed'  → reset to null (re-mention provides new evidence;
+        #                    if the fix was correct, the new type is compatible
+        #                    and won't be re-flagged)
         result = session.run(
             f"""MATCH (h:Entity {{name: $head}})
                 MATCH (t:Entity {{name: $tail}})
@@ -254,7 +261,8 @@ def upsert_relationship(
                         WHEN size(r.context_snippets) >= 3
                         THEN r.context_snippets[1..] + [$snippet]
                         ELSE r.context_snippets + [$snippet]
-                    END
+                    END,
+                    r.audit_status = CASE WHEN r.audit_status IN ['quarantined', 'verified'] THEN r.audit_status ELSE null END
                 RETURN r.mention_count AS mention_count""",
             head=head_name,
             tail=tail_name,
@@ -422,7 +430,8 @@ def query_entities_for_context(entity_names: list[str]) -> str:
         rels_out = session.run(
             """UNWIND $names AS ename
                MATCH (e:Entity {name: ename})-[r]->(t:Entity)
-               RETURN e.name AS entity_name, type(r) AS rel_type, t.name AS target""",
+               RETURN e.name AS entity_name, type(r) AS rel_type, t.name AS target,
+                      r.audit_status AS audit_status""",
             names=found_names,
         )
         for rec in rels_out:
@@ -432,13 +441,15 @@ def query_entities_for_context(entity_names: list[str]) -> str:
                     "type": rec["rel_type"],
                     "target": rec["target"],
                     "direction": "outgoing",
+                    "audit_status": rec["audit_status"],
                 })
 
         # Batch query: all incoming relationships for found entities
         rels_in = session.run(
             """UNWIND $names AS ename
                MATCH (s:Entity)-[r]->(e:Entity {name: ename})
-               RETURN e.name AS entity_name, type(r) AS rel_type, s.name AS source""",
+               RETURN e.name AS entity_name, type(r) AS rel_type, s.name AS source,
+                      r.audit_status AS audit_status""",
             names=found_names,
         )
         for rec in rels_in:
@@ -448,6 +459,7 @@ def query_entities_for_context(entity_names: list[str]) -> str:
                     "type": rec["rel_type"],
                     "source": rec["source"],
                     "direction": "incoming",
+                    "audit_status": rec["audit_status"],
                 })
 
     # Format output
@@ -463,10 +475,11 @@ def query_entities_for_context(entity_names: list[str]) -> str:
 
         for rel in ent.get("relationships", []):
             rtype = rel["type"].replace("_", " ").lower()
+            flag = " [unverified]" if rel.get("audit_status") == "quarantined" else ""
             if rel["direction"] == "outgoing":
-                lines.append(f"  → {rtype} {rel['target']}")
+                lines.append(f"  → {rtype} {rel['target']}{flag}")
             else:
-                lines.append(f"  ← {rel['source']} {rtype}")
+                lines.append(f"  ← {rel['source']} {rtype}{flag}")
 
     return "\n".join(lines)
 
@@ -577,6 +590,147 @@ def delete_blocklisted_entities(blocklist: set[str]) -> int:
         deleted = result.single()["deleted"]
         log.info("Deleted %d blocklisted entities", deleted)
         return deleted
+
+
+# --- Audit helpers ---
+
+
+def get_relationships_for_audit(limit: int = 500) -> list[dict]:
+    """Return relationships with full context for audit (ordered by strength ASC)."""
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (h:Entity)-[r]->(t:Entity)
+            RETURN h.name AS head, h.entity_type AS head_type,
+                   t.name AS tail, t.entity_type AS tail_type,
+                   type(r) AS rel_type,
+                   r.strength AS strength,
+                   r.mention_count AS mention_count,
+                   r.context_snippets AS context_snippets,
+                   r.audit_status AS audit_status,
+                   r.first_mentioned AS first_mentioned,
+                   r.last_mentioned AS last_mentioned
+            ORDER BY r.strength ASC
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        return [dict(rec) for rec in result]
+
+
+def get_relationship_type_distribution() -> dict[str, int]:
+    """Return count of relationships by type."""
+    driver = get_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH ()-[r]->()
+            RETURN type(r) AS rel_type, count(r) AS cnt
+            ORDER BY cnt DESC
+            """
+        )
+        return {rec["rel_type"]: rec["cnt"] for rec in result}
+
+
+def set_relationship_audit_status(
+    head: str, tail: str, rel_type: str, status: str,
+) -> None:
+    """Set audit_status on a specific edge.
+
+    Status: 'verified' | 'quarantined' | 'auto_fixed'
+    """
+    driver = get_driver()
+    if rel_type not in VALID_REL_TYPES:
+        return
+    with driver.session() as session:
+        session.run(
+            f"""MATCH (h:Entity {{name: $head}})-[r:{rel_type}]->(t:Entity {{name: $tail}})
+                SET r.audit_status = $status""",
+            head=head,
+            tail=tail,
+            status=status,
+        )
+
+
+def reclassify_relationship(
+    head: str,
+    tail: str,
+    old_type: str,
+    new_type: str,
+    strength: float,
+    mention_count: int,
+    context_snippets: list[str] | None = None,
+    first_mentioned: str | None = None,
+) -> None:
+    """Delete old rel, merge new one with corrected type + audit_status='auto_fixed'.
+
+    Uses MERGE (not CREATE) for the new edge so that repeated reclassifications
+    of the same entity pair merge into an existing edge rather than creating
+    duplicates.  Preserves strength, mention_count, context_snippets, and
+    timestamps.  Uses an explicit transaction so delete + merge are atomic.
+    """
+    driver = get_driver()
+    if old_type not in VALID_REL_TYPES or new_type not in VALID_REL_TYPES:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    snippets = context_snippets or []
+    first_ts = first_mentioned or now
+    with driver.session() as session:
+        with session.begin_transaction() as tx:
+            tx.run(
+                f"""MATCH (h:Entity {{name: $head}})-[r:{old_type}]->(t:Entity {{name: $tail}})
+                    DELETE r""",
+                head=head,
+                tail=tail,
+            )
+            tx.run(
+                f"""MATCH (h:Entity {{name: $head}})
+                    MATCH (t:Entity {{name: $tail}})
+                    MERGE (h)-[r:{new_type}]->(t)
+                    ON CREATE SET
+                        r.strength = $strength,
+                        r.mention_count = $mention_count,
+                        r.context_snippets = $snippets,
+                        r.first_mentioned = $first_mentioned,
+                        r.last_mentioned = $now,
+                        r.audit_status = 'auto_fixed'
+                    ON MATCH SET
+                        r.strength = CASE WHEN $strength > r.strength THEN $strength ELSE r.strength END,
+                        r.mention_count = r.mention_count + $mention_count,
+                        r.context_snippets = CASE
+                            WHEN size(r.context_snippets) >= 3
+                            THEN r.context_snippets[1..] + $snippets
+                            ELSE r.context_snippets + $snippets
+                        END,
+                        r.last_mentioned = $now,
+                        r.audit_status = 'auto_fixed'""",
+                head=head,
+                tail=tail,
+                strength=strength,
+                mention_count=mention_count,
+                snippets=snippets,
+                first_mentioned=first_ts,
+                now=now,
+            )
+            tx.commit()
+
+
+def delete_specific_relationship(head: str, tail: str, rel_type: str) -> bool:
+    """Delete a specific edge. Returns True if deleted."""
+    driver = get_driver()
+    if rel_type not in VALID_REL_TYPES:
+        return False
+    with driver.session() as session:
+        result = session.run(
+            f"""MATCH (h:Entity {{name: $head}})-[r:{rel_type}]->(t:Entity {{name: $tail}})
+                DELETE r
+                RETURN count(r) AS deleted""",
+            head=head,
+            tail=tail,
+        )
+        record = result.single()
+        return record is not None and record["deleted"] > 0
 
 
 # --- Stats ---

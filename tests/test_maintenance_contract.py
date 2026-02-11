@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -40,6 +40,12 @@ class _ImmediateImprover:
     async def run_weekly_assessment(self):
         return "2026-02-08.md"
 
+    async def propose_skill_updates(self, patterns):
+        return {"proposed": 0}
+
+    async def propose_tool_updates(self, **kwargs):
+        return {"proposed": 0}
+
 
 class _BlockingImprover:
     def __init__(self):
@@ -64,6 +70,12 @@ class _BlockingImprover:
     async def run_gliner_nightly_cycle(self):
         return {"status": "insufficient_examples", "message": "not-ready"}
 
+    async def propose_skill_updates(self, patterns):
+        return {"proposed": 0}
+
+    async def propose_tool_updates(self, **kwargs):
+        return {"proposed": 0}
+
     async def run_weekly_assessment(self):
         return "2026-02-08.md"
 
@@ -78,6 +90,12 @@ def _fake_graph_module() -> types.ModuleType:
     }
     module.entity_count = lambda: 10
     module.relationship_count = lambda: 20
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__ = MagicMock(return_value=mock_session)
+    mock_driver.session.return_value.__exit__ = MagicMock(return_value=False)
+    mock_session.run.return_value = MagicMock(single=MagicMock(return_value=None))
+    module.get_driver = lambda: mock_driver
     return module
 
 
@@ -115,12 +133,60 @@ class TestMaintenanceSchedulingContract(unittest.TestCase):
 class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
     def _runtime_harness(self, temp_root: Path, improver, strength_side_effect=None):
         stack = ExitStack()
+
+        # Build a fake relationship_audit module
+        fake_rel_audit = types.ModuleType("memory.relationship_audit")
+
+        async def _fake_run_rel_audit(**kwargs):
+            return {
+                "auto_fixes_applied": 0,
+                "quarantined_count": 0,
+                "deterministic_result": {"status": "pass"},
+            }
+
+        fake_rel_audit.run_relationship_audit = _fake_run_rel_audit
+
+        # Build a fake retriever with a conn-bearing vectorstore
+        fake_retriever = types.ModuleType("memory.retriever")
+        _mock_conn = MagicMock()
+        _mock_conn.execute.return_value.fetchall.return_value = []
+        _mock_vs = MagicMock()
+        _mock_vs.conn = _mock_conn
+        fake_retriever.get_vectorstore = lambda: _mock_vs
+
+        # Build a fake foundry_adapter (needs FoundrySequenceSignal for self_improve import)
+        from dataclasses import dataclass
+
+        fake_foundry = types.ModuleType("foundry_adapter")
+        fake_foundry.load_foundry_sequence_signals = lambda days=7: {}
+
+        @dataclass(frozen=True)
+        class _FakeSignal:
+            steps: tuple = ()
+            count: int = 0
+            successes: int = 0
+            latest_at: str = ""
+
+            @property
+            def success_rate(self):
+                return 0.0
+
+        fake_foundry.FoundrySequenceSignal = _FakeSignal
+
+        # Build a fake graph_suggestions
+        fake_gs = types.ModuleType("memory.graph_suggestions")
+        fake_gs.build_suggestion_digest = lambda: ""
+
         stack.enter_context(
             patch.dict(
                 sys.modules,
                 {
                     "memory.graph": _fake_graph_module(),
                     "health": _fake_health_module(),
+                    "memory.relationship_audit": fake_rel_audit,
+                    "memory.retriever": fake_retriever,
+                    "foundry_adapter": fake_foundry,
+                    "memory.graph_suggestions": fake_gs,
                 },
             )
         )
