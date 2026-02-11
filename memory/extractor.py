@@ -110,6 +110,26 @@ RELATION_SCHEMA = {
         "description": "Person works together with another person but not at the same organization",
         "threshold": 0.45,
     },
+    "customer of": {
+        "description": "Person is a customer, subscriber, or account holder at a company or service",
+        "threshold": 0.5,
+    },
+    "attends": {
+        "description": "Person attends or is enrolled at a school, program, or recurring event",
+        "threshold": 0.45,
+    },
+    "parent of": {
+        "description": "Person is the parent or guardian of another person (typically a child)",
+        "threshold": 0.5,
+    },
+    "child of": {
+        "description": "Person is the child of another person",
+        "threshold": 0.5,
+    },
+    "received from": {
+        "description": "Person received a delivery, package, email, or communication from an organization or person",
+        "threshold": 0.5,
+    },
 }
 
 # Message type classification
