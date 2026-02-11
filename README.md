@@ -57,6 +57,7 @@ molly/
 ├── web.py               # FastAPI web UI backend (WebSocket chat)
 ├── terminal.py          # Standalone CLI REPL for debugging
 ├── database.py          # SQLite message store
+├── contacts.py          # Google Contacts phone→name resolution + graph enrichment
 ├── agent.py             # Claude Agent SDK wrapper, sub-agents, identity loading
 ├── approval.py          # Action approval flow (WhatsApp yes/no)
 ├── commands.py          # /help, /clear, /memory, /graph, /forget, /status, /upgrade, /mute, /tiers
@@ -67,7 +68,8 @@ molly/
 ├── skills.py            # Dynamic skill trigger matching, hot-reload, lifecycle
 ├── scripts/
 │   ├── run_molly.sh     # Supervisor loop with restart-on-exit-code support
-│   └── run_preprod_readiness_audit.py # Track F pre-prod gate/report generator
+│   ├── run_preprod_readiness_audit.py # Track F pre-prod gate/report generator
+│   └── import_contacts.py # vCard (.vcf) → store/contacts.json converter
 ├── web/
 │   └── index.html       # Chat UI (single-page, no framework)
 ├── tools/
@@ -151,6 +153,7 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Recent Updates (February 2026)
 
+- Added Google Contacts phone resolution: import contacts from vCard via `scripts/import_contacts.py`, resolve phone→name in WhatsApp sender names, `/groups` DM listings, and iMessage handles. Resolved contacts are enriched into the knowledge graph as `CONTACT_OF` relationships.
 - Added triage quality overhaul: deterministic pre-filter skips the local model for automated senders, transactional subjects, and known sender tiers. Channel-aware system prompts (email/iMessage/group) replace the generic classifier. Email prompt is aggressively noise-biased — only real humans writing directly to Brian get through.
 - Added sender tier management: `/upgrade`, `/downgrade`, `/mute`, `/tiers` commands let Brian manually control sender classification. Tiers persist in `sender_tiers` SQLite table and feed into both the pre-filter and LLM context.
 - Added preference signal feedback loop: dismissed sender patterns (2+ dismissals) are now injected into triage context, biasing the model toward noise for repeatedly dismissed senders.

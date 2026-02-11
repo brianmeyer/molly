@@ -17,12 +17,31 @@ WHATSAPP_JID_ALLOWED_SERVERS = {"lid", "g.us", "broadcast"}
 
 
 def _resolve_sender_name(sender_jid: str, pushname: str) -> str:
-    """Resolve a sender name using pushname → phone fallback."""
+    """Resolve a sender name using pushname → contacts → phone fallback."""
     phone = sender_jid.split("@")[0]
 
     # Prefer WhatsApp pushname when available.
     if pushname:
+        from contacts import get_resolver
+        get_resolver().cache_pushname(phone, pushname)
         return pushname
+
+    # Try Google Contacts lookup.
+    try:
+        from contacts import get_resolver
+        resolver = get_resolver()
+        entry = resolver.resolve_phone_entry(phone)
+        if entry:
+            # Fire-and-forget graph enrichment in daemon thread.
+            import threading
+            threading.Thread(
+                target=resolver.enrich_graph,
+                args=(entry["name"], phone, "contacts_json", entry.get("email", "")),
+                daemon=True,
+            ).start()
+            return entry["name"]
+    except Exception:
+        pass
 
     # Final fallback: raw phone number.
     return phone
