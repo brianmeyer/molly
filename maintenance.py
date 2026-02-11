@@ -334,6 +334,54 @@ def write_health_check():
 # ---------------------------------------------------------------------------
 
 
+def _compute_operational_insights() -> dict:
+    """Compute 24h tool success rates, flag failing tools, find unused skills."""
+    from memory.retriever import get_vectorstore
+
+    vs = get_vectorstore()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    # Tool success rates (last 24h)
+    cursor = vs.conn.execute(
+        """SELECT tool_name,
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes
+           FROM tool_calls
+           WHERE created_at > ?
+             AND tool_name NOT LIKE 'routing:%'
+             AND tool_name NOT LIKE 'approval:%'
+           GROUP BY tool_name
+           ORDER BY total DESC""",
+        (cutoff,),
+    )
+    failing_tools: list[str] = []
+    tool_count = 0
+    for row in cursor.fetchall():
+        tool_count += 1
+        total = row[1]
+        successes = row[2]
+        rate = successes / total if total > 0 else 0
+        if total >= 3 and rate < 0.9:
+            failing_tools.append(f"{row[0]} ({successes}/{total}={rate:.0%})")
+
+    # Unused skills (7+ days since last execution)
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    cursor = vs.conn.execute(
+        "SELECT DISTINCT skill_name FROM skill_executions WHERE created_at > ?",
+        (stale_cutoff,),
+    )
+    recent_skills = {row[0] for row in cursor.fetchall()}
+    cursor = vs.conn.execute("SELECT DISTINCT skill_name FROM skill_executions")
+    all_skills = {row[0] for row in cursor.fetchall()}
+    unused = sorted(all_skills - recent_skills)
+
+    return {
+        "tool_count_24h": tool_count,
+        "failing_tools": failing_tools,
+        "unused_skills": unused,
+    }
+
+
 def _run_strength_decay() -> int:
     """Task 1: Recalculate strength for all entities."""
     from memory.graph import run_strength_decay
@@ -451,17 +499,48 @@ def _prune_daily_logs() -> int:
     memory_dir = config.WORKSPACE / "memory"
     archive_dir = memory_dir / "archive"
     cutoff = (date.today() - timedelta(days=30)).isoformat()
-    moved = 0
+    archived = 0
+    deleted = 0
 
     for path in memory_dir.glob("????-??-??.md"):
         if path.stem < cutoff:
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(path), str(archive_dir / path.name))
-            moved += 1
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(archive_dir / path.name))
+                archived += 1
+            except OSError:
+                log.debug("Failed to archive %s", path, exc_info=True)
 
-    if moved:
-        log.info("Archived %d daily logs older than %s", moved, cutoff)
-    return moved
+    # Cleanup JSONL files in graph_suggestions/ older than 30 days
+    gs_dir = config.WORKSPACE / "memory" / "graph_suggestions"
+    if gs_dir.is_dir():
+        for path in gs_dir.glob("????-??-??.jsonl"):
+            if path.stem < cutoff:
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    log.debug("Failed to delete %s", path, exc_info=True)
+
+    # Cleanup JSONL files in foundry/observations/ older than 30 days
+    fo_dir = config.WORKSPACE / "foundry" / "observations"
+    if fo_dir.is_dir():
+        for path in fo_dir.glob("????-??-??.jsonl"):
+            if path.stem < cutoff:
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    log.debug("Failed to delete %s", path, exc_info=True)
+
+    parts = []
+    if archived:
+        parts.append(f"archived {archived} daily log(s)")
+    if deleted:
+        parts.append(f"deleted {deleted} JSONL file(s)")
+    if parts:
+        log.info("%s older than %s", ", ".join(parts).capitalize(), cutoff)
+    return archived + deleted
 
 
 def _slugify(text: str) -> str:
@@ -543,46 +622,48 @@ def _record_maintenance_issues(
     notified = 0
     try:
         conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
-        ensure_issue_registry_tables(conn)
-        now = datetime.now(timezone.utc).isoformat()
-        for task_name, result in results.items():
-            check_id = f"{MAINTENANCE_STEP_PREFIX}{_slugify(task_name)}"
-            severity = _severity_from_result(result)
-            issue = upsert_issue(
-                conn,
-                check_id=check_id,
-                severity=severity,
-                detail=str(result),
-                source="maintenance",
-                observed_at=now,
-            )
-            synced += 1
-            if severity not in {"yellow", "red"}:
-                continue
-            last_notified = _issue_last_notified_at(conn, issue["fingerprint"])
-            if should_notify(
-                fingerprint=issue["fingerprint"],
-                cooldown_hours=MAINTENANCE_NOTIFY_COOLDOWN_HOURS,
-                last_notified_at=last_notified,
-                severity_changed=bool(issue.get("severity_changed", False)),
-            ):
-                plan = route_health_signal(check_id, severity)
-                append_issue_event(
+        try:
+            ensure_issue_registry_tables(conn)
+            now = datetime.now(timezone.utc).isoformat()
+            for task_name, result in results.items():
+                check_id = f"{MAINTENANCE_STEP_PREFIX}{_slugify(task_name)}"
+                severity = _severity_from_result(result)
+                issue = upsert_issue(
                     conn,
-                    issue_fingerprint=issue["fingerprint"],
-                    event_type="notified",
-                    created_at=now,
-                    payload={
-                        "task": task_name,
-                        "result": result,
-                        "run_status": run_status,
-                        "action": plan.action,
-                        "suggested_action": plan.suggested_action,
-                    },
+                    check_id=check_id,
+                    severity=severity,
+                    detail=str(result),
+                    source="maintenance",
+                    observed_at=now,
                 )
-                notified += 1
-        conn.commit()
-        conn.close()
+                synced += 1
+                if severity not in {"yellow", "red"}:
+                    continue
+                last_notified = _issue_last_notified_at(conn, issue["fingerprint"])
+                if should_notify(
+                    fingerprint=issue["fingerprint"],
+                    cooldown_hours=MAINTENANCE_NOTIFY_COOLDOWN_HOURS,
+                    last_notified_at=last_notified,
+                    severity_changed=bool(issue.get("severity_changed", False)),
+                ):
+                    plan = route_health_signal(check_id, severity)
+                    append_issue_event(
+                        conn,
+                        issue_fingerprint=issue["fingerprint"],
+                        event_type="notified",
+                        created_at=now,
+                        payload={
+                            "task": task_name,
+                            "result": result,
+                            "run_status": run_status,
+                            "action": plan.action,
+                            "suggested_action": plan.suggested_action,
+                        },
+                    )
+                    notified += 1
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         log.debug("Maintenance issue registry sync failed", exc_info=True)
     return synced, notified
@@ -779,6 +860,31 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 log.error("Orphan cleanup failed", exc_info=True)
                 _record_step("Orphan cleanup", "failed", failed=True)
 
+            # Step 4.5: Neo4j transaction log checkpoint
+            try:
+                from memory.graph import get_driver
+
+                driver = get_driver()
+                with driver.session() as neo_session:
+                    # Detect edition — db.checkpoint() is Enterprise-only
+                    # Try modern syntax first (Neo4j 5.x+), fall back to legacy
+                    try:
+                        comp = neo_session.run("SHOW SERVER INFO YIELD edition")
+                        comp_record = comp.single()
+                        edition = str(comp_record.get("edition", "")).lower() if comp_record else ""
+                    except Exception:
+                        comp = neo_session.run("CALL dbms.components()")
+                        comp_record = comp.single()
+                        edition = str(comp_record.get("edition", "")).lower() if comp_record else ""
+                    if "enterprise" in edition:
+                        neo_session.run("CALL db.checkpoint()")
+                        _record_step("Neo4j checkpoint", "completed")
+                    else:
+                        _record_step("Neo4j checkpoint", f"skipped ({edition or 'unknown'} edition)")
+            except Exception:
+                log.error("Neo4j checkpoint failed", exc_info=True)
+                _record_step("Neo4j checkpoint", "failed", failed=True)
+
             # Step 5: Phase 7 memory optimization loop
             try:
                 improver = await _ensure_improver()
@@ -830,6 +936,94 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 log.error("GLiNER closed-loop run failed", exc_info=True)
                 _record_step("GLiNER loop", "failed", failed=True)
 
+            # Step 7.5: Operational insights (24h tool success rates, unused skills)
+            try:
+                insights = _compute_operational_insights()
+                parts = [f"{insights['tool_count_24h']} tools active"]
+                if insights["failing_tools"]:
+                    parts.append(f"failing: {', '.join(insights['failing_tools'][:5])}")
+                if insights["unused_skills"]:
+                    parts.append(f"unused skills (7d): {', '.join(insights['unused_skills'][:5])}")
+                _record_step("Operational insights", "; ".join(parts))
+            except Exception:
+                log.error("Operational insights failed", exc_info=True)
+                _record_step("Operational insights", "failed", failed=True)
+
+            # Step 7.6: Foundry skill scan (nightly pattern detection)
+            try:
+                improver = await _ensure_improver()
+                from foundry_adapter import load_foundry_sequence_signals
+
+                signals = load_foundry_sequence_signals(days=7)
+                patterns = [
+                    {
+                        "steps": list(sig.steps),
+                        "count": sig.count,
+                        "confidence": sig.success_rate,
+                        "name": key,
+                        "steps_text": key,
+                    }
+                    for key, sig in signals.items()
+                    if sig.count >= 3
+                ]
+                if patterns:
+                    skill_result = await improver.propose_skill_updates(patterns)
+                    _record_step("Foundry skill scan", str(skill_result.get("status", "no candidates")))
+                else:
+                    _record_step("Foundry skill scan", "no qualifying patterns")
+            except Exception:
+                log.error("Foundry skill scan failed", exc_info=True)
+                _record_step("Foundry skill scan", "failed", failed=True)
+
+            # Step 7.7: Tool gap scan (nightly failure analysis)
+            try:
+                improver = await _ensure_improver()
+                gap_result = await improver.propose_tool_updates(
+                    days=7, min_failures=5,
+                )
+                _record_step("Tool gap scan", str(gap_result.get("status", "no gaps")))
+            except Exception:
+                log.error("Tool gap scan failed", exc_info=True)
+                _record_step("Tool gap scan", "failed", failed=True)
+
+            # Step 7.8: Correction pattern analysis
+            try:
+                from memory.retriever import get_vectorstore
+                vs = get_vectorstore()
+                cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+                cursor = vs.conn.execute(
+                    "SELECT pattern, COUNT(*) as cnt FROM corrections "
+                    "WHERE created_at > ? GROUP BY pattern ORDER BY cnt DESC LIMIT 10",
+                    (cutoff_24h,),
+                )
+                pattern_rows = cursor.fetchall()
+
+                cursor = vs.conn.execute(
+                    "SELECT molly_output, user_correction, pattern FROM corrections "
+                    "WHERE created_at > ? ORDER BY created_at DESC LIMIT 5",
+                    (cutoff_24h,),
+                )
+                example_rows = cursor.fetchall()
+
+                total_corrections = sum(row[1] for row in pattern_rows)
+                if total_corrections == 0:
+                    _record_step("Correction patterns", "0 corrections in last 24h")
+                else:
+                    parts = [f"{total_corrections} correction(s) in last 24h"]
+                    for row in pattern_rows[:5]:
+                        parts.append(f"  '{row[0]}': {row[1]}x")
+                    if example_rows:
+                        parts.append("Recent examples:")
+                        for ex in example_rows[:3]:
+                            molly_out = (ex[0] or "")[:80]
+                            user_corr = (ex[1] or "")[:80]
+                            parts.append(f"  Molly: {molly_out}... -> User: {user_corr}...")
+                    _record_step("Correction patterns", "\n".join(parts))
+            except Exception:
+                log.error("Correction pattern analysis failed", exc_info=True)
+                _record_step("Correction patterns", "failed", failed=True)
+
             # Step 8: Weekly assessment catch-up if due/overdue.
             try:
                 improver = await _ensure_improver()
@@ -861,6 +1055,19 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
             except Exception:
                 log.error("Health Doctor run failed", exc_info=True)
                 _record_step("Health Doctor", "failed", failed=True)
+
+            # Step 9.5: Graph suggestions digest
+            try:
+                from memory.graph_suggestions import build_suggestion_digest
+
+                digest = build_suggestion_digest()
+                if digest:
+                    _record_step("Graph suggestions", digest[:500])
+                else:
+                    _record_step("Graph suggestions", "no suggestions today")
+            except Exception:
+                log.error("Graph suggestions digest failed", exc_info=True)
+                _record_step("Graph suggestions", "failed", failed=True)
 
             # Step 10: Contract audits (deterministic first, model second)
             try:

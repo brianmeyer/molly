@@ -194,6 +194,11 @@ def upsert_relationship(
     # Sanitize relationship type against whitelist
     label = rel_type.strip().upper().replace(" ", "_")
     if label not in VALID_REL_TYPES:
+        try:
+            from memory.graph_suggestions import log_relationship_fallback
+            log_relationship_fallback(head_name, tail_name, rel_type, confidence, context_snippet)
+        except Exception:
+            log.debug("graph suggestion fallback logging failed", exc_info=True)
         label = "RELATED_TO"
 
     snippet = context_snippet[:200]
@@ -202,7 +207,7 @@ def upsert_relationship(
         # Dynamic relationship type requires a workaround since Cypher
         # doesn't allow parameterized relationship types.
         # Validated against whitelist above, so f-string is safe.
-        session.run(
+        result = session.run(
             f"""MATCH (h:Entity {{name: $head}})
                 MATCH (t:Entity {{name: $tail}})
                 MERGE (h)-[r:{label}]->(t)
@@ -222,13 +227,25 @@ def upsert_relationship(
                         WHEN size(r.context_snippets) >= 3
                         THEN r.context_snippets[1..] + [$snippet]
                         ELSE r.context_snippets + [$snippet]
-                    END""",
+                    END
+                RETURN r.mention_count AS mention_count""",
             head=head_name,
             tail=tail_name,
             now=now,
             confidence=confidence,
             snippet=snippet,
         )
+
+        # Log RELATED_TO hotspots when mention count crosses threshold
+        if label == "RELATED_TO":
+            try:
+                record = result.single()
+                mention_count = record["mention_count"] if record else 0
+                if mention_count == 3:  # Fires once at threshold; nightly get_related_to_hotspots() catches persistent hotspots
+                    from memory.graph_suggestions import log_repeated_related_to
+                    log_repeated_related_to(head_name, tail_name, mention_count)
+            except Exception:
+                log.debug("graph suggestion hotspot logging failed", exc_info=True)
 
 
 def create_episode(
