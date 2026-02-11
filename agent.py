@@ -135,6 +135,9 @@ def _load_mcp_servers() -> dict[str, object]:
     return servers
 
 
+_MAX_DAILY_LOG_BYTES = 35_000
+
+
 def load_identity_stack() -> str:
     """Read and concatenate all identity files into system prompt."""
     parts = []
@@ -142,12 +145,18 @@ def load_identity_stack() -> str:
         if path.exists():
             parts.append(f"<!-- {path.name} -->\n{path.read_text()}")
 
-    # Add today's and yesterday's daily logs
+    # Add today's and yesterday's daily logs (tail-truncated to cap context size)
     today = date.today()
     for d in [today, today - timedelta(days=1)]:
         log_path = config.WORKSPACE / "memory" / f"{d.isoformat()}.md"
         if log_path.exists():
-            parts.append(f"<!-- Daily Log: {d.isoformat()} -->\n{log_path.read_text()}")
+            content = log_path.read_text()
+            if len(content) > _MAX_DAILY_LOG_BYTES:
+                content = (
+                    f"[... truncated {len(content) - _MAX_DAILY_LOG_BYTES} bytes ...]\n"
+                    + content[-_MAX_DAILY_LOG_BYTES:]
+                )
+            parts.append(f"<!-- Daily Log: {d.isoformat()} -->\n{content}")
 
     return "\n\n---\n\n".join(parts)
 
@@ -804,12 +813,25 @@ async def handle_message(
                     failure_detail = type(exc).__name__
                     recoverable = _is_recoverable_transport_error(exc)
                     if recoverable:
-                        log.warning(
-                            "Recoverable Claude transport error in %s (attempt %d/2): %s",
-                            chat_id,
-                            attempt + 1,
-                            exc,
+                        # If buffer overflow, the session itself is too large — reset it
+                        is_overflow = any(
+                            "buffer size" in str(e).lower()
+                            for e in _iter_exceptions(exc)
                         )
+                        if is_overflow:
+                            log.warning(
+                                "Session buffer overflow in %s — resetting session (attempt %d/2)",
+                                chat_id,
+                                attempt + 1,
+                            )
+                            runtime.session_id = None
+                        else:
+                            log.warning(
+                                "Recoverable Claude transport error in %s (attempt %d/2): %s",
+                                chat_id,
+                                attempt + 1,
+                                exc,
+                            )
                         await _disconnect_runtime(runtime)
                         if approval_manager and hasattr(approval_manager, "cancel_pending"):
                             with suppress(Exception):
