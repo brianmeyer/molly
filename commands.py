@@ -37,7 +37,11 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             "/followups - Show active commitments + Apple Reminders sync status\n"
             "/commitments - Alias for /followups\n"
             "/health - Show latest health report (or generate one)\n"
-            "/health history - Show 7-day health trend"
+            "/health history - Show 7-day health trend\n"
+            "/upgrade <sender> - Mark a sender as upgraded (bias toward relevant)\n"
+            "/downgrade <sender> - Mark a sender as downgraded (bias toward background)\n"
+            "/mute <sender> - Mute a sender (always classified as noise)\n"
+            "/tiers - List all sender tier overrides + config VIPs"
         )
 
     if cmd == "/clear":
@@ -225,6 +229,14 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
                 phone = jid.split("@")[0]
                 stored = info.get("name", "")
                 name = stored if stored and stored != phone else None
+
+                # Try Google Contacts resolver
+                if not name:
+                    try:
+                        from contacts import get_resolver
+                        name = get_resolver().resolve_phone(phone)
+                    except Exception:
+                        pass
 
                 # Final fallback: formatted phone number
                 if not name:
@@ -415,5 +427,75 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
         except Exception as e:
             log.error("/health failed", exc_info=True)
             return f"Health check failed: {e}"
+
+    if cmd == "/upgrade":
+        if not args:
+            return "Usage: /upgrade <sender>"
+        try:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            vs.upsert_sender_tier(args.strip(), "upgraded")
+            return f"Upgraded '{args.strip()}' — messages will bias toward relevant."
+        except Exception as e:
+            log.error("/upgrade failed", exc_info=True)
+            return f"Upgrade failed: {e}"
+
+    if cmd == "/downgrade":
+        if not args:
+            return "Usage: /downgrade <sender>"
+        try:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            vs.upsert_sender_tier(args.strip(), "downgraded")
+            return f"Downgraded '{args.strip()}' — messages will bias toward background."
+        except Exception as e:
+            log.error("/downgrade failed", exc_info=True)
+            return f"Downgrade failed: {e}"
+
+    if cmd == "/mute":
+        if not args:
+            return "Usage: /mute <sender>"
+        try:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            vs.upsert_sender_tier(args.strip(), "muted")
+            return f"Muted '{args.strip()}' — messages will always be classified as noise."
+        except Exception as e:
+            log.error("/mute failed", exc_info=True)
+            return f"Mute failed: {e}"
+
+    if cmd == "/tiers":
+        try:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            tiers = vs.get_sender_tiers()
+        except Exception as e:
+            log.error("/tiers failed", exc_info=True)
+            return f"Tiers lookup failed: {e}"
+
+        lines = []
+
+        # Config VIPs
+        if config.VIP_CONTACTS:
+            lines.append(f"Config VIPs ({len(config.VIP_CONTACTS)}):")
+            for vip in config.VIP_CONTACTS:
+                name = vip.get("name", "?")
+                email = vip.get("email", "")
+                label = f"  {name}"
+                if email:
+                    label += f" ({email})"
+                lines.append(label)
+
+        # DB tier overrides
+        if tiers:
+            if lines:
+                lines.append("")
+            lines.append(f"Sender Tiers ({len(tiers)}):")
+            for t in tiers:
+                lines.append(f"  {t['sender_pattern']} — {t['tier']} (via {t['source']})")
+
+        if not lines:
+            return "No VIP contacts or sender tier overrides configured."
+        return "\n".join(lines)
 
     return None

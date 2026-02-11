@@ -42,6 +42,7 @@ COMMANDS = {
     "/status", "/pending", "/register", "/unregister", "/groups",
     "/skills", "/skill", "/digest", "/automations", "/followups",
     "/commitments", "/health",
+    "/upgrade", "/downgrade", "/mute", "/tiers",
 }
 
 # Chat processing modes (tiered classification)
