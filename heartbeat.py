@@ -666,7 +666,17 @@ async def _check_email(molly):
                 log.debug("Triage failed for email %d", i, exc_info=triage_result)
                 continue
 
-            _msg_id, _internal_ts_ms, sender, subject, snippet, email_text = email_data[i]
+            msg_id, internal_ts_ms, sender, subject, snippet, email_text = email_data[i]
+
+            # Queue non-noise emails for digest
+            if triage_result.classification != "noise":
+                from memory.email_digest import append_digest_item
+                append_digest_item(
+                    msg_id=msg_id, sender=sender, subject=subject,
+                    snippet=snippet, classification=triage_result.classification,
+                    score=triage_result.score, reason=triage_result.reason,
+                    internal_ts_ms=internal_ts_ms,
+                )
 
             if triage_result and triage_result.classification == "urgent":
                 if owner_jid and molly.wa:

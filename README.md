@@ -44,6 +44,7 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | Skill Analytics (`skill_analytics.py`) | Skill gap telemetry, underperformance detection, gap clustering |
 | Triage Pre-Filter (`memory/triage.py`) | Deterministic sender/subject filtering + channel-aware LLM prompts |
 | Graph Suggestions (`memory/graph_suggestions.py`) | Relationship fallback tracking, RELATED_TO hotspot detection, nightly digest |
+| Email Digest Queue (`memory/email_digest.py`) | JSONL queue for triaged emails, per-slot digest builder with high-water consumption tracking |
 | Relationship Audit (`memory/relationship_audit.py`) | Two-tier edge quality audit: 7 deterministic checks + optional Kimi model review |
 
 ## Project Structure
@@ -102,6 +103,7 @@ molly/
     ├── issue_registry.py # Persistent issue/event registry + notification cooldown
     ├── graph.py         # Neo4j client + Cypher queries
     ├── graph_suggestions.py # Relationship fallback + hotspot JSONL logging, nightly digest
+    ├── email_digest.py  # Email digest JSONL queue, per-slot digest builder, cleanup
     └── relationship_audit.py # Two-tier edge quality audit (deterministic + model)
 ```
 
@@ -114,7 +116,7 @@ All channels share the same memory pipeline and call `handle_message()`.
 | WhatsApp | Neonize (Go bridge) | JID | Primary channel, approval flow |
 | Web UI | FastAPI + WebSocket | `web:` | `http://localhost:8080?token=XXX` |
 | Terminal | CLI REPL | `terminal` | `python terminal.py` for debugging |
-| Email | Gmail API poll | `email` | Surfaces urgent emails via WhatsApp |
+| Email | Gmail API poll | `email` | Surfaces urgent emails via WhatsApp, queues non-noise for periodic digests |
 
 ## Memory System
 
@@ -127,6 +129,8 @@ All channels share the same memory pipeline and call `handle_message()`.
 **Graph suggestions** — When a relationship type is not in the 18 whitelisted types, it falls back to RELATED_TO and the original type is logged to JSONL. When a RELATED_TO edge reaches 3+ mentions, it is flagged as a reclassification candidate. The nightly digest combines today's JSONL suggestions with a Neo4j hotspot query, deduplicates, and surfaces actionable recommendations.
 
 **Relationship audit** — Nightly two-tier quality audit of knowledge graph edges. Tier 1 runs 7 deterministic checks: self-referencing edges, zombie edges (missing nodes), entity-type mismatches, contradictions (duplicate employers, symmetric conflicts), low-confidence edges, RELATED_TO accumulation, and new relationship type monitoring. Auto-fixes where safe (reclassify via MERGE, delete, merge contradictions), quarantines uncertain edges, and preserves verified/quarantined status across re-mentions. Tier 2 optionally sends flagged edges to Kimi K2.5 for model-based review with correct/reclassify/delete verdicts.
+
+**Email digest queue** — The heartbeat triages every email and queues non-noise results (urgent, relevant, background) to daily JSONL files in `~/.molly/workspace/memory/email_digest_queue/`. Four scheduled automations build WhatsApp digests at 9 AM, 12 PM, 3 PM, and 6 PM. Each slot maintains an independent high-water timestamp in `state.json` so items are only shown once per slot. Urgent emails appear under "ALREADY NOTIFIED" (they were surfaced in real-time), while relevant and background items appear under "NEW ITEMS". Empty digests are automatically suppressed. JSONL files older than 3 days are pruned by nightly maintenance.
 
 **Correction detection** — When the user replies with correction keywords ("no,", "that's wrong", "actually"), a local LLM (Qwen3-4B) classifies whether it is a genuine correction. Confirmed corrections are logged to the vector store for future retrieval accuracy.
 
@@ -161,6 +165,10 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 | Morning Briefing | Cron (7 AM weekdays) | Calendar, email, commitments summary |
 | Meeting Prep | 30 min before calendar event | Context gathering for upcoming meetings |
 | Email Triage | New unread emails (polled) | Categorize and surface urgent emails |
+| Email Digest (Morning) | Cron (9 AM daily) | Digest of triaged emails since last morning slot |
+| Email Digest (Noon) | Cron (12 PM daily) | Digest of triaged emails since last noon slot |
+| Email Digest (Afternoon) | Cron (3 PM daily) | Digest of triaged emails since last afternoon slot |
+| Email Digest (Evening) | Cron (6 PM daily) | Digest of triaged emails since last evening slot |
 | Commitment Tracker | Owner makes a commitment | Logs and tracks follow-through |
 | End-of-Day Wrap | Cron (6 PM weekdays) | Daily summary if 3+ messages exchanged |
 | Weekend Review | Cron (9 AM Saturday) | Weekly reflection and planning |
@@ -169,10 +177,13 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 **Guards:** Quiet hours (10 PM–7 AM ET, VIP/urgent bypass), deduplication via state.json (payload hash + min interval), condition expressions.
 
+**Direct actions:** Some pipeline steps bypass the LLM entirely for deterministic behavior. `email_digest` builds a formatted digest directly from the JSONL queue without agent delegation. Empty digests (`NO_DIGEST_ITEMS`) suppress WhatsApp delivery automatically.
+
 **Pipeline steps** route through `handle_message()` → Claude Agent SDK, inheriting the full sub-agent and approval system.
 
 ## Recent Updates (February 2026)
 
+- Added email digest queue (`memory/email_digest.py`): heartbeat captures non-noise triaged emails to daily JSONL files, four scheduled automations (morning/noon/afternoon/evening) build WhatsApp-friendly digests via deterministic direct action dispatch (bypasses LLM). Per-slot high-water timestamps in `state.json` prevent repeat delivery. Empty digests are suppressed. 3-day JSONL retention via nightly maintenance. 40 tests.
 - Added Google People, Tasks, Drive, and Meet API integrations with 15 new MCP tools (12 AUTO, 3 CONFIRM). Includes scope detection for automatic re-consent when new APIs are added, 0o600 token file permissions, Drive query injection escaping, 10MB download guard, and paginated Meet transcript retrieval (500-entry cap).
 - Added relationship quality audit (`memory/relationship_audit.py`): two-tier nightly audit with 7 deterministic checks (self-refs, zombies, type mismatches, contradictions, low-confidence, RELATED_TO accumulation, new types) + optional Kimi K2.5 model review. Auto-fixes via MERGE-based reclassify, quarantines uncertain edges, preserves verified/quarantined status on re-mention. Cross-check `_mutated` set prevents stale-snapshot double-processing. 77 tests.
 - Added graph suggestions system (`memory/graph_suggestions.py`): JSONL logging for relationship type fallbacks and RELATED_TO hotspots, nightly digest builder with case-insensitive deduplication against Neo4j, hotspot query for reclassification candidates.
@@ -346,5 +357,5 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - [x] Phase 6: Proactive automation engine, preference signal logging, Grok x_search
 - [x] Phase 7: Learning loops (preference signals, health doctor, automation proposal mining, entity dedup)
 - [x] Phase 8: Self-improvement (guarded self-edit, skill lifecycle, skill gap analytics, hot-reload)
-- [ ] Phase 9: Email triage overhaul (deterministic 3-tier classification, digest scheduling)
+- [ ] Phase 9: Email triage overhaul (deterministic 3-tier classification, ~~digest scheduling~~)
 - [ ] Phase 10: Collaboration

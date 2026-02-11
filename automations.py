@@ -522,6 +522,8 @@ class AutomationEngine:
 
                 if "channel" in step:
                     output = await self._execute_channel_step(automation, step, outputs, run_context)
+                elif self._is_direct_action(step):
+                    output = await self._execute_direct_action(step, outputs, run_context)
                 else:
                     output = await self._execute_agent_step(automation, step, outputs, run_context)
 
@@ -660,6 +662,24 @@ class AutomationEngine:
         email_state["last_query"] = str(payload.get("query", ""))
         email_state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
+    _DIRECT_ACTIONS = {"email_digest"}
+
+    def _is_direct_action(self, step: dict) -> bool:
+        return str(step.get("action", "")).strip() in self._DIRECT_ACTIONS
+
+    async def _execute_direct_action(
+        self,
+        step: dict,
+        outputs: dict[str, dict[str, str]],
+        run_context: dict,
+    ) -> str:
+        action = str(step.get("action", "")).strip()
+        params = step.get("params", {})
+        if action == "email_digest":
+            from memory.email_digest import build_digest
+            return build_digest(str(params.get("slot", "morning")))
+        return f"Unknown direct action: {action}"
+
     async def _execute_agent_step(
         self,
         automation: Automation,
@@ -763,6 +783,10 @@ class AutomationEngine:
             log.info("- Email triage: no actionable items, skipping report")
             return "Skipped delivery: no actionable items"
 
+        if self._should_skip_digest_delivery(automation, outputs, message):
+            log.info("- Email digest: no items, skipping delivery")
+            return "Skipped delivery: no digest items"
+
         self.molly._track_send(self.molly.wa.send_message(owner_jid, message))
         return "Delivered via WhatsApp"
 
@@ -778,6 +802,17 @@ class AutomationEngine:
         classify_output = str(outputs.get("classify", {}).get("output", "")).strip()
         source_text = classify_output or (message or "").strip()
         return not self._email_triage_has_actionable_items(source_text)
+
+    def _should_skip_digest_delivery(
+        self,
+        automation: Automation,
+        outputs: dict[str, dict[str, str]],
+        message: str,
+    ) -> bool:
+        if not automation.automation_id.startswith("email-digest-"):
+            return False
+        source = str(outputs.get("build_digest", {}).get("output", "")) or message or ""
+        return "NO_DIGEST_ITEMS" in source
 
     def _email_triage_has_actionable_items(self, text: str) -> bool:
         content = (text or "").strip()
