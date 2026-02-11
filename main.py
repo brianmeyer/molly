@@ -79,6 +79,53 @@ _TOOL_DEPENDENCY_SPECS = [
         ],
     },
     {
+        "server": "google-people",
+        "tools": {"people_search", "people_get", "people_list"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("google.auth.transport.requests", "google-auth"),
+            ("google.oauth2.credentials", "google-auth"),
+            ("google_auth_oauthlib.flow", "google-auth-oauthlib"),
+            ("googleapiclient.discovery", "google-api-python-client"),
+        ],
+    },
+    {
+        "server": "google-tasks",
+        "tools": {
+            "tasks_list", "tasks_list_tasks", "tasks_create",
+            "tasks_complete", "tasks_delete",
+        },
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("google.auth.transport.requests", "google-auth"),
+            ("google.oauth2.credentials", "google-auth"),
+            ("google_auth_oauthlib.flow", "google-auth-oauthlib"),
+            ("googleapiclient.discovery", "google-api-python-client"),
+        ],
+    },
+    {
+        "server": "google-drive",
+        "tools": {"drive_search", "drive_get", "drive_read"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("google.auth.transport.requests", "google-auth"),
+            ("google.oauth2.credentials", "google-auth"),
+            ("google_auth_oauthlib.flow", "google-auth-oauthlib"),
+            ("googleapiclient.discovery", "google-api-python-client"),
+        ],
+    },
+    {
+        "server": "google-meet",
+        "tools": {"meet_list", "meet_get", "meet_transcripts", "meet_recordings"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("google.auth.transport.requests", "google-auth"),
+            ("google.oauth2.credentials", "google-auth"),
+            ("google_auth_oauthlib.flow", "google-auth-oauthlib"),
+            ("googleapiclient.discovery", "google-api-python-client"),
+        ],
+    },
+    {
         "server": "apple-mcp",
         "tools": {"contacts", "notes", "messages", "mail", "reminders", "calendar", "maps"},
         "requirements": [

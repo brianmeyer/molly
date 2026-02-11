@@ -30,6 +30,10 @@ Channels ──────────┼─ Web UI (FastAPI + WebSocket)    �
 | GLiNER2 | Entity + relationship extraction (DeBERTa-large) |
 | Neo4j | Layer 3: knowledge graph |
 | Qwen3-4B GGUF (`llama-cpp-python`) | Local triage model for message classification |
+| Google People API | Read-only Google Contacts search, lookup, and listing |
+| Google Tasks API | Full CRUD for Google Tasks (create, complete, delete with approval) |
+| Google Drive API | Read-only Drive file search, metadata, and content export |
+| Google Meet API | Read-only meeting records, transcripts, and recordings |
 | apple-mcp (`bunx`) | Contacts, Notes, Messages (send), Mail, Calendar, Maps |
 | Kimi K2.5 (Moonshot) | External research model via MCP tool |
 | Grok (xAI) | External reasoning model via MCP tool |
@@ -78,6 +82,10 @@ molly/
 │   ├── google_auth.py   # Google OAuth token management
 │   ├── calendar.py      # Google Calendar MCP tools
 │   ├── gmail.py         # Gmail MCP tools
+│   ├── google_people.py # Google People/Contacts MCP tools
+│   ├── google_tasks.py  # Google Tasks MCP tools
+│   ├── google_drive.py  # Google Drive MCP tools
+│   ├── google_meet.py   # Google Meet MCP tools
 │   ├── imessage.py      # iMessage MCP tools
 │   ├── reminders.py     # Apple Reminders MCP tools
 │   ├── whatsapp.py      # WhatsApp message search MCP tool
@@ -165,6 +173,7 @@ YAML-based proactive automation engine. Automations live in `~/.molly/workspace/
 
 ## Recent Updates (February 2026)
 
+- Added Google People, Tasks, Drive, and Meet API integrations with 15 new MCP tools (12 AUTO, 3 CONFIRM). Includes scope detection for automatic re-consent when new APIs are added, 0o600 token file permissions, Drive query injection escaping, 10MB download guard, and paginated Meet transcript retrieval (500-entry cap).
 - Added relationship quality audit (`memory/relationship_audit.py`): two-tier nightly audit with 7 deterministic checks (self-refs, zombies, type mismatches, contradictions, low-confidence, RELATED_TO accumulation, new types) + optional Kimi K2.5 model review. Auto-fixes via MERGE-based reclassify, quarantines uncertain edges, preserves verified/quarantined status on re-mention. Cross-check `_mutated` set prevents stale-snapshot double-processing. 77 tests.
 - Added graph suggestions system (`memory/graph_suggestions.py`): JSONL logging for relationship type fallbacks and RELATED_TO hotspots, nightly digest builder with case-insensitive deduplication against Neo4j, hotspot query for reclassification candidates.
 - Added correction detection pipeline: keyword fast-path + local LLM (Qwen3-4B) classification to detect user corrections of Molly's responses, with confirmed corrections logged to the vector store.
@@ -322,7 +331,7 @@ Set `MOLLY_WEB_TOKEN` env var for authentication. A warning is logged if unset.
 - HuggingFace account (for gated EmbeddingGemma model)
 - `llama-cpp-python` (for local triage)
 - Qwen3-4B GGUF file at `~/.molly/models/Qwen_Qwen3-4B-Q4_K_M.gguf`
-- Google Cloud OAuth credentials (optional, for Calendar/Gmail)
+- Google Cloud OAuth credentials (optional, for Calendar/Gmail/People/Tasks/Drive/Meet)
 - Moonshot API key (optional, for Kimi K2.5 research tool)
 - xAI API key (optional, for Grok reasoning tool)
 

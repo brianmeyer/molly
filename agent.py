@@ -31,6 +31,10 @@ log = logging.getLogger(__name__)
 _MCP_SERVER_SPECS = {
     "google-calendar": ("tools.calendar", "calendar_server"),
     "gmail": ("tools.gmail", "gmail_server"),
+    "google-people": ("tools.google_people", "people_server"),
+    "google-tasks": ("tools.google_tasks", "tasks_server"),
+    "google-drive": ("tools.google_drive", "drive_server"),
+    "google-meet": ("tools.google_meet", "meet_server"),
     "apple-mcp": {
         "command": "bunx",
         "args": ["--no-cache", "apple-mcp@latest"],
@@ -47,6 +51,10 @@ _MCP_SERVER_TOOL_NAMES = {
         "calendar_create", "calendar_update", "calendar_delete",
     },
     "gmail": {"gmail_search", "gmail_read", "gmail_draft", "gmail_send", "gmail_reply"},
+    "google-people": {"people_search", "people_get", "people_list"},
+    "google-tasks": {"tasks_list", "tasks_list_tasks", "tasks_create", "tasks_complete", "tasks_delete"},
+    "google-drive": {"drive_search", "drive_get", "drive_read"},
+    "google-meet": {"meet_list", "meet_get", "meet_transcripts", "meet_recordings"},
     "apple-mcp": {
         "contacts", "notes", "messages", "mail", "reminders", "calendar", "maps",
     },
