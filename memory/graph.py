@@ -184,6 +184,21 @@ def upsert_entity(
             return name.strip()
 
 
+def set_entity_properties(name: str, properties: dict) -> None:
+    """Set properties on an existing entity node."""
+    if not properties:
+        return
+    driver = get_driver()
+    # Keys are validated by caller; values are parameterized.
+    set_clauses = ", ".join(f"e.{k} = ${k}" for k in properties)
+    with driver.session() as session:
+        session.run(
+            f"MATCH (e:Entity {{name: $name}}) SET {set_clauses}",
+            name=name,
+            **properties,
+        )
+
+
 def upsert_relationship(
     head_name: str,
     tail_name: str,
@@ -295,7 +310,10 @@ def query_entity(name: str) -> dict[str, Any] | None:
         if not record:
             return None
 
-        entity = dict(record["e"])
+        raw = dict(record["e"])
+        # Strip PII properties that shouldn't flow into LLM context
+        _PII_FIELDS = {"phone", "email"}
+        entity = {k: v for k, v in raw.items() if k not in _PII_FIELDS}
 
         # Get outgoing relationships
         rels_out = session.run(

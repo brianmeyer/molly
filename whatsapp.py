@@ -20,28 +20,29 @@ def _resolve_sender_name(sender_jid: str, pushname: str) -> str:
     """Resolve a sender name using pushname → contacts → phone fallback."""
     phone = sender_jid.split("@")[0]
 
-    # Prefer WhatsApp pushname when available.
-    if pushname:
-        from contacts import get_resolver
-        get_resolver().cache_pushname(phone, pushname)
-        return pushname
-
-    # Try Google Contacts lookup.
     try:
         from contacts import get_resolver
         resolver = get_resolver()
+    except Exception:
+        log.debug("Contact resolver unavailable", exc_info=True)
+        return pushname if pushname else phone
+
+    # Prefer WhatsApp pushname when available.
+    if pushname:
+        resolver.cache_pushname(phone, pushname)
+        # Still enrich graph with contact data if available
         entry = resolver.resolve_phone_entry(phone)
         if entry:
-            # Fire-and-forget graph enrichment in daemon thread.
-            import threading
-            threading.Thread(
-                target=resolver.enrich_graph,
-                args=(entry["name"], phone, "contacts_json", entry.get("email", "")),
-                daemon=True,
-            ).start()
-            return entry["name"]
-    except Exception:
-        pass
+            resolver.submit_enrichment(entry["name"], phone, "contacts_json", entry.get("email", ""))
+        else:
+            resolver.submit_enrichment(pushname, phone, "pushname")
+        return pushname
+
+    # Try Google Contacts lookup.
+    entry = resolver.resolve_phone_entry(phone)
+    if entry:
+        resolver.submit_enrichment(entry["name"], phone, "contacts_json", entry.get("email", ""))
+        return entry["name"]
 
     # Final fallback: raw phone number.
     return phone

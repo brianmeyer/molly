@@ -236,7 +236,7 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
                         from contacts import get_resolver
                         name = get_resolver().resolve_phone(phone)
                     except Exception:
-                        pass
+                        log.debug("Contact resolution failed for %s", phone, exc_info=True)
 
                 # Final fallback: formatted phone number
                 if not name:
