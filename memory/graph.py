@@ -21,6 +21,7 @@ VALID_REL_TYPES = {
     "DEPENDS_ON", "RELATED_TO",
     "CLASSMATE_OF", "STUDIED_AT", "ALUMNI_OF",
     "MENTORS", "MENTORED_BY", "REPORTS_TO", "COLLABORATES_WITH",
+    "CONTACT_OF",
 }
 
 
@@ -47,6 +48,9 @@ def get_driver():
                 )
                 session.run(
                     "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
+                )
+                session.run(
+                    "CREATE INDEX entity_phone IF NOT EXISTS FOR (e:Entity) ON (e.phone)"
                 )
             _driver = drv
             log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
