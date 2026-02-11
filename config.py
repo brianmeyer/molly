@@ -148,6 +148,7 @@ GLINER_LORA_PLATEAU_EPSILON = float(
 WEEKLY_ASSESSMENT_DAY = os.getenv("MOLLY_WEEKLY_ASSESSMENT_DAY", "sunday").strip().lower()
 WEEKLY_ASSESSMENT_HOUR = int(os.getenv("MOLLY_WEEKLY_ASSESSMENT_HOUR", "3"))
 WEEKLY_ASSESSMENT_DIR = WORKSPACE / "memory" / "weekly"
+EMAIL_DIGEST_QUEUE_DIR = WORKSPACE / "memory" / "email_digest_queue"
 TOOL_GAP_MIN_FAILURES = max(1, int(os.getenv("MOLLY_TOOL_GAP_MIN_FAILURES", "5")))
 TOOL_GAP_WINDOW_DAYS = max(1, int(os.getenv("MOLLY_TOOL_GAP_WINDOW_DAYS", "7")))
 

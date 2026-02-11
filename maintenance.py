@@ -522,6 +522,10 @@ def _prune_daily_logs() -> int:
                 except OSError:
                     log.debug("Failed to delete %s", path, exc_info=True)
 
+    # Cleanup JSONL files in email_digest_queue/ older than 3 days
+    from memory.email_digest import cleanup_old_files as _cleanup_digest
+    deleted += _cleanup_digest(keep_days=3)
+
     # Cleanup JSONL files in foundry/observations/ older than 30 days
     fo_dir = config.WORKSPACE / "foundry" / "observations"
     if fo_dir.is_dir():
