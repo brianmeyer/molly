@@ -807,13 +807,73 @@ If zvec is still immature at that point, proceed with the sqlite-vec hybrid path
 1. **Gemini API down** → Four-tier fallback: Qwen local → GPT-4.1 Nano → hardcoded general. Molly routes even when fully offline (Qwen is local).
 2. **Worker fails** → Returns error text for that subtask. Other workers unaffected.
 3. **Rate limits** → Semaphore caps concurrent workers at 3. Configurable.
-4. **Wrong classification** → Two-phase design reduces this. Phase 1 only does simple triage (low error rate). Phase 2 uses a reasoning model (intelligence 46) for complex decomposition. Worst case = same as today.
+4. **Wrong classification** → Two-phase design reduces this. Phase 1 only does simple triage (low error rate). Phase 2 uses Kimi K2.5's Agent Swarm reasoning (designed for multi-agent decomposition) for complex requests. Worst case = same as today.
 5. **Circular dependencies in subtasks** → Detected and force-run remaining. Logged.
 6. **Voice-to-voice session fails** → Gemini Live session fails to start → text channels unaffected. Voice notes still work (async through Flash-Lite).
 7. **Voice cost overrun** → Per-session and daily minute budgets enforced.
 8. **Voice transcript quality** → Gemini Live transcripts may diverge slightly from what the model "heard". Memory pipeline handles this gracefully since it already handles imprecise input.
 9. **Browser tool security** → Sandboxed Chromium profile, no access to main browser cookies. Per-site credential isolation.
 10. **Gemini single-provider dependency for routing** — Mitigated by the four-tier fallback chain. Text routing works without any cloud API (Qwen local). Only live voice-to-voice requires Gemini specifically.
+
+---
+
+## Latency Analysis: Does Two-Phase Orchestration Add Too Much?
+
+The orchestration overhead is real but pays for itself through parallelism gains and scoped workers.
+
+### Critical Path by Message Type
+
+**Direct answer (~20%)** — "thanks", "what time is it?"
+```
+Gemini Flash-Lite triage:  ~0.4s
+                           ─────
+Total:                     ~0.4s   (vs ~5-10s today: Claude thinks, no tools needed but still loads everything)
+```
+Savings: **~5-10s**. Never touches Claude.
+
+**Simple message (~60%)** — "check my calendar for tomorrow"
+```
+Gemini Flash-Lite triage:  ~0.4s
+Claude worker (scoped):    ~5-8s   ← only calendar MCP loaded, less context pollution
+                           ─────
+Total:                     ~5.4-8.4s   (vs ~10-15s today: all MCPs loaded, more context)
+```
+Savings: **~4-7s**. Scoped worker starts faster (fewer tools = less Claude thinking overhead).
+
+**Complex message (~20%)** — "check calendar, find John's email, draft a reply"
+```
+Gemini Flash-Lite triage:  ~0.4s
+Kimi K2.5 decomposition:   ~0.7-1.0s
+Claude workers (parallel):  ~5-10s   ← calendar + email run simultaneously
+Kimi synthesis:             ~0.5-1.0s
+                            ─────
+Total:                      ~6.6-12.4s   (vs ~30-45s today: serial tool calls)
+```
+Savings: **~20-30s**. Parallelism dwarfs the ~1.5-2.5s orchestration overhead.
+
+**Voice note (any complexity)**
+```
+Gemini Flash-Lite (audio):  ~0.4s   ← transcript + classification in one call
+Then same as text path above
+```
+Zero additional latency vs text. No separate STT step.
+
+### Orchestration Overhead Budget
+
+| Component | Latency | When | Impact |
+|---|---|---|---|
+| Gemini Flash-Lite triage | ~0.4s | Every message | Negligible vs 5-10s Claude round-trip |
+| Kimi K2.5 decomposition | ~0.7-1.0s | Complex only (~20%) | Pays for itself 20-30x via parallelism |
+| Kimi synthesis | ~0.5-1.0s | Complex only (~20%) | Necessary to merge parallel results |
+| **Total overhead** | **0.4-2.4s** | | |
+
+### Where It Could Hurt
+
+**Kimi going slow**: If Kimi K2.5 thinking mode takes 3-5s (API congestion, cold start, overthinking), complex messages feel sluggish. Mitigated by `ORCHESTRATOR_DECOMPOSE_TIMEOUT = 5` — exceeds 5s → fall through to `phase1.as_simple_parallel()` (functional but no dependency reasoning).
+
+**Gemini triage misclassifying**: If Flash-Lite marks a complex request as "simple", it goes to one worker that can't handle the full scope. Mitigated by worker response quality checks — if the single worker's output looks incomplete, the orchestrator can escalate and re-dispatch.
+
+**Neither adds net latency in practice**: The 0.4s triage overhead is invisible against a 5-10s Claude worker. The 1.5-2.5s decomposition+synthesis overhead only appears on complex requests where it saves 20-30s. Every message type is faster than today.
 
 ---
 
