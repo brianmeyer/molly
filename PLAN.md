@@ -640,6 +640,45 @@ This means "who sent me photos of the house?" becomes a graph traversal + vector
 
 ---
 
+## Technology Watch List
+
+### Google WebMCP (Watch — Not Actionable Yet)
+
+**What it is**: Browser-native standard (`navigator.modelContext`) that lets websites expose structured tools to AI agents. Shipped in Chrome 146 Canary (Feb 2026). Developed jointly by Google and Microsoft, incubated through W3C Web ML community group.
+
+**Why it doesn't apply today**: Molly is a headless backend agent — no browser, no user present during autonomous tasks (cron, heartbeat, email triage). WebMCP requires a browser and human-in-the-loop confirmation. Molly's existing MCP tools (`tools/calendar.py`, `tools/gmail.py`, etc.) use direct API calls, which are faster and fully autonomous.
+
+**What to watch for**:
+1. **Google Workspace managed MCP servers** — Google launched managed MCP servers for Cloud services (Dec 2025) and plans to cover all Google services. When Gmail/Calendar/Drive/Tasks get official managed MCP servers, they could replace Molly's hand-rolled tools with Google-maintained endpoints (less maintenance, enterprise auth for free).
+2. **Browser-agent mode** — If Molly ever needs to interact with websites lacking APIs (restaurant booking, form filling), a browser channel using WebMCP would be reliable instead of brittle screenshot+click automation. Natural fit alongside the channel abstraction in Phase 4.
+
+**Action**: No changes to the plan. Revisit when Google announces Workspace MCP servers.
+
+### alibaba/zvec (Migration Candidate for Phase 7 — Maturity Gate)
+
+**What it is**: Embedded vector database built on Alibaba's Proxima engine (battle-tested in Taobao/Alipay). HNSW ANN indexing, >8,000 QPS on 10M 768-dim vectors. Apache 2.0. Positions itself as "the SQLite of vector databases" — but it is NOT an SQLite extension. It's a separate embedded DB with its own storage format.
+
+**Current state**: v0.2.0, released Feb 10 2026 (~5 days old), ~1,700 stars. No LangChain/LlamaIndex integrations yet. Documentation is sparse.
+
+**Why it's interesting for Molly**:
+- **Native multi-vector queries** — search across text and image embeddings simultaneously with built-in fusion/reranking. sqlite-vec can't do this; we'd need two separate searches + manual merging in Python.
+- **HNSW indexing** — if conversation chunks grow past ~100K, sqlite-vec's brute-force KNN will slow down. zvec handles millions.
+- **Scalar filter pushdown** — metadata filters execute inside the index path, not as post-filter JOINs.
+
+**Why NOT to switch now**:
+- **5 days old.** Unknown edge cases, incomplete docs, no ecosystem integrations.
+- **Two-database architecture.** Molly's `VectorStore` class is tightly coupled to SQLite — operational tables (`tool_calls`, `skill_executions`, `corrections`, `preference_signals`, `sender_tiers`, `self_improvement_events`) live alongside vectors in one file. zvec would split this into SQLite (relational) + zvec (vectors), adding consistency concerns.
+- **Current scale is fine.** Thousands of chunks, sub-millisecond brute-force. No bottleneck.
+
+**Migration trigger**: When implementing Phase 7 (multimodal embeddings), evaluate zvec maturity at that time. If it has reached v1.0+, has published hybrid search examples, and has LangChain/LlamaIndex integrations, architect the new multi-vector search layer around zvec instead of adding more sqlite-vec virtual tables. The architecture would be:
+- **SQLite** stays for all relational/operational tables
+- **zvec** handles all vector storage (text + image embeddings, multi-vector queries with native fusion)
+- `search()` becomes: zvec query → IDs + scores → SQLite metadata lookup
+
+If zvec is still immature at that point, proceed with the sqlite-vec hybrid path (separate `visual_vec` table) as described in Phase 7, and revisit zvec later.
+
+---
+
 ## Risk Mitigation
 
 1. **Kimi API down** → Qwen local router takes over. If Qwen fails → single general worker (same as today).
