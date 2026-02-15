@@ -1668,14 +1668,6 @@ def main():
         sys.exit(1)
 
     try:
-        try:
-            import uvloop
-
-            uvloop.install()
-            log.info("uvloop event loop policy installed")
-        except Exception:
-            log.debug("uvloop unavailable; using default asyncio loop", exc_info=True)
-
         preflight_checks()
 
         molly = Molly()
