@@ -38,7 +38,7 @@ These are genuinely ahead of OpenClaw and must not be degraded:
 
 ---
 
-## The Core Change: Two-Phase Gemini Orchestrator + Parallel Claude Workers
+## The Core Change: Two-Phase Orchestrator + Parallel Claude Workers
 
 ### Current Flow (Serial)
 ```
@@ -54,11 +54,11 @@ Message (text or audio) →
     ├── "direct: <answer>"     → respond immediately (no Claude)
     ├── "simple: <profile>"    → dispatch one scoped Claude worker (~5-10s)
     └── "complex"              →
-          Phase 2: Gemini 3 Flash (~0.7s) →
+          Phase 2: Kimi K2.5 thinking mode (~0.7-1s) →
             Full decomposition: subtasks, dependencies, model tiers
             → Multiple Claude workers via asyncio.gather (~5-10s)
                   ↓
-            Gemini synthesizes results (~0.5-1s)
+            Kimi synthesizes results (~0.5-1s)
                   ↓
             Final response
 ```
@@ -79,19 +79,28 @@ Using one model for both means either paying for reasoning you don't need (expen
 |---|---|---|---|---|---|
 | GPT-4.1 Nano | **$0.02** | $0.15 | 0.37s | 13 | Cheapest, but too dumb for decomposition |
 | Gemini 2.5 Flash-Lite | $0.10 | $0.40 | **0.29s** | ~20 | Fastest TTFT, free tier, multimodal (audio+image) |
-| Gemini 3 Flash | $0.50 | $3.00 | 0.40s | **46** | Beats old 2.5 Pro, strong reasoning |
+| Gemini 3 Flash | $0.50 | $3.00 | 0.40s | **46** | Strong general reasoning, but not agent-specialized |
 | Grok 4.1 Fast | $0.20 | $0.50 | 0.40s | 24 | Good value but no multimodal input |
 | DeepSeek V3.2 | $0.28 | $0.42 | 1.2-7.5s | High | **Too slow** — 3.5-9s total latency |
-| Kimi K2.5 | $0.60 | $2.50 | 0.62s | High | Good but expensive for triage, no audio input |
+| Kimi K2.5 | $0.60 | $2.50 | 0.62s | High | **Agent Swarm** — designed for multi-agent orchestration, thinking mode |
 | Claude Haiku 4.5 | $1.00 | $5.00 | 0.50s | ~30 | 10x pricier than Flash-Lite on input |
 
-**Decision**: Gemini wins because:
-1. **Unified voice + text pipeline** — Flash-Lite accepts audio input natively, so voice notes get transcribed AND classified in one API call (no separate STT)
-2. **Two-tier quality** — Flash-Lite for fast routing, 3 Flash for reasoning when needed
-3. **Molly already has `GEMINI_API_KEY`** — no new credentials needed
-4. **Provider diversity** — Gemini routes, Claude works. No single-provider dependency.
-5. **Free tier** — development and testing at zero cost
-6. **Gemini Live API** — same key, same provider for live voice-to-voice sessions
+**Decision**: Split by phase — each model where it's strongest:
+
+**Phase 1 triage → Gemini 2.5 Flash-Lite** because:
+1. **Multimodal** — accepts audio input natively, so voice notes get transcribed AND classified in one API call (no separate STT)
+2. **Fastest TTFT** (0.29s) — sub-half-second for simple routing
+3. **Free tier** — development and testing at zero cost
+4. **Gemini Live API** — same key, same provider for live voice-to-voice sessions
+
+**Phase 2 decomposition → Kimi K2.5 (thinking mode)** because:
+1. **Agent Swarm architecture** — Kimi K2.5 was explicitly designed to coordinate up to 100 specialized agents. This is literally the decomposition task: figure out which agents to spawn, what each does, and how they depend on each other.
+2. **Thinking mode** — chain-of-thought reasoning over task dependencies, model tier selection, and prompt writing for each subtask. Produces more reliable decompositions than a general-purpose model.
+3. **1T MoE (32B active)** — deep reasoning capacity without the latency of a full dense model
+4. **Molly already has `KIMI_API_KEY`** — no new credentials needed
+5. **Cost-competitive** — $0.60/$2.50 vs Gemini 3 Flash $0.50/$3.00 — nearly identical per-call cost
+
+**Provider diversity**: Gemini triages, Kimi decomposes, Claude works, Qwen falls back locally. Four providers, no single point of failure.
 
 ### Four-Tier Fallback Chain
 
@@ -100,7 +109,7 @@ classify_message():
   try:
     Phase 1: gemini_flash_lite_triage()     # ~0.4s, text or audio input
     if complex:
-      Phase 2: gemini_3_flash_decompose()   # ~0.7s, rich JSON
+      Phase 2: kimi_k25_decompose()         # ~0.7-1s, thinking mode, rich JSON
   except (timeout, api_error):
     try:
       return qwen_local_classify()           # ~0.5s, simple format, offline
@@ -111,7 +120,7 @@ classify_message():
         return hardcoded_general()           # 0ms, safe default
 ```
 
-Four levels of resilience: Gemini → Qwen local → GPT-4.1 Nano → hardcoded. Molly can classify messages even with two cloud providers simultaneously down (Qwen runs locally).
+Four providers, four levels of resilience: Gemini+Kimi → Qwen local → GPT-4.1 Nano → hardcoded. Molly can classify messages even with two cloud providers simultaneously down (Qwen runs locally).
 
 ### Language Decision: Stay in Python
 
@@ -140,13 +149,13 @@ Four levels of resilience: Gemini → Qwen local → GPT-4.1 Nano → hardcoded.
 - `classify_message(user_message, memory_context, skill_context, audio_bytes=None) → OrchestrationPlan`
   - **Phase 1 triage**: Gemini 2.5 Flash-Lite (~0.4s) — determines `direct`, `simple`, or `complex`
   - If `audio_bytes` provided (voice note), sends audio to Flash-Lite — gets transcript AND classification in one call
-  - **Phase 2 decomposition** (only if `complex`): Gemini 3 Flash (~0.7s) — full subtask decomposition with dependencies
+  - **Phase 2 decomposition** (only if `complex`): Kimi K2.5 thinking mode (~0.7-1s) — agent-specialized subtask decomposition with dependencies
   - Falls back through: Qwen3-4B local → GPT-4.1 Nano → hardcoded "single:general"
   - Returns: `{strategy: "direct", direct_answer: "...", transcript: "..."}` or `{strategy: "single"|"parallel", subtasks: [...]}`
 
 - `synthesize_results(user_message, worker_results, hint) → str`
-  - Gemini 3 Flash combines multiple worker outputs into one coherent response
-  - Fallback: concatenate results if Gemini synthesis fails
+  - Kimi K2.5 combines multiple worker outputs into one coherent response (same model that decomposed — maintains context)
+  - Fallback: concatenate results if Kimi synthesis fails
 
 - `orchestrate(user_message, chat_id, ..., audio_bytes=None) → (response_text, session_id)`
   - Same signature as `handle_message()` — drop-in replacement
@@ -172,9 +181,9 @@ If the input is audio, also include: transcript: <verbatim transcription>
 
 Output is ~10-30 tokens. At $0.10/$0.40 per 1M tokens, cost is negligible (~$0.0001/call).
 
-### Phase 2 Decomposition Prompt (Gemini 3 Flash)
+### Phase 2 Decomposition Prompt (Kimi K2.5 Thinking Mode)
 
-Only triggered for `complex` messages (~20% of traffic). Full reasoning model that produces rich JSON:
+Only triggered for `complex` messages (~20% of traffic). Kimi K2.5 uses its Agent Swarm reasoning to decompose into subtasks:
 
 ```json
 {
@@ -186,7 +195,9 @@ Only triggered for `complex` messages (~20% of traffic). Full reasoning model th
 }
 ```
 
-Intelligence score 46 (beats old Gemini 2.5 Pro) — reliable for dependency reasoning and prompt writing. ~0.7s latency, $0.50/$3.00 per 1M tokens. Cost per decomposition: ~$0.001.
+Kimi K2.5's Agent Swarm architecture (1T MoE, 32B active) was designed for exactly this: reasoning about which agents to spawn, what tools each needs, how they depend on each other, and what model tier each deserves. Thinking mode adds chain-of-thought reasoning over dependency graphs. ~0.7-1s latency, $0.60/$2.50 per 1M tokens. Cost per decomposition: ~$0.0012.
+
+**Decomposition fallback**: If Kimi is down, fall through to Phase 1 fallbacks (Qwen local → GPT-4.1 Nano) which handle complex requests as simple `parallel:<profile>,<profile>` without dependency reasoning — less optimal but functional.
 
 ### Worker Profiles (Scoped Tool Sets)
 
@@ -232,20 +243,26 @@ If `OPENAI_API_KEY` is configured, GPT-4.1 Nano ($0.02/$0.15) serves as a third-
 ```
 classify_message():
   try:
-    phase1 = gemini_flash_lite_triage()     # ~0.4s, text or audio
-    if phase1.strategy == "complex":
-      return gemini_3_flash_decompose()     # ~0.7s, rich JSON
-    return phase1
+    phase1 = gemini_flash_lite_triage()       # ~0.4s, text or audio
   except (timeout, api_error):
+    # Gemini triage down — fall through to simpler classifiers
     try:
-      return qwen_local_classify()           # ~0.5s, simple format, offline
+      return qwen_local_classify()             # ~0.5s, simple format, offline
     except:
       if OPENAI_API_KEY:
         try:
-          return gpt41_nano_classify()       # ~0.4s, text-only
+          return gpt41_nano_classify()         # ~0.4s, text-only
         except:
           pass
-      return hardcoded_general()             # 0ms, safe default
+      return hardcoded_general()               # 0ms, safe default
+
+  if phase1.strategy == "complex":
+    try:
+      return kimi_k25_decompose(phase1)        # ~0.7-1s, thinking mode, rich JSON
+    except (timeout, api_error):
+      # Kimi down — degrade to simple parallel dispatch from Phase 1
+      return phase1.as_simple_parallel()       # no dependency reasoning, but functional
+  return phase1
 ```
 
 ---
@@ -582,14 +599,15 @@ Voice sessions burn API credits continuously. Safeguards:
 
 New settings:
 ```python
-# Orchestrator (Gemini two-phase)
+# Orchestrator (Phase 1: Gemini triage, Phase 2: Kimi decomposition)
 ORCHESTRATOR_ENABLED = _env_bool("MOLLY_ORCHESTRATOR_ENABLED", True)
 MAX_CONCURRENT_WORKERS = int(os.getenv("MOLLY_MAX_WORKERS", "3"))
-ORCHESTRATOR_TRIAGE_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_TRIAGE_TIMEOUT", "3"))   # Phase 1
-ORCHESTRATOR_DECOMPOSE_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_DECOMPOSE_TIMEOUT", "5"))  # Phase 2
+ORCHESTRATOR_TRIAGE_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_TRIAGE_TIMEOUT", "3"))   # Phase 1 (Gemini)
+ORCHESTRATOR_DECOMPOSE_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_DECOMPOSE_TIMEOUT", "5"))  # Phase 2 (Kimi)
 ORCHESTRATOR_LOCAL_FALLBACK = _env_bool("MOLLY_ORCHESTRATOR_LOCAL_FALLBACK", True)
 GEMINI_TRIAGE_MODEL = os.getenv("MOLLY_GEMINI_TRIAGE_MODEL", "gemini-2.5-flash-lite")
-GEMINI_DECOMPOSE_MODEL = os.getenv("MOLLY_GEMINI_DECOMPOSE_MODEL", "gemini-3-flash")
+KIMI_DECOMPOSE_MODEL = os.getenv("MOLLY_KIMI_DECOMPOSE_MODEL", "kimi-k2.5")
+KIMI_THINKING_ENABLED = _env_bool("MOLLY_KIMI_THINKING", True)  # enable thinking mode for decomposition
 
 # Gateway
 GATEWAY_TASK_DIR = WORKSPACE / "gateway" / "tasks"
@@ -803,7 +821,7 @@ If zvec is still immature at that point, proceed with the sqlite-vec hybrid path
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `orchestrator.py` | NEW | Two-phase Gemini routing (Flash-Lite triage + 3 Flash decompose), Qwen/GPT fallback, synthesis |
+| `orchestrator.py` | NEW | Two-phase routing (Gemini Flash-Lite triage + Kimi K2.5 decompose), Qwen/GPT fallback, synthesis |
 | `workers.py` | NEW | Parallel Claude SDK worker pool, scoped profiles, dispatch logic |
 | `gateway.py` | NEW | Cron scheduler, webhook handler, built-in task definitions |
 | `channels/__init__.py` | NEW | Package init |
@@ -825,7 +843,7 @@ If zvec is still immature at that point, proceed with the sqlite-vec hybrid path
 Each phase is independently testable. The system works at every intermediate step because the fallback path is the existing code.
 
 ### Step 1: orchestrator.py
-- Two-phase Gemini routing: Flash-Lite triage + 3 Flash decomposition
+- Two-phase routing: Gemini Flash-Lite triage + Kimi K2.5 thinking decomposition
 - Qwen local fallback + GPT-4.1 Nano fallback + hardcoded fallback
 - `classify_message()` accepts text or audio_bytes
 - Can test by calling `orchestrate()` directly from a script
@@ -869,7 +887,7 @@ Each phase is independently testable. The system works at every intermediate ste
 
 ### Step 9: config.py additions
 - Small additions throughout steps 1-8
-- Gemini model names, orchestrator timeouts, voice budgets, browser config
+- Gemini + Kimi model names, orchestrator timeouts, voice budgets, browser config
 
 ### Step 10: memory/embeddings.py — Qwen3-VL multimodal embeddings
 - Load Qwen3-VL-Embedding-2B (GGUF or transformers)
