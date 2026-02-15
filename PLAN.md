@@ -7,10 +7,12 @@ Molly's current architecture has a **serial bottleneck**. Every user message goe
 OpenClaw solves this differently — it's a persistent daemon with a hub-and-spoke gateway, multi-channel support, cron scheduling, and webhook triggers. It feels more autonomous because it's always on, always doing things proactively.
 
 **Goal**: Take the best ideas from OpenClaw's architecture and combine them with Molly's unique strengths (knowledge graph, local ML, self-evolution) while:
-1. Breaking the serial bottleneck using Kimi as a fast orchestrator dispatching parallel Claude SDK workers
+1. Breaking the serial bottleneck using a two-phase Gemini orchestrator dispatching parallel Claude SDK workers
 2. Adding always-on proactive autonomy (cron, webhooks, gateway)
-3. Adding a voice-to-voice channel so Brian can talk to Molly naturally
-4. Making the orchestrator routing resilient with a local Qwen fallback
+3. Adding voice — both async voice notes and live voice-to-voice — unified through Gemini's multimodal API
+4. Making the orchestrator routing resilient with a four-tier fallback chain
+5. Adding a browser tool for interacting with websites lacking APIs
+6. Staying in Python (evaluated Go, Rust, TypeScript — Python wins for this use case)
 
 ---
 
@@ -36,7 +38,7 @@ These are genuinely ahead of OpenClaw and must not be degraded:
 
 ---
 
-## The Core Change: Kimi Orchestrator + Parallel Claude Workers
+## The Core Change: Two-Phase Gemini Orchestrator + Parallel Claude Workers
 
 ### Current Flow (Serial)
 ```
@@ -45,48 +47,87 @@ Message → Claude SDK (single session, ~30-45s for multi-domain tasks)
        think → tool → wait → think → tool → wait → ... → response
 ```
 
-### New Flow (Parallel)
+### New Flow (Parallel, Two-Phase)
 ```
-Message → Orchestrator classifies (~1-2s) →
-  ├── "direct": Kimi/Qwen answers immediately (no Claude, ~1-2s total)
-  ├── "single": One scoped Claude worker (~5-10s)
-  └── "parallel": Multiple Claude workers via asyncio.gather (~5-10s)
-                     ↓
-              Kimi synthesizes results (~1-2s)
-                     ↓
-              Final response
+Message (text or audio) →
+  Phase 1: Gemini 2.5 Flash-Lite (~0.4s) →
+    ├── "direct: <answer>"     → respond immediately (no Claude)
+    ├── "simple: <profile>"    → dispatch one scoped Claude worker (~5-10s)
+    └── "complex"              →
+          Phase 2: Gemini 3 Flash (~0.7s) →
+            Full decomposition: subtasks, dependencies, model tiers
+            → Multiple Claude workers via asyncio.gather (~5-10s)
+                  ↓
+            Gemini synthesizes results (~0.5-1s)
+                  ↓
+            Final response
 ```
 
-### Why This Works
+### Why Two Phases Instead of One
 
-1. **Kimi K2.5 is fast and cheap** — classification ~1-2s, synthesis ~1-2s
-2. **Multiple `query()` calls run truly in parallel** via `asyncio.gather()` — confirmed by Anthropic docs and SDK
-3. **Each worker gets a scoped tool set** — calendar worker only loads calendar MCP, email worker only loads gmail MCP. Less context pollution, faster startup.
-4. **Simple questions skip Claude entirely** — "what time is it?" or "thanks" get answered by Kimi in 1-2s instead of 10s+
-5. **The Claude SDK stays** — workers are real SDK sessions with all the existing tool execution, MCP integration, context management
-6. **Fallback is safe** — if Kimi API is down, local Qwen3-4B handles routing; if that fails too, the existing single-session `handle_message()` path runs unchanged
+The orchestrator has two very different jobs:
+1. **Simple routing** (~80% of messages): "check my calendar" → single:calendar. Any model can do this.
+2. **Complex decomposition** (~20%): "check my calendar, find John's email about the meeting, and draft a reply incorporating both" → parallel subtasks with dependencies, model tier selection, prompt writing.
 
-### Orchestrator Routing: Kimi Primary, Qwen Local Fallback
+Using one model for both means either paying for reasoning you don't need (expensive fast model) or getting wrong decompositions (cheap model on complex requests). Two phases optimizes both.
 
-The orchestrator classification is the critical path — if it's slow or down, everything stalls. Solution: **two-tier routing**.
+### Why Gemini
 
-**Tier 1: Kimi K2.5 (primary)**
-- Full JSON-mode classification with rich reasoning
-- Handles complex decomposition (which subtasks, dependencies, model tiers)
-- ~1-2s latency over API
+**Model evaluation (February 2026)** — compared Kimi K2.5, DeepSeek V3.2, OpenAI, Grok, Gemini, and Claude for orchestration:
 
-**Tier 2: Qwen3-4B local (fallback)**
-- Already loaded in-process for triage — zero additional startup cost
-- Simpler classification: `direct | single:<profile> | parallel:<profile>,<profile>`
-- Can't do rich dependency reasoning, but handles 90% of routing correctly
-- ~0.5s latency, zero API dependency
-- Activates automatically when Kimi API is unreachable or times out
+| Model | Input $/1M | Output $/1M | TTFT | Intelligence | Notes |
+|---|---|---|---|---|---|
+| GPT-4.1 Nano | **$0.02** | $0.15 | 0.37s | 13 | Cheapest, but too dumb for decomposition |
+| Gemini 2.5 Flash-Lite | $0.10 | $0.40 | **0.29s** | ~20 | Fastest TTFT, free tier, multimodal (audio+image) |
+| Gemini 3 Flash | $0.50 | $3.00 | 0.40s | **46** | Beats old 2.5 Pro, strong reasoning |
+| Grok 4.1 Fast | $0.20 | $0.50 | 0.40s | 24 | Good value but no multimodal input |
+| DeepSeek V3.2 | $0.28 | $0.42 | 1.2-7.5s | High | **Too slow** — 3.5-9s total latency |
+| Kimi K2.5 | $0.60 | $2.50 | 0.62s | High | Good but expensive for triage, no audio input |
+| Claude Haiku 4.5 | $1.00 | $5.00 | 0.50s | ~30 | 10x pricier than Flash-Lite on input |
 
-**Tier 3: Hardcoded fallback**
-- If both Kimi and Qwen fail: route to single "general" Claude worker
-- Equivalent to today's behavior — zero regression
+**Decision**: Gemini wins because:
+1. **Unified voice + text pipeline** — Flash-Lite accepts audio input natively, so voice notes get transcribed AND classified in one API call (no separate STT)
+2. **Two-tier quality** — Flash-Lite for fast routing, 3 Flash for reasoning when needed
+3. **Molly already has `GEMINI_API_KEY`** — no new credentials needed
+4. **Provider diversity** — Gemini routes, Claude works. No single-provider dependency.
+5. **Free tier** — development and testing at zero cost
+6. **Gemini Live API** — same key, same provider for live voice-to-voice sessions
 
-This means Molly can route messages even when completely offline from external APIs (Qwen runs locally), which is something OpenClaw cannot do.
+### Four-Tier Fallback Chain
+
+```
+classify_message():
+  try:
+    Phase 1: gemini_flash_lite_triage()     # ~0.4s, text or audio input
+    if complex:
+      Phase 2: gemini_3_flash_decompose()   # ~0.7s, rich JSON
+  except (timeout, api_error):
+    try:
+      return qwen_local_classify()           # ~0.5s, simple format, offline
+    except:
+      try:
+        return gpt41_nano_classify()         # ~0.4s, if OPENAI_API_KEY set
+      except:
+        return hardcoded_general()           # 0ms, safe default
+```
+
+Four levels of resilience: Gemini → Qwen local → GPT-4.1 Nano → hardcoded. Molly can classify messages even with two cloud providers simultaneously down (Qwen runs locally).
+
+### Language Decision: Stay in Python
+
+**Evaluated**: Go, Rust, TypeScript, and hybrid approaches against current Python stack.
+
+**Why Python wins for Molly:**
+1. **Claude Agent SDK** — official first-class support in Python and TypeScript only. No Go or Rust SDK. The SDK is in Alpha (v0.1.36) with breaking changes — being on an official SDK is non-negotiable.
+2. **ML ecosystem** — sentence-transformers, GLiNER2 fine-tuning, llama-cpp-python have no equivalent outside Python. The self-improvement engine's GLiNER fine-tuning is impossible in any other language.
+3. **Bottleneck is API latency** — Claude API round-trips take 2-10s. Shaving 30ms off WebSocket frames by switching to Rust gains nothing.
+4. **26K lines = 2-4 month rewrite** — zero feature work during that time, chasing Alpha SDK breaking changes.
+5. **OpenClaw is TypeScript** (not Go/Rust as speculated) — proves TS works for this category, but OpenClaw has a team and doesn't run local ML in-process.
+
+**Quick wins without rewriting:**
+- `pip install neo4j-rust-ext` — 3-10x Neo4j driver speedup, zero code changes
+- `pip install uvloop` — ~2x asyncio event loop throughput
+- Profile with `py-spy` before optimizing anything
 
 ---
 
@@ -96,24 +137,56 @@ This means Molly can route messages even when completely offline from external A
 
 ### Key Components
 
-- `classify_message(user_message, memory_context, skill_context) → OrchestrationPlan`
-  - Tries Kimi K2.5 first (JSON mode, ~1-2s)
-  - Falls back to local Qwen3-4B if Kimi fails/times out
-  - Falls back to hardcoded "single:general" if both fail
-  - Returns: `{strategy: "direct", direct_answer: "..."}` or `{strategy: "single"|"parallel", subtasks: [...]}`
+- `classify_message(user_message, memory_context, skill_context, audio_bytes=None) → OrchestrationPlan`
+  - **Phase 1 triage**: Gemini 2.5 Flash-Lite (~0.4s) — determines `direct`, `simple`, or `complex`
+  - If `audio_bytes` provided (voice note), sends audio to Flash-Lite — gets transcript AND classification in one call
+  - **Phase 2 decomposition** (only if `complex`): Gemini 3 Flash (~0.7s) — full subtask decomposition with dependencies
+  - Falls back through: Qwen3-4B local → GPT-4.1 Nano → hardcoded "single:general"
+  - Returns: `{strategy: "direct", direct_answer: "...", transcript: "..."}` or `{strategy: "single"|"parallel", subtasks: [...]}`
 
 - `synthesize_results(user_message, worker_results, hint) → str`
-  - Kimi combines multiple worker outputs into one coherent response
-  - Fallback: concatenate results if Kimi synthesis fails
+  - Gemini 3 Flash combines multiple worker outputs into one coherent response
+  - Fallback: concatenate results if Gemini synthesis fails
 
-- `orchestrate(user_message, chat_id, ...) → (response_text, session_id)`
+- `orchestrate(user_message, chat_id, ..., audio_bytes=None) → (response_text, session_id)`
   - Same signature as `handle_message()` — drop-in replacement
   - Runs pre-processing (memory retrieval, skill matching) concurrently
   - Calls `classify_message()`, then dispatches accordingly
+  - `audio_bytes` parameter enables unified voice note handling
 
-### Classification Prompt Design
+### Phase 1 Triage Prompt (Gemini 2.5 Flash-Lite)
 
-Tells Kimi/Qwen about Molly's tool domains: calendar, email, contacts, tasks, research, writer, files, imessage, general. For each subtask, specifies: `worker_profile`, `prompt`, `model` (haiku/sonnet/opus), `depends_on` (dependency indices). Rules bias toward "direct" (fastest) and "single" (simplest).
+Fast, cheap classification. The model receives the user message (text or audio) plus brief context and returns a one-line classification:
+
+```
+System: You are Molly's message router. Classify the user's request.
+Respond with ONLY one of:
+  direct: <brief answer>      — trivial questions you can answer (time, thanks, greetings)
+  simple: <profile>            — needs one tool domain
+  complex                      — needs multiple domains or multi-step reasoning
+
+Profiles: calendar, email, contacts, tasks, research, writer, files, imessage, browser, general
+
+If the input is audio, also include: transcript: <verbatim transcription>
+```
+
+Output is ~10-30 tokens. At $0.10/$0.40 per 1M tokens, cost is negligible (~$0.0001/call).
+
+### Phase 2 Decomposition Prompt (Gemini 3 Flash)
+
+Only triggered for `complex` messages (~20% of traffic). Full reasoning model that produces rich JSON:
+
+```json
+{
+  "subtasks": [
+    {"profile": "calendar", "prompt": "Check Brian's calendar for tomorrow", "model": "haiku", "depends_on": []},
+    {"profile": "email", "prompt": "Find John's email about the meeting", "model": "haiku", "depends_on": []},
+    {"profile": "writer", "prompt": "Draft a reply incorporating calendar and email findings", "model": "sonnet", "depends_on": [0, 1]}
+  ]
+}
+```
+
+Intelligence score 46 (beats old Gemini 2.5 Pro) — reliable for dependency reasoning and prompt writing. ~0.7s latency, $0.50/$3.00 per 1M tokens. Cost per decomposition: ~$0.001.
 
 ### Worker Profiles (Scoped Tool Sets)
 
@@ -127,9 +200,10 @@ Tells Kimi/Qwen about Molly's tool domains: calendar, email, contacts, tasks, re
 | writer | (none) | sonnet | Drafting text |
 | files | google-drive | sonnet | File/drive operations |
 | imessage | imessage, apple-mcp | sonnet | iMessage operations |
+| browser | browser-tool | sonnet | Web interaction (no API available) |
 | general | (none) | sonnet | Catch-all |
 
-### Qwen Local Router Design
+### Qwen Local Router Design (Fallback Tier 2)
 
 The local Qwen3-4B router uses a simpler prompt since it can't reliably produce complex JSON:
 
@@ -140,24 +214,38 @@ Respond with ONLY one line in this format:
   single:<profile>            — needs one tool domain
   parallel:<profile>,<profile> — needs multiple domains simultaneously
 
-Profiles: calendar, email, contacts, tasks, research, writer, files, imessage, general
+Profiles: calendar, email, contacts, tasks, research, writer, files, imessage, browser, general
 
 User: <message>
 ```
 
 Qwen's response is parsed with simple string splitting. If it says `direct:`, Molly uses the inline answer. If `single:calendar`, dispatch one calendar worker. If `parallel:calendar,email`, dispatch both. This is fast (~0.5s), reliable, and runs entirely locally.
 
+Note: Qwen cannot handle audio input. If a voice note triggers the Qwen fallback, Molly must either use a separate local whisper model for transcription or respond with "I can't process voice right now, please type your message."
+
+### GPT-4.1 Nano Fallback (Tier 3)
+
+If `OPENAI_API_KEY` is configured, GPT-4.1 Nano ($0.02/$0.15) serves as a third-tier fallback. Same simple prompt as Qwen. ~0.4s latency, text-only.
+
 ### Fallback Chain
 
 ```
 classify_message():
   try:
-    return kimi_classify()           # ~1-2s, rich JSON
+    phase1 = gemini_flash_lite_triage()     # ~0.4s, text or audio
+    if phase1.strategy == "complex":
+      return gemini_3_flash_decompose()     # ~0.7s, rich JSON
+    return phase1
   except (timeout, api_error):
     try:
-      return qwen_local_classify()   # ~0.5s, simple format
+      return qwen_local_classify()           # ~0.5s, simple format, offline
     except:
-      return hardcoded_general()     # 0ms, safe default
+      if OPENAI_API_KEY:
+        try:
+          return gpt41_nano_classify()       # ~0.4s, text-only
+        except:
+          pass
+      return hardcoded_general()             # 0ms, safe default
 ```
 
 ---
@@ -274,42 +362,66 @@ channel: owner_dm
 
 ---
 
-## Phase 5: Voice-to-Voice Channel (channels/voice_channel.py)
+## Phase 5: Unified Voice Pipeline (channels/voice_channel.py)
 
-**New file.** Adds real-time voice conversation as a first-class Molly channel.
+**New file.** Voice is handled entirely through Gemini, creating a unified pipeline with the orchestrator.
 
-### Architecture Decision: Which Voice API?
+### Two Voice Modes, One Provider
 
-Three viable options, each with different tradeoffs:
+| Mode | API | Model | Latency | When |
+|---|---|---|---|---|
+| **Async voice notes** | Gemini 2.5 Flash-Lite (standard API) | Flash-Lite | ~0.4s | WhatsApp voice notes, voice commands |
+| **Live voice-to-voice** | Gemini Live API | Gemini 2.0 Flash (native audio) | Sub-second | Real-time conversation sessions |
 
-| | Gemini Live | OpenAI Realtime | xAI Grok Voice |
-|---|---|---|---|
-| **Protocol** | WebSocket (own format) | WebSocket (event-based) | WebSocket (OpenAI-compatible) |
-| **Bidirectional audio** | Yes (native audio model) | Yes (native audio model) | Yes (native audio model) |
-| **Text transcripts** | Both sides (input + output transcription) | Both sides (via gpt-4o-transcribe) | Both sides (OpenAI-compatible) |
-| **Tool/function calling** | Yes (in-session) | Yes (in-session) | Yes (+ built-in web_search, x_search) |
-| **System instructions** | Yes (setup message) | Yes (session.update, updatable mid-session) | Yes (session.update, OpenAI-compatible) |
-| **Latency** | Sub-second (native audio) | Sub-second (native audio) | <1s (claims fastest) |
-| **Cost per 5-min call** | ~$0.15-0.50 | ~$0.50 | $0.25 (flat $0.05/min) |
-| **Max session** | 10 min default | 60 min | Not specified |
-| **Molly already has** | Gemini API key (`GEMINI_API_KEY`) | No API key configured | xAI API key (`XAI_API_KEY`) |
+Both use `GEMINI_API_KEY` — no additional credentials needed.
 
-**Recommended approach**: Support all three behind a common `VoiceProvider` interface, with provider selection via config. Grok Voice is the cheapest and uses the OpenAI-compatible protocol (shares implementation with OpenAI Realtime). Gemini Live is a different protocol but Molly already has a Gemini key.
+### Mode 1: Async Voice Notes (Integrated with Triage)
 
-### Voice Channel Design
+This is the key integration. When a voice note arrives (WhatsApp, future channels), it goes through the **same triage path as text messages** — but with audio input:
 
-The voice channel is fundamentally different from text channels because:
-1. It's **continuous** — audio streams in/out constantly, not discrete messages
-2. It needs its own **LLM brain** — the voice API's native model handles conversation
-3. It needs to **feed Molly's memory** — transcripts from both sides must flow into the knowledge graph
-4. It needs **Molly's context** — the voice model's system prompt must include identity, memory, and current state
+```
+Voice note (audio bytes) →
+  Gemini 2.5 Flash-Lite (audio input) →
+    Returns BOTH:
+      1. transcript: "Check my calendar for tomorrow"
+      2. classification: "simple: calendar"
+    → Same orchestrator dispatch as text messages
+```
 
-### How It Plugs Into Molly
+**No separate STT step.** The triage model does transcription AND classification in one API call. This means:
+- Zero additional latency vs text messages (Flash-Lite processes audio natively)
+- Zero additional cost (same call, audio is just another input modality)
+- Voice notes and text messages flow through identical orchestrator logic
+- Transcripts feed into memory pipeline (embed + graph extract) automatically
+
+Implementation in `orchestrator.py`:
+```python
+async def classify_message(
+    user_message: str,
+    memory_context: str,
+    skill_context: str,
+    audio_bytes: bytes | None = None,  # voice note audio
+) -> OrchestrationPlan:
+    """Classify via Gemini Flash-Lite. Accepts text OR audio."""
+    if audio_bytes:
+        # Send audio as inline_data part alongside system prompt
+        # Response includes both transcript and classification
+        parts = [
+            {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(audio_bytes).decode()}},
+            {"text": f"Context: {memory_context}\n\nTranscribe the audio and classify the request."}
+        ]
+    else:
+        parts = [{"text": f"Context: {memory_context}\n\nMessage: {user_message}"}]
+    # ... same classification logic, returns OrchestrationPlan with optional transcript field
+```
+
+### Mode 2: Live Voice-to-Voice (Gemini Live API)
+
+For real-time conversational sessions where Brian talks to Molly naturally.
 
 ```
                   ┌─────────────────────┐
-                  │   Voice Provider     │
-                  │  (Gemini/OpenAI/Grok)│
+                  │   Gemini Live API    │
                   │                      │
   Microphone ───► │  Audio In ──► Model  │
                   │             (native) │
@@ -331,137 +443,109 @@ The voice channel is fundamentally different from text channels because:
                   │                      │
                   │  2. Captures both    │
                   │     sides' transcripts│
-                  │     as InboundMessage│
-                  │     + stores in      │
-                  │     memory pipeline  │
+                  │     → memory pipeline│
                   │                      │
-                  │  3. Registers tool   │
-                  │     functions that   │
+                  │  3. Tool functions   │
                   │     call back into   │
                   │     the orchestrator │
-                  │     for multi-step   │
-                  │     tasks            │
                   └─────────────────────┘
 ```
 
 ### Key Design Points
 
-**1. The voice model IS the conversational brain during voice sessions.**
+**1. The Gemini Live model IS the conversational brain during voice sessions.**
 
-Unlike text channels where messages route through the orchestrator → Claude workers, voice sessions use the voice API's native model (Gemini/GPT-4o/Grok) for real-time conversation. This is necessary because voice-to-voice latency requires a single model handling the full loop — you can't route audio through Kimi → Claude → synthesis and keep sub-second response times.
+Voice-to-voice latency requires a single model handling the full audio loop. You can't route audio through triage → Claude → synthesis and keep sub-second response times. The Gemini Live model handles real-time conversation natively.
 
-**2. Molly's identity and memory inject into the voice model's system prompt.**
+**2. Molly's identity and memory inject into the session's system instructions.**
 
-Before the WebSocket session starts (or via mid-session updates for OpenAI/Grok), we inject:
+Before the WebSocket session starts, we inject:
 - `SOUL.md` — Molly's personality and behavioral guidelines
 - `USER.md` — information about Brian
 - Recent memory context from `retrieve_context()` — relevant past conversations
 - Knowledge graph summary — key entities and relationships
 - Current state — today's calendar, pending tasks, recent notifications
 
-This makes the voice model "be Molly" for the duration of the call.
+This makes the Gemini Live model "be Molly" for the duration of the call.
 
 **3. Transcripts flow back into Molly's memory pipeline.**
 
-Both sides of the conversation are captured as text transcripts (all three APIs support this). After each conversational turn:
+Both sides of the conversation are captured as text transcripts. After each conversational turn:
 - User transcript + model transcript → `process_conversation()` (embed + graph extract)
-- This means voice conversations build knowledge graph entities, update memory, and are searchable later — same as text conversations
+- Voice conversations build knowledge graph entities, update memory, and are searchable later — same as text
 
 **4. Tool calls bridge to Molly's orchestrator for complex tasks.**
 
-All three voice APIs support function/tool calling during live sessions. We register tools like:
+Gemini Live supports function calling during live sessions. We register tools like:
 - `check_calendar(date)` — calls orchestrator with calendar worker
 - `search_email(query)` — calls orchestrator with email worker
 - `create_reminder(title, due)` — calls orchestrator with tasks worker
 - `do_research(query)` — calls orchestrator with research worker
+- `browse_website(url, action)` — calls orchestrator with browser worker
 
-When the voice model decides to call a tool, the VoiceChannel:
+When the Gemini Live model decides to call a tool, the VoiceChannel:
 1. Receives the function call from the WebSocket
 2. Dispatches it through the orchestrator (which may fan out to Claude workers)
-3. Returns the result to the voice model via the WebSocket
-4. The voice model speaks the result to the user
-
-This means Brian can say "check my calendar for tomorrow and see if John emailed about the meeting" and the voice model will call both tools, get parallel results, and speak a synthesized answer.
+3. Returns the result to the Gemini Live model via the WebSocket
+4. The model speaks the result to the user
 
 **5. Voice sessions are triggered via a dedicated endpoint or command.**
 
-Options for starting a voice session:
 - `POST /voice/start` HTTP endpoint — returns WebSocket URL for audio streaming
-- WhatsApp voice note detection — when Brian sends a voice note, Molly enters voice mode
-- `/voice` command in any channel — starts a voice session
+- WhatsApp voice note detection — async mode (transcript + classify + respond via text)
+- `/voice` command in any channel — starts a live voice-to-voice session
 - Dedicated companion app (future) — native mic/speaker access
 
-### VoiceProvider Interface
+### Gemini Live Protocol
+
+Single provider implementation — no abstraction layer needed:
 
 ```python
-class VoiceProvider(ABC):
-    """Abstract interface for voice-to-voice providers."""
+class GeminiLiveSession:
+    """Manages a Gemini Live voice-to-voice session."""
 
     async def connect(self, system_instructions: str, tools: list[dict]) -> None:
-        """Open WebSocket connection with identity + tool definitions."""
+        """Open WebSocket to Gemini Live API with identity + tool definitions."""
+        # Setup message with systemInstruction + tools.functionDeclarations
 
     async def send_audio(self, audio_chunk: bytes) -> None:
-        """Stream audio input to the model."""
+        """Stream audio input via realtimeInput.mediaChunks (PCM 16kHz)."""
 
     async def receive(self) -> VoiceEvent:
-        """Receive next event: audio_chunk | transcript | tool_call | end."""
+        """Receive: audio chunk | transcript | tool_call | end.
+        - serverContent.modelTurn.parts[].inlineData → speaker audio (PCM 24kHz)
+        - inputAudioTranscription → user transcript
+        - outputAudioTranscription → model transcript
+        - toolCall → function call request
+        """
 
     async def send_tool_result(self, call_id: str, result: str) -> None:
-        """Return a tool call result to the model."""
-
-    async def update_instructions(self, instructions: str) -> None:
-        """Update system instructions mid-session (OpenAI/Grok only)."""
+        """Return tool result via toolResponse message."""
 
     async def disconnect(self) -> None:
         """Close the WebSocket connection."""
 ```
 
-### Provider Implementations
-
-**`GrokVoiceProvider` / `OpenAIVoiceProvider`** — share 95% of code because Grok uses the OpenAI-compatible protocol. Key events:
-- `session.update` → inject system instructions + tool definitions
-- `input_audio_buffer.append` → stream mic audio
-- `response.audio.delta` → receive speaker audio
-- `conversation.item.input_audio_transcription.completed` → user transcript
-- `response.audio_transcript.delta` → model transcript
-- `response.function_call_arguments.done` → tool call request
-
-**`GeminiVoiceProvider`** — different protocol:
-- Setup message with `systemInstruction` + `tools.functionDeclarations`
-- `realtimeInput.mediaChunks` → stream mic audio (PCM 16kHz)
-- `serverContent.modelTurn.parts[].inlineData` → receive speaker audio (PCM 24kHz)
-- `inputAudioTranscription` / `outputAudioTranscription` → transcripts
-- `toolResponse` → return tool results
-
 ### Audio Transport
 
-The VoiceChannel needs to get audio to/from the user's device. Options:
-
-**Option A: WebSocket relay through FastAPI** (simplest)
+**WebSocket relay through FastAPI** (simplest, works over LAN):
 - Client connects to `ws://molly:8080/voice`
 - Client streams raw PCM audio in, receives PCM audio out
-- VoiceChannel relays between client WebSocket ↔ provider WebSocket
-- Works with any web client, companion app, or native app
-
-**Option B: WebRTC (lower latency, more complex)**
-- OpenAI Realtime natively supports WebRTC for browser clients
-- Requires STUN/TURN infrastructure
-- Better for mobile/browser use cases
-- Can add later as an optimization
-
-**Recommended**: Start with Option A (WebSocket relay). It works with all three providers, is simple to implement, and latency is acceptable over LAN. Add WebRTC later if needed.
+- VoiceChannel relays between client WebSocket ↔ Gemini Live WebSocket
+- Works with web client, companion app, or native app
+- WebRTC can be added later as an optimization if latency becomes a measured problem
 
 ### Voice Session Lifecycle
 
 ```
-1. Client connects to ws://molly:8080/voice?provider=grok
+1. Client connects to ws://molly:8080/voice
 2. VoiceChannel loads Molly's identity + memory context
-3. VoiceChannel opens WebSocket to voice provider with system instructions + tools
+3. VoiceChannel opens WebSocket to Gemini Live API with system instructions + tools
 4. Audio relay loop:
-   - Client audio → provider (streaming)
-   - Provider audio → client (streaming)
-   - Provider transcript events → memory pipeline (async)
-   - Provider tool calls → orchestrator → result → provider
+   - Client audio → Gemini Live (streaming)
+   - Gemini Live audio → client (streaming)
+   - Transcript events → memory pipeline (async)
+   - Tool calls → orchestrator → Claude workers → result → Gemini Live
 5. Session ends when client disconnects or timeout
 6. Full transcript written to daily log + embedded + graph-extracted
 ```
@@ -473,6 +557,7 @@ Voice sessions burn API credits continuously. Safeguards:
 - `VOICE_DAILY_BUDGET_MINUTES` config (default: 60)
 - Session timer with warning at 80% of max
 - Daily minute tracking persisted in gateway state
+- Gemini Live cost: ~$0.15-0.50 per 5-min call
 
 ---
 
@@ -497,23 +582,27 @@ Voice sessions burn API credits continuously. Safeguards:
 
 New settings:
 ```python
-# Orchestrator
+# Orchestrator (Gemini two-phase)
 ORCHESTRATOR_ENABLED = _env_bool("MOLLY_ORCHESTRATOR_ENABLED", True)
 MAX_CONCURRENT_WORKERS = int(os.getenv("MOLLY_MAX_WORKERS", "3"))
-ORCHESTRATOR_KIMI_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_KIMI_TIMEOUT", "5"))
+ORCHESTRATOR_TRIAGE_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_TRIAGE_TIMEOUT", "3"))   # Phase 1
+ORCHESTRATOR_DECOMPOSE_TIMEOUT = int(os.getenv("MOLLY_ORCHESTRATOR_DECOMPOSE_TIMEOUT", "5"))  # Phase 2
 ORCHESTRATOR_LOCAL_FALLBACK = _env_bool("MOLLY_ORCHESTRATOR_LOCAL_FALLBACK", True)
+GEMINI_TRIAGE_MODEL = os.getenv("MOLLY_GEMINI_TRIAGE_MODEL", "gemini-2.5-flash-lite")
+GEMINI_DECOMPOSE_MODEL = os.getenv("MOLLY_GEMINI_DECOMPOSE_MODEL", "gemini-3-flash")
 
 # Gateway
 GATEWAY_TASK_DIR = WORKSPACE / "gateway" / "tasks"
 GATEWAY_WEBHOOK_DIR = WORKSPACE / "gateway" / "webhooks"
 GATEWAY_STATE_FILE = WORKSPACE / "gateway" / "state.json"
 
-# Voice
+# Voice (Gemini unified)
 VOICE_ENABLED = _env_bool("MOLLY_VOICE_ENABLED", False)
-VOICE_PROVIDER = os.getenv("MOLLY_VOICE_PROVIDER", "grok")  # grok | openai | gemini
 VOICE_MAX_SESSION_MINUTES = int(os.getenv("MOLLY_VOICE_MAX_SESSION_MINUTES", "10"))
 VOICE_DAILY_BUDGET_MINUTES = int(os.getenv("MOLLY_VOICE_DAILY_BUDGET_MINUTES", "60"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# Optional fallback orchestrator
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # GPT-4.1 Nano fallback (Tier 3)
 ```
 
 ---
@@ -628,7 +717,7 @@ This means "who sent me photos of the house?" becomes a graph traversal + vector
 
 ## What Does NOT Change
 
-- **Knowledge graph** — untouched, still fed by `process_conversation()` post-response (now also fed by voice transcripts)
+- **Knowledge graph** — untouched, still fed by `process_conversation()` post-response (now also fed by voice transcripts from Gemini)
 - **Triage system** — still gates group messages before they reach the orchestrator
 - **Memory retrieval** — still runs during pre-processing, results go to orchestrator and workers (and into voice system prompts)
 - **Approval system** — same 3-tier classification, same WhatsApp approval flow; workers reuse the same `get_action_tier()` and `ApprovalManager`
@@ -642,17 +731,33 @@ This means "who sent me photos of the house?" becomes a graph traversal + vector
 
 ## Technology Watch List
 
-### Google WebMCP (Watch — Not Actionable Yet)
+### Browser Tool (Active — New Worker Profile)
 
-**What it is**: Browser-native standard (`navigator.modelContext`) that lets websites expose structured tools to AI agents. Shipped in Chrome 146 Canary (Feb 2026). Developed jointly by Google and Microsoft, incubated through W3C Web ML community group.
+Molly is getting a browser tool for interacting with websites that lack APIs. This adds a `browser` worker profile to the orchestrator.
 
-**Why it doesn't apply today**: Molly is a headless backend agent — no browser, no user present during autonomous tasks (cron, heartbeat, email triage). WebMCP requires a browser and human-in-the-loop confirmation. Molly's existing MCP tools (`tools/calendar.py`, `tools/gmail.py`, etc.) use direct API calls, which are faster and fully autonomous.
+**Implementation approach**: Headless Playwright via MCP server. The browser runs as a headless Chromium instance controlled by an MCP tool server, giving Claude workers the ability to navigate, click, fill forms, extract content, and take screenshots.
 
-**What to watch for**:
-1. **Google Workspace managed MCP servers** — Google launched managed MCP servers for Cloud services (Dec 2025) and plans to cover all Google services. When Gmail/Calendar/Drive/Tasks get official managed MCP servers, they could replace Molly's hand-rolled tools with Google-maintained endpoints (less maintenance, enterprise auth for free).
-2. **Browser-agent mode** — If Molly ever needs to interact with websites lacking APIs (restaurant booking, form filling), a browser channel using WebMCP would be reliable instead of brittle screenshot+click automation. Natural fit alongside the channel abstraction in Phase 4.
+**MCP server**: Use `@anthropic-ai/mcp-server-puppeteer` or `playwright-mcp-server` — both expose browser actions as MCP tools (`navigate`, `click`, `type`, `screenshot`, `extract_text`, `evaluate`). Runs headless on the Mac Mini.
 
-**Action**: No changes to the plan. Revisit when Google announces Workspace MCP servers.
+**Worker profile**:
+| Profile | MCP Servers | Default Model | Use Case |
+|---------|-------------|---------------|----------|
+| browser | browser-tool | sonnet | Web interaction, form filling, scraping |
+
+**Use cases**:
+- Restaurant reservations (OpenTable, Resy — no usable API)
+- Form submissions (government sites, appointment booking)
+- Price checking / comparison shopping
+- Reading web pages that block API access
+- Interacting with sites that require login (session cookies managed by Playwright)
+
+**Why not WebMCP**: WebMCP (`navigator.modelContext`) is a browser-native standard for websites that opt in to exposing tools. It requires a visible browser and human-in-the-loop. Molly is a headless backend agent — she needs to control the browser, not wait for websites to expose tools. Playwright/Puppeteer is the right approach.
+
+**Security**: Browser worker runs in a sandboxed Chromium profile. No access to Brian's main browser session/cookies. Login credentials for specific sites stored in Molly's encrypted config, injected per-session.
+
+### Google Workspace Managed MCP Servers (Watch)
+
+Google launched managed MCP servers for Cloud services (Dec 2025) and plans to cover all Google services. When Gmail/Calendar/Drive/Tasks get official managed MCP servers, they could replace Molly's hand-rolled tools with Google-maintained endpoints (less maintenance, enterprise auth for free). Revisit when announced.
 
 ### alibaba/zvec (Migration Candidate for Phase 7 — Maturity Gate)
 
@@ -681,14 +786,16 @@ If zvec is still immature at that point, proceed with the sqlite-vec hybrid path
 
 ## Risk Mitigation
 
-1. **Kimi API down** → Qwen local router takes over. If Qwen fails → single general worker (same as today).
+1. **Gemini API down** → Four-tier fallback: Qwen local → GPT-4.1 Nano → hardcoded general. Molly routes even when fully offline (Qwen is local).
 2. **Worker fails** → Returns error text for that subtask. Other workers unaffected.
 3. **Rate limits** → Semaphore caps concurrent workers at 3. Configurable.
-4. **Wrong classification** → "single/general" is the safe default. Worst case = same as today.
+4. **Wrong classification** → Two-phase design reduces this. Phase 1 only does simple triage (low error rate). Phase 2 uses a reasoning model (intelligence 46) for complex decomposition. Worst case = same as today.
 5. **Circular dependencies in subtasks** → Detected and force-run remaining. Logged.
-6. **Voice provider down** → Session fails to start. Text channels unaffected.
+6. **Voice-to-voice session fails** → Gemini Live session fails to start → text channels unaffected. Voice notes still work (async through Flash-Lite).
 7. **Voice cost overrun** → Per-session and daily minute budgets enforced.
-8. **Voice transcript quality** → All three APIs note transcripts may diverge slightly from what the model "heard". Memory pipeline handles this gracefully since it already handles imprecise input.
+8. **Voice transcript quality** → Gemini Live transcripts may diverge slightly from what the model "heard". Memory pipeline handles this gracefully since it already handles imprecise input.
+9. **Browser tool security** → Sandboxed Chromium profile, no access to main browser cookies. Per-site credential isolation.
+10. **Gemini single-provider dependency for routing** — Mitigated by the four-tier fallback chain. Text routing works without any cloud API (Qwen local). Only live voice-to-voice requires Gemini specifically.
 
 ---
 
@@ -696,17 +803,17 @@ If zvec is still immature at that point, proceed with the sqlite-vec hybrid path
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `orchestrator.py` | NEW | Kimi + Qwen local routing, synthesis, main orchestrate() entry point |
+| `orchestrator.py` | NEW | Two-phase Gemini routing (Flash-Lite triage + 3 Flash decompose), Qwen/GPT fallback, synthesis |
 | `workers.py` | NEW | Parallel Claude SDK worker pool, scoped profiles, dispatch logic |
 | `gateway.py` | NEW | Cron scheduler, webhook handler, built-in task definitions |
 | `channels/__init__.py` | NEW | Package init |
 | `channels/base.py` | NEW | Channel protocol, InboundMessage, OutboundMessage, ChannelRegistry |
 | `channels/whatsapp_channel.py` | NEW | WhatsApp adapter wrapping existing neonize client |
-| `channels/voice_channel.py` | NEW | Voice-to-voice session manager, provider relay, transcript capture |
-| `channels/voice_providers.py` | NEW | VoiceProvider ABC + Grok/OpenAI/Gemini implementations |
-| `agent.py` | MODIFIED | Add orchestrator delegation with fallback |
+| `channels/voice_channel.py` | NEW | Unified voice: async voice notes (via orchestrator) + live Gemini Live sessions |
+| `tools/browser_mcp.py` | NEW | Browser tool MCP server config (Playwright headless) |
+| `agent.py` | MODIFIED | Add orchestrator delegation with fallback, audio_bytes parameter |
 | `main.py` | MODIFIED | Add gateway scheduler init + tick + webhook routes + voice endpoint |
-| `config.py` | MODIFIED | Add orchestrator, gateway, and voice settings |
+| `config.py` | MODIFIED | Add orchestrator (Gemini models), gateway, voice, and browser settings |
 | `memory/embeddings.py` | MODIFIED | Add Qwen3-VL image embedding functions alongside existing EmbeddingGemma |
 | `memory/vectorstore.py` | MODIFIED | Add visual_chunks + visual_vec tables, merged search |
 | `memory/retriever.py` | MODIFIED | Add visual search path to retrieve_context() |
@@ -718,18 +825,20 @@ If zvec is still immature at that point, proceed with the sqlite-vec hybrid path
 Each phase is independently testable. The system works at every intermediate step because the fallback path is the existing code.
 
 ### Step 1: orchestrator.py
-- Kimi classification + Qwen local fallback + hardcoded fallback
+- Two-phase Gemini routing: Flash-Lite triage + 3 Flash decomposition
+- Qwen local fallback + GPT-4.1 Nano fallback + hardcoded fallback
+- `classify_message()` accepts text or audio_bytes
 - Can test by calling `orchestrate()` directly from a script
 - No changes to existing files yet
 
 ### Step 2: workers.py
-- Parallel Claude SDK worker pool with scoped profiles
+- Parallel Claude SDK worker pool with scoped profiles (including browser)
 - Can test with manually constructed `Subtask` objects
 - No changes to existing files yet
 
 ### Step 3: agent.py wiring
-- Add `use_orchestrator` flag, delegate to orchestrator when available
-- Flip the switch, test end-to-end with WhatsApp
+- Add `use_orchestrator` flag and `audio_bytes` parameter
+- Delegate to orchestrator when available
 - Full fallback to existing behavior if anything fails
 
 ### Step 4: gateway.py
@@ -744,21 +853,23 @@ Each phase is independently testable. The system works at every intermediate ste
 ### Step 6: channels/base.py + channels/whatsapp_channel.py
 - Unified channel abstraction
 - WhatsApp adapter wraps existing client
+- Voice note detection → passes audio_bytes to orchestrator
 - Prepares the interface for voice and future channels
 
-### Step 7: channels/voice_providers.py
-- VoiceProvider ABC + Grok/OpenAI implementation (shared protocol)
-- Gemini implementation (different protocol)
-- Can test each provider independently with a simple audio test script
-
-### Step 8: channels/voice_channel.py
-- Voice session manager: identity injection, tool bridging, transcript capture
-- WebSocket endpoint on FastAPI for audio relay
+### Step 7: channels/voice_channel.py
+- Gemini Live session manager: identity injection, tool bridging, transcript capture
+- WebSocket endpoint on FastAPI for audio relay (`ws://molly:8080/voice`)
 - Integration with memory pipeline for transcript storage
+- Can test with a simple audio test script against Gemini Live API
+
+### Step 8: tools/browser_mcp.py
+- Playwright headless browser MCP server configuration
+- Sandboxed Chromium profile
+- Register as `browser-tool` MCP server for the `browser` worker profile
 
 ### Step 9: config.py additions
 - Small additions throughout steps 1-8
-- Orchestrator, gateway, and voice settings
+- Gemini model names, orchestrator timeouts, voice budgets, browser config
 
 ### Step 10: memory/embeddings.py — Qwen3-VL multimodal embeddings
 - Load Qwen3-VL-Embedding-2B (GGUF or transformers)
