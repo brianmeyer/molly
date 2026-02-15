@@ -1,7 +1,15 @@
 import asyncio
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
+import fcntl
 import importlib
 import json
 import logging
+import os
 import re
 import shutil
 import signal
@@ -11,6 +19,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import config
 from agent import handle_message
@@ -41,6 +50,8 @@ log = logging.getLogger("molly")
 SURFACED_SIGNAL_WINDOW_SECONDS = 6 * 60 * 60
 MAX_RECENT_SURFACED_ITEMS = 100
 LAST_RESPONSE_TTL_SECONDS = 300  # 5 minutes
+AUTO_CREATE_UNDO_TTL_SECONDS = 24 * 60 * 60
+AUTO_CREATE_UNDO_MAX_ENTRIES = 200
 
 _CORRECTION_KEYWORDS = re.compile(
     r"\b(?:no[,.]|that'?s wrong|that is wrong|actually|not (?:that|what)|"
@@ -334,6 +345,114 @@ def ensure_tool_dependencies():
         )
 
 
+def _kill_stale_port(port: int):
+    """Kill any leftover process binding the given port (e.g. after a crash)."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().split()
+        my_pid = str(os.getpid())
+        for pid in pids:
+            if pid and pid != my_pid:
+                log.info("Killing stale process %s on port %d", pid, port)
+                os.kill(int(pid), signal.SIGTERM)
+        if pids:
+            time.sleep(0.3)  # give it a moment to release the port
+    except Exception:
+        log.debug("Could not check for stale port %d holders", port, exc_info=True)
+
+
+def _acquire_instance_lock() -> int | None:
+    """Prevent multiple Molly processes from sharing one WhatsApp session."""
+    lock_path = config.STORE_DIR / ".molly.instance.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
+def _release_instance_lock(fd: int):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        log.debug("Failed to unlock Molly instance lock", exc_info=True)
+    try:
+        os.close(fd)
+    except Exception:
+        log.debug("Failed to close Molly instance lock fd", exc_info=True)
+
+
+def _clear_pycache(*package_names: str):
+    """Remove __pycache__ dirs for given packages to recover from stale bytecode."""
+    site_packages = Path(sys.executable).parent.parent / "lib"
+    for sp in site_packages.rglob("site-packages"):
+        for pkg in package_names:
+            pkg_dir = sp / pkg
+            if pkg_dir.is_dir():
+                for cache_dir in pkg_dir.rglob("__pycache__"):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                # Also invalidate any top-level .pyc
+                for pyc in pkg_dir.glob("*.pyc"):
+                    pyc.unlink(missing_ok=True)
+    # Force re-import on next attempt
+    for name in list(sys.modules):
+        if any(name == pkg or name.startswith(pkg + ".") for pkg in package_names):
+            del sys.modules[name]
+
+
+def prewarm_ml_models():
+    """Prewarm ML models so first message doesn't eat a cold-start penalty.
+
+    Loads embedding (EmbeddingGemma-300M) and GLiNER2 (DeBERTa-v3-large)
+    in parallel background threads. Non-blocking on failure — both degrade
+    gracefully to lazy loading if this fails.
+
+    Cold start without prewarming: ~18 seconds on first message.
+    With prewarming: models are already resident when first message arrives.
+    """
+    import concurrent.futures
+
+    def _load_embedding():
+        try:
+            from memory.embeddings import _get_model
+            _get_model()
+            log.info("Embedding model prewarmed (EmbeddingGemma-300M)")
+        except Exception:
+            log.warning("Embedding model prewarm failed — will lazy-load on first use", exc_info=True)
+
+    def _load_gliner():
+        for attempt in range(2):
+            try:
+                from memory.extractor import _get_model
+                _get_model()
+                log.info("GLiNER2 model prewarmed")
+                return
+            except ImportError:
+                if attempt == 0:
+                    log.warning("GLiNER2 import failed — clearing bytecode cache and retrying")
+                    _clear_pycache("transformers", "gliner", "gliner2")
+                else:
+                    log.error("GLiNER2 import failed after cache clear — entity extraction will be unavailable", exc_info=True)
+            except Exception:
+                log.error("GLiNER2 model prewarm failed — entity extraction may be degraded", exc_info=True)
+                return
+
+    log.info("Prewarming ML models (embedding + GLiNER2)...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="prewarm") as pool:
+        futures = [pool.submit(_load_embedding), pool.submit(_load_gliner)]
+        concurrent.futures.wait(futures, timeout=120)
+    log.info("ML model prewarm complete")
+
+
 def preflight_checks():
     """Run all service checks before Molly starts."""
     log.info("Running preflight checks...")
@@ -342,6 +461,7 @@ def preflight_checks():
     ensure_triage_model()
     ensure_tool_dependencies()
     ensure_google_auth()
+    prewarm_ml_models()
     try:
         from health import get_health_doctor
 
@@ -389,6 +509,7 @@ class Molly:
         self._sent_ids: dict[str, float] = {}  # msg_id → timestamp (avoid echo loop)
         self._last_responses: dict[str, tuple[str, float]] = {}  # chat_jid → (response_text, timestamp)
         self._recent_surfaces: list[dict] = []  # recent surfaced notifications for feedback linking
+        self._auto_create_undo_map: dict[str, dict] = {}  # notification msg_id -> created resource metadata
         self.approvals = ApprovalManager()
         self.automations = AutomationEngine(self)
         self.self_improvement = SelfImprovementEngine(self)
@@ -397,6 +518,21 @@ class Molly:
         self._imessage_mention_task: asyncio.Task | None = None
         self._last_imessage_mention_check: datetime | None = None
         self.exit_code = 0
+        self._bg_semaphore = asyncio.Semaphore(12)  # cap concurrent background tasks
+        self._bg_tasks: set[asyncio.Task] = set()  # prevent GC before completion
+
+    # --- Background task management ---
+
+    def _spawn_bg(self, coro, *, name: str = "") -> asyncio.Task:
+        """Spawn a background task gated by the concurrency semaphore."""
+        async def _wrapper():
+            async with self._bg_semaphore:
+                return await coro
+        task = asyncio.create_task(_wrapper(), name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(_task_done_callback)
+        return task
 
     # --- State persistence ---
 
@@ -430,9 +566,15 @@ class Molly:
     def save_registered_chats(self):
         save_json(config.REGISTERED_CHATS_FILE, self.registered_chats)
 
+    @staticmethod
+    def _normalize_jid_user(jid: str) -> str:
+        """Extract stable user identifier from JIDs (strip @server and :device)."""
+        user = (jid or "").split("@", 1)[0]
+        return user.split(":", 1)[0]
+
     def _is_owner(self, sender_jid: str) -> bool:
         """Check if the sender is Brian (by phone or LID)."""
-        user = sender_jid.split("@")[0]
+        user = self._normalize_jid_user(sender_jid)
         return user in config.OWNER_IDS
 
     def _get_chat_mode(self, chat_jid: str) -> str:
@@ -445,7 +587,7 @@ class Molly:
         store_only — everything else, embed only
         """
         # Owner DMs (self-chat): always full processing
-        if chat_jid.split("@")[0] in config.OWNER_IDS:
+        if self._normalize_jid_user(chat_jid) in config.OWNER_IDS:
             return "owner_dm"
 
         # Check registered chats
@@ -468,10 +610,7 @@ class Molly:
 
     def _track_send(self, msg_id: str | list[str] | None):
         """Record message IDs Molly sent so we skip them on echo."""
-        if not msg_id:
-            return
-
-        msg_ids = [msg_id] if isinstance(msg_id, str) else [m for m in msg_id if m]
+        msg_ids = self._coerce_message_ids(msg_id)
         if not msg_ids:
             return
 
@@ -482,6 +621,15 @@ class Molly:
         # Prune entries older than 5 minutes
         cutoff = now - 300
         self._sent_ids = {k: v for k, v in self._sent_ids.items() if v > cutoff}
+
+    @staticmethod
+    def _coerce_message_ids(msg_id: str | list[str] | None) -> list[str]:
+        if isinstance(msg_id, str):
+            msg = msg_id.strip()
+            return [msg] if msg else []
+        if isinstance(msg_id, list):
+            return [str(m).strip() for m in msg_id if str(m).strip()]
+        return []
 
     @staticmethod
     def _normalize_signal_source(source: str) -> str:
@@ -536,6 +684,310 @@ class Molly:
                 source=source,
                 surfaced_summary=surfaced_summary or text,
                 sender_pattern=sender_pattern,
+            )
+
+    @staticmethod
+    def _decode_tool_response_payload(tool_response) -> dict:
+        if not isinstance(tool_response, dict):
+            return {}
+        if tool_response.get("is_error"):
+            return {}
+
+        content = tool_response.get("content")
+        if not isinstance(content, list):
+            return {}
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "text":
+                continue
+            text = str(part.get("text", "")).strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @staticmethod
+    def _format_auto_created_when(raw_when) -> tuple[str, str]:
+        if not raw_when:
+            return "unspecified date", "unspecified time"
+
+        value = str(raw_when).strip()
+        if not value:
+            return "unspecified date", "unspecified time"
+
+        if len(value) == 10 and value.count("-") == 2:
+            return value, "all day"
+
+        normalized = value.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(ZoneInfo(config.TIMEZONE))
+            date_text = dt.strftime("%Y-%m-%d")
+            time_text = dt.strftime("%I:%M %p").lstrip("0")
+            return date_text, time_text
+        except Exception:
+            if "T" in value:
+                date_part, _, time_part = value.partition("T")
+                time_part = time_part.split("+", 1)[0].replace("Z", "")
+                if date_part:
+                    return date_part, time_part or "unspecified time"
+            return value, "unspecified time"
+
+    @staticmethod
+    def _extract_tool_response_text(tool_response) -> str:
+        if not isinstance(tool_response, dict):
+            return ""
+        content = tool_response.get("content")
+        if not isinstance(content, list):
+            return ""
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "text":
+                continue
+            text = str(part.get("text", "")).strip()
+            if text:
+                return text
+        return ""
+
+    def _prune_auto_create_undo_map(self):
+        now = time.time()
+        cutoff = now - AUTO_CREATE_UNDO_TTL_SECONDS
+
+        fresh: dict[str, dict] = {}
+        for notification_id, entry in self._auto_create_undo_map.items():
+            if not isinstance(entry, dict):
+                continue
+            created_ts = float(entry.get("created_ts", 0.0) or 0.0)
+            if created_ts and created_ts < cutoff:
+                continue
+            fresh[notification_id] = entry
+
+        if len(fresh) > AUTO_CREATE_UNDO_MAX_ENTRIES:
+            ordered = sorted(
+                fresh.items(),
+                key=lambda item: float(item[1].get("created_ts", 0.0) or 0.0),
+            )
+            drop_count = len(fresh) - AUTO_CREATE_UNDO_MAX_ENTRIES
+            for notification_id, _ in ordered[:drop_count]:
+                fresh.pop(notification_id, None)
+
+        self._auto_create_undo_map = fresh
+
+    def _record_auto_create_undo_entry(
+        self,
+        notification_id: str,
+        chat_jid: str,
+        *,
+        resource_type: str,
+        resource_id: str,
+        title: str,
+        tasklist_id: str | None = None,
+    ):
+        notification_id = (notification_id or "").strip()
+        resource_id = (resource_id or "").strip()
+        if not notification_id or not resource_id:
+            return
+
+        self._auto_create_undo_map[notification_id] = {
+            "chat_jid": (chat_jid or "").strip(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "tasklist_id": (tasklist_id or "").strip(),
+            "title": (title or "").strip(),
+            "created_ts": time.time(),
+        }
+        self._prune_auto_create_undo_map()
+
+    @staticmethod
+    def _extract_undo_request(text: str) -> str | None:
+        content = (text or "").strip()
+        lowered = content.lower()
+        if lowered == "undo":
+            return ""
+        if lowered.startswith("undo "):
+            return content.split(None, 1)[1].strip()
+        return None
+
+    def _pop_auto_create_undo_entry(
+        self,
+        chat_jid: str,
+        requested_notification_id: str | None,
+    ) -> tuple[str | None, dict | None]:
+        chat = (chat_jid or "").strip()
+        requested = (requested_notification_id or "").strip()
+
+        self._prune_auto_create_undo_map()
+
+        if requested:
+            entry = self._auto_create_undo_map.get(requested)
+            if not isinstance(entry, dict):
+                return None, None
+            if entry.get("chat_jid") != chat:
+                return None, None
+            return requested, self._auto_create_undo_map.pop(requested)
+
+        best_id = None
+        best_entry = None
+        best_ts = -1.0
+        for notification_id, entry in self._auto_create_undo_map.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("chat_jid") != chat:
+                continue
+            ts = float(entry.get("created_ts", 0.0) or 0.0)
+            if ts > best_ts:
+                best_ts = ts
+                best_id = notification_id
+                best_entry = entry
+
+        if not best_id or not isinstance(best_entry, dict):
+            return None, None
+
+        self._auto_create_undo_map.pop(best_id, None)
+        return best_id, best_entry
+
+    async def _undo_auto_created_entry(self, entry: dict) -> tuple[bool, str]:
+        resource_type = str(entry.get("resource_type") or "").strip().lower()
+        resource_id = str(entry.get("resource_id") or "").strip()
+        if not resource_id:
+            return False, "missing resource id"
+
+        try:
+            if resource_type == "calendar":
+                from tools.calendar import calendar_delete
+
+                result = await calendar_delete({"event_id": resource_id})
+            elif resource_type == "task":
+                from tools.google_tasks import tasks_delete
+
+                args = {"task_id": resource_id}
+                tasklist_id = str(entry.get("tasklist_id") or "").strip()
+                if tasklist_id:
+                    args["tasklist_id"] = tasklist_id
+                result = await tasks_delete(args)
+            else:
+                return False, f"unsupported resource type: {resource_type}"
+        except Exception as exc:
+            log.error("Undo delete failed for %s:%s", resource_type, resource_id, exc_info=True)
+            return False, str(exc)
+
+        if isinstance(result, dict) and not result.get("is_error"):
+            return True, ""
+
+        detail = self._extract_tool_response_text(result)
+        return False, detail or "delete failed"
+
+    async def _maybe_handle_auto_create_undo(self, content: str, chat_jid: str) -> bool:
+        requested = self._extract_undo_request(content)
+        if requested is None:
+            return False
+        if not self.wa:
+            return True
+
+        requested_id = requested or None
+        notification_id, entry = self._pop_auto_create_undo_entry(chat_jid, requested_id)
+        if not entry:
+            suffix = f" '{requested_id}'" if requested_id else ""
+            self._track_send(
+                self.wa.send_message(
+                    chat_jid,
+                    f"No recent auto-created item found for undo{suffix}.",
+                )
+            )
+            return True
+
+        success, detail = await self._undo_auto_created_entry(entry)
+        if success:
+            item_type = "event" if entry.get("resource_type") == "calendar" else "task"
+            title = (entry.get("title") or "").strip() or entry.get("resource_id", "item")
+            self._track_send(self.wa.send_message(chat_jid, f"Undid auto-created {item_type}: {title}."))
+            return True
+
+        if notification_id:
+            self._auto_create_undo_map[notification_id] = entry
+            self._prune_auto_create_undo_map()
+        item_label = (entry.get("title") or "").strip() or entry.get("resource_id", "item")
+        reason = f": {detail}" if detail else "."
+        self._track_send(self.wa.send_message(chat_jid, f"Undo failed for {item_label}{reason}"))
+        return True
+
+    def notify_auto_created_tool_result(
+        self,
+        source_chat_jid: str,
+        tool_name: str,
+        tool_input: dict,
+        tool_response,
+    ):
+        """Notify Brian when an AUTO-tier create action succeeds."""
+        if tool_name not in {"calendar_create", "tasks_create"}:
+            return
+        if not self.wa:
+            return
+        if isinstance(tool_response, dict) and tool_response.get("is_error"):
+            return
+
+        payload = self._decode_tool_response_payload(tool_response)
+        title = ""
+        date_text = "unspecified date"
+        time_text = "unspecified time"
+        location = "no location"
+        resource_type = "calendar" if tool_name == "calendar_create" else "task"
+        resource_id = ""
+        tasklist_id = ""
+
+        if tool_name == "calendar_create":
+            event = payload.get("event", {}) if isinstance(payload, dict) else {}
+            if not isinstance(event, dict):
+                event = {}
+            title = str(event.get("summary") or tool_input.get("summary") or "Untitled event")
+            raw_start = event.get("start") or tool_input.get("start")
+            if isinstance(raw_start, dict):
+                raw_start = raw_start.get("dateTime") or raw_start.get("date")
+            date_text, time_text = self._format_auto_created_when(raw_start)
+            location = str(event.get("location") or tool_input.get("location") or "no location")
+            resource_id = str(event.get("id") or "").strip()
+        else:
+            created = payload.get("created", {}) if isinstance(payload, dict) else {}
+            if not isinstance(created, dict):
+                created = {}
+            title = str(created.get("title") or tool_input.get("title") or "Untitled task")
+            raw_due = created.get("due") or tool_input.get("due")
+            date_text, time_text = self._format_auto_created_when(raw_due)
+            location = str(tool_input.get("location") or "no location")
+            resource_id = str(created.get("id") or "").strip()
+            tasklist_id = str(tool_input.get("tasklist_id") or "@default").strip()
+
+        if not resource_id:
+            log.warning("Skipping auto-create notification without resource id for %s", tool_name)
+            return
+
+        title = " ".join(title.split()) or "Untitled item"
+        location = " ".join(location.split()) or "no location"
+        message = (
+            f"Auto-created: {title} on {date_text} at {time_text} at {location}. "
+            "Reply 'undo' to remove."
+        )
+
+        target_jid = self._get_owner_dm_jid() or source_chat_jid
+        notification_msg = self.wa.send_message(target_jid, message)
+        self._track_send(notification_msg)
+
+        for notification_id in self._coerce_message_ids(notification_msg):
+            self._record_auto_create_undo_entry(
+                notification_id,
+                target_jid,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                title=title,
+                tasklist_id=tasklist_id,
             )
 
     def _get_group_participant_names(self, chat_jid: str) -> list[str]:
@@ -704,11 +1156,10 @@ class Molly:
             return
 
         # Phase 6: evaluate message-triggered automations in background
-        auto_msg_task = asyncio.create_task(
+        self._spawn_bg(
             self.automations.on_message(msg_data),
             name=f"automation-msg:{chat_jid[:20]}",
         )
-        auto_msg_task.add_done_callback(_task_done_callback)
 
         # Determine chat processing tier
         chat_mode = self._get_chat_mode(chat_jid)
@@ -717,14 +1168,13 @@ class Molly:
         # Non-owner messages: passive processing only, never respond
         if not is_owner:
             if content.strip():
-                task = asyncio.create_task(
+                self._spawn_bg(
                     self._process_passive(
                         content, chat_jid, chat_mode, sender_jid,
                         sender_name=sender_name, group_name=group_name,
                     ),
                     name=f"passive:{chat_jid[:20]}",
                 )
-                task.add_done_callback(_task_done_callback)
             return
 
         # --- Owner messages from here ---
@@ -733,19 +1183,21 @@ class Molly:
         if self.approvals.try_resolve(content.strip(), chat_jid):
             return
 
+        # Owner safety net for AUTO-tier create tools (calendar/task)
+        if await self._maybe_handle_auto_create_undo(content.strip(), chat_jid):
+            return
+
         # Passive data collection only: log dismissive feedback to surfaced items
-        dismissive_task = asyncio.create_task(
+        self._spawn_bg(
             self._log_preference_signal_if_dismissive(chat_jid, content),
             name=f"dismissive-feedback:{chat_jid[:20]}",
         )
-        dismissive_task.add_done_callback(_task_done_callback)
 
         # Passive data collection: detect corrections to Molly's responses
-        correction_task = asyncio.create_task(
+        self._spawn_bg(
             self._detect_and_log_correction(chat_jid, content),
             name=f"correction-detect:{chat_jid[:20]}",
         )
-        correction_task.add_done_callback(_task_done_callback)
 
         # Check for @Molly trigger
         has_trigger = config.TRIGGER_PATTERN.search(content)
@@ -789,14 +1241,13 @@ class Molly:
         if not should_respond or not clean_content:
             # Owner message but not triggering a response — passive processing
             if content.strip():
-                task = asyncio.create_task(
+                self._spawn_bg(
                     self._process_passive(
                         content, chat_jid, chat_mode, sender_jid,
                         sender_name=sender_name, group_name=group_name,
                     ),
                     name=f"passive-owner:{chat_jid[:20]}",
                 )
-                task.add_done_callback(_task_done_callback)
             return
 
         # --- Molly is going to respond ---
@@ -836,11 +1287,10 @@ class Molly:
                 if visible:
                     self._track_send(self.wa.send_message(chat_jid, visible))
 
-                task = asyncio.create_task(
+                self._spawn_bg(
                     self._approval_flow(category, description, chat_jid, new_session_id),
                     name=f"approval:{chat_jid[:20]}",
                 )
-                task.add_done_callback(_task_done_callback)
             else:
                 self._track_send(self.wa.send_message(chat_jid, response))
 
@@ -882,7 +1332,7 @@ class Molly:
         # listen / store_only: triage first
         from memory.triage import triage_message
 
-        result = await triage_message(content, sender_name, group_name)
+        result = await triage_message(content, sender_name, group_name, chat_jid=chat_jid)
 
         if result is None:
             # Triage unavailable — fall back to old behavior
@@ -934,7 +1384,7 @@ class Molly:
     def _get_owner_dm_jid(self) -> str | None:
         """Find the owner's DM JID for sending notifications."""
         for jid in self.registered_chats:
-            if jid.split("@")[0] in config.OWNER_IDS:
+            if self._normalize_jid_user(jid) in config.OWNER_IDS:
                 return jid
         # Fallback: construct from first owner ID
         for owner_id in config.OWNER_IDS:
@@ -1096,8 +1546,18 @@ class Molly:
                 log_level="warning",
                 ws_max_size=8192,
             )
+            # Kill any stale process holding our port (e.g. from a crash/kernel panic)
+            _kill_stale_port(config.WEB_PORT)
+
             web_server = uvicorn.Server(web_config)
-            web_task = asyncio.create_task(web_server.serve(), name="web-ui")
+
+            async def _serve_web():
+                try:
+                    await web_server.serve()
+                except SystemExit:
+                    log.warning("Web UI exited (port %d likely in use) — continuing without it", config.WEB_PORT)
+
+            web_task = asyncio.create_task(_serve_web(), name="web-ui")
             web_task.add_done_callback(_task_done_callback)
             log.info("Web UI started at http://%s:%d", config.WEB_HOST, config.WEB_PORT)
         except ImportError:
@@ -1122,29 +1582,26 @@ class Molly:
                         self._automation_tick_task is None
                         or self._automation_tick_task.done()
                     ):
-                        self._automation_tick_task = asyncio.create_task(
+                        self._automation_tick_task = self._spawn_bg(
                             self.automations.tick(),
                             name="automations-tick",
                         )
-                        self._automation_tick_task.add_done_callback(_task_done_callback)
                     if (
                         self._self_improve_tick_task is None
                         or self._self_improve_tick_task.done()
                     ):
-                        self._self_improve_tick_task = asyncio.create_task(
+                        self._self_improve_tick_task = self._spawn_bg(
                             self.self_improvement.tick(),
                             name="self-improvement-tick",
                         )
-                        self._self_improve_tick_task.add_done_callback(_task_done_callback)
                     if should_heartbeat(self.last_heartbeat):
                         self.last_heartbeat = datetime.now()
-                        task = asyncio.create_task(
+                        self._spawn_bg(
                             self._run_with_timeout(
                                 run_heartbeat(self), "heartbeat", timeout=120,
                             ),
                             name="heartbeat",
                         )
-                        task.add_done_callback(_task_done_callback)
                     # Fast poll: iMessage @molly mentions (every 60s)
                     if (
                         self._imessage_mention_task is None
@@ -1153,7 +1610,7 @@ class Molly:
                         if self._should_check_imessage_mentions():
                             self._last_imessage_mention_check = datetime.now()
                             from heartbeat import _check_imessage_mentions
-                            self._imessage_mention_task = asyncio.create_task(
+                            self._imessage_mention_task = self._spawn_bg(
                                 self._run_with_timeout(
                                     _check_imessage_mentions(self),
                                     "imessage-mentions",
@@ -1161,18 +1618,14 @@ class Molly:
                                 ),
                                 name="imessage-mentions",
                             )
-                            self._imessage_mention_task.add_done_callback(
-                                _task_done_callback
-                            )
                     if should_run_maintenance(self.last_maintenance):
                         self.last_maintenance = datetime.now()
-                        task = asyncio.create_task(
+                        self._spawn_bg(
                             self._run_with_timeout(
                                 run_maintenance(molly=self), "maintenance", timeout=1800,
                             ),
                             name="maintenance",
                         )
-                        task.add_done_callback(_task_done_callback)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1206,22 +1659,47 @@ class Molly:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    preflight_checks()
+    instance_lock_fd = _acquire_instance_lock()
+    if instance_lock_fd is None:
+        log.error(
+            "Another Molly instance is already running (lock: %s). Exiting.",
+            config.STORE_DIR / ".molly.instance.lock",
+        )
+        sys.exit(1)
 
-    molly = Molly()
-
-    # Handle graceful shutdown
-    signal.signal(signal.SIGINT, molly.shutdown)
-    signal.signal(signal.SIGTERM, molly.shutdown)
-
-    exit_code = 0
     try:
-        exit_code = asyncio.run(molly.run()) or 0
-    except KeyboardInterrupt:
-        log.info("Interrupted.")
-        exit_code = 130
+        try:
+            import uvloop
 
-    sys.exit(int(exit_code))
+            uvloop.install()
+            log.info("uvloop event loop policy installed")
+        except Exception:
+            log.debug("uvloop unavailable; using default asyncio loop", exc_info=True)
+
+        preflight_checks()
+
+        molly = Molly()
+
+        # Handle graceful shutdown
+        signal.signal(signal.SIGINT, molly.shutdown)
+        signal.signal(signal.SIGTERM, molly.shutdown)
+
+        # SIGHUP → graceful restart (exit code 42, supervisor loop restarts)
+        def _restart_on_hup(*_args):
+            molly.request_restart("SIGHUP received")
+
+        signal.signal(signal.SIGHUP, _restart_on_hup)
+
+        exit_code = 0
+        try:
+            exit_code = asyncio.run(molly.run()) or 0
+        except KeyboardInterrupt:
+            log.info("Interrupted.")
+            exit_code = 130
+
+        sys.exit(int(exit_code))
+    finally:
+        _release_instance_lock(instance_lock_fd)
 
 
 if __name__ == "__main__":
