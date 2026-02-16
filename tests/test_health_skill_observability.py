@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 import config
 import db_pool
-import health
+from monitoring.agents import learning_loop
+from monitoring._base import (
+    HEALTH_SKILL_BASH_RATIO_RED,
+    HEALTH_SKILL_BASH_RATIO_YELLOW,
+    HEALTH_SKILL_LOW_WATERMARK,
+    HEALTH_SKILL_WINDOW_DAYS,
+)
 
 
 class TestHealthSkillObservability(unittest.TestCase):
@@ -72,7 +78,7 @@ class TestHealthSkillObservability(unittest.TestCase):
 
     def test_skill_execution_volume_red_when_no_events(self):
         with patch.object(config, "MOLLYGRAPH_PATH", self.db_path):
-            status, detail = health.HealthDoctor()._skill_execution_volume_check()
+            status, detail = learning_loop._skill_execution_volume_check()
 
         self.assertEqual(status, "red")
         self.assertIn("executions=0", detail)
@@ -82,9 +88,9 @@ class TestHealthSkillObservability(unittest.TestCase):
         self._insert_skill("success")
 
         with patch.object(config, "MOLLYGRAPH_PATH", self.db_path), patch.object(
-            health, "HEALTH_SKILL_LOW_WATERMARK", 3
+            learning_loop, "HEALTH_SKILL_LOW_WATERMARK", 3
         ):
-            status, detail = health.HealthDoctor()._skill_execution_volume_check()
+            status, detail = learning_loop._skill_execution_volume_check()
 
         self.assertEqual(status, "yellow")
         self.assertIn("executions=2", detail)
@@ -95,9 +101,9 @@ class TestHealthSkillObservability(unittest.TestCase):
             self._insert_tool_call("Bash")
 
         with patch.object(config, "MOLLYGRAPH_PATH", self.db_path), patch.object(
-            health, "HEALTH_SKILL_BASH_RATIO_RED", 0.30
-        ), patch.object(health, "HEALTH_SKILL_BASH_RATIO_YELLOW", 0.75):
-            status, detail = health.HealthDoctor()._skill_vs_direct_bash_ratio_check()
+            learning_loop, "HEALTH_SKILL_BASH_RATIO_RED", 0.30
+        ), patch.object(learning_loop, "HEALTH_SKILL_BASH_RATIO_YELLOW", 0.75):
+            status, detail = learning_loop._skill_vs_direct_bash_ratio_check()
 
         self.assertEqual(status, "red")
         self.assertIn("ratio=0.20", detail)
@@ -109,9 +115,9 @@ class TestHealthSkillObservability(unittest.TestCase):
             self._insert_tool_call("Bash")
 
         with patch.object(config, "MOLLYGRAPH_PATH", self.db_path), patch.object(
-            health, "HEALTH_SKILL_BASH_RATIO_RED", 0.30
-        ), patch.object(health, "HEALTH_SKILL_BASH_RATIO_YELLOW", 0.75):
-            status, detail = health.HealthDoctor()._skill_vs_direct_bash_ratio_check()
+            learning_loop, "HEALTH_SKILL_BASH_RATIO_RED", 0.30
+        ), patch.object(learning_loop, "HEALTH_SKILL_BASH_RATIO_YELLOW", 0.75):
+            status, detail = learning_loop._skill_vs_direct_bash_ratio_check()
 
         self.assertEqual(status, "green")
         self.assertIn("ratio=2.00", detail)

@@ -12,8 +12,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import importlib
+import importlib.util
 import config
-from memory.graph import VALID_REL_TYPES
+
+
+def _load_module_from_file(name: str, file_path: str):
+    """Force-load a module from its real file path, bypassing sys.modules pollution."""
+    spec = importlib.util.spec_from_file_location(name, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Force-load from real files to avoid cross-test sys.modules pollution
+_graph_mod = _load_module_from_file(
+    "memory.graph", str(PROJECT_ROOT / "memory" / "graph.py")
+)
+VALID_REL_TYPES = _graph_mod.VALID_REL_TYPES
+
 from memory.relationship_audit import (
     CONFLICTING_SYMMETRIC,
     DETERMINISTIC_RECLASSIFY,
@@ -753,7 +770,7 @@ class TestRelationshipAuditSourceAssertions(unittest.TestCase):
         self.assertIn("DETERMINISTIC_RECLASSIFY", content)
 
     def test_maintenance_contains_relationship_audit(self):
-        content = self._read_source("maintenance.py")
+        content = self._read_source("monitoring", "maintenance.py")
         self.assertIn("Relationship audit", content)
         self.assertIn("run_relationship_audit", content)
 
@@ -762,9 +779,10 @@ class TestRelationshipAuditSourceAssertions(unittest.TestCase):
         self.assertIn("audit_status", content)
         self.assertIn("quarantined", content)
 
-    def test_contract_audit_includes_relationship_audit_step(self):
-        content = self._read_source("contract_audit.py")
+    def test_maintenance_includes_relationship_audit_step(self):
+        content = self._read_source("monitoring", "maintenance.py")
         self.assertIn("Relationship audit", content)
+        self.assertIn("run_relationship_audit", content)
 
     def test_config_has_rel_audit_constants(self):
         self.assertTrue(hasattr(config, "REL_AUDIT_MODEL_ENABLED"))
@@ -800,9 +818,11 @@ class TestRelationshipAuditSourceAssertions(unittest.TestCase):
         self.assertIn("get_related_to_hotspots", content)
         self.assertIn("original_type_hint", content)
 
-    def test_contract_audit_required_steps_includes_relationship_audit(self):
-        from contract_audit import REQUIRED_NIGHTLY_STEPS
-        self.assertIn("Relationship audit", REQUIRED_NIGHTLY_STEPS)
+    def test_maintenance_run_maintenance_calls_relationship_audit(self):
+        """Verify run_maintenance() invokes the relationship audit step."""
+        content = self._read_source("monitoring", "maintenance.py")
+        self.assertIn("_step_relationship_audit", content)
+        self.assertIn("from memory.relationship_audit import run_relationship_audit", content)
 
     def test_kimi_model_ids_use_k25(self):
         self.assertEqual(config.CONTRACT_AUDIT_KIMI_MODEL, "kimi-k2.5")

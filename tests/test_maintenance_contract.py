@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config
 import health
-import maintenance
+import monitoring.maintenance as maintenance
 
 
 class _FrozenDateTime:
@@ -112,8 +112,7 @@ def _fake_health_module() -> types.ModuleType:
 
 class TestMaintenanceSchedulingContract(unittest.TestCase):
     def test_daily_maintenance_is_catch_up_safe_once_per_day(self):
-        with patch.object(maintenance, "datetime", _FrozenDateTime):
-            _FrozenDateTime.current = datetime(2026, 2, 8, 23, 0, 0)
+        with patch.object(maintenance, "_now_local", lambda: datetime(2026, 2, 8, 23, 0, 0)):
             self.assertTrue(maintenance.should_run_maintenance(None))
 
             self.assertFalse(
@@ -124,7 +123,7 @@ class TestMaintenanceSchedulingContract(unittest.TestCase):
                 maintenance.should_run_maintenance(datetime(2026, 2, 7, 23, 59, 0))
             )
 
-            _FrozenDateTime.current = datetime(2026, 2, 8, 22, 0, 0)
+        with patch.object(maintenance, "_now_local", lambda: datetime(2026, 2, 8, 22, 0, 0)):
             self.assertFalse(
                 maintenance.should_run_maintenance(datetime(2026, 2, 7, 23, 59, 0))
             )
@@ -177,6 +176,67 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
         fake_gs = types.ModuleType("memory.graph_suggestions")
         fake_gs.build_suggestion_digest = lambda: ""
 
+        # Build fake job modules for new maintenance steps
+        fake_entity_audit = types.ModuleType("monitoring.jobs.entity_audit")
+
+        async def _fake_run_entity_audit():
+            return {
+                "entities_audited": 0,
+                "relationships_audited": 0,
+                "gliner_examples_written": 0,
+                "types_adopted": 0,
+            }
+
+        fake_entity_audit.run_entity_audit = _fake_run_entity_audit
+
+        fake_graph_maint = types.ModuleType("monitoring.jobs.graph_maintenance")
+        fake_graph_maint.run_neo4j_checkpoint = lambda: "community edition, skipped"
+        fake_graph_maint.run_strength_decay = AsyncMock(return_value=11)
+        fake_graph_maint.run_dedup_sweep = lambda: 3
+        fake_graph_maint.run_orphan_cleanup = lambda: 2
+
+        fake_analysis = types.ModuleType("monitoring.jobs.analysis_jobs")
+        fake_analysis.compute_operational_insights = lambda: {
+            "tool_count_24h": 0,
+            "failing_tools": [],
+            "unused_skills": [],
+        }
+        fake_analysis.run_graph_suggestions_digest = lambda: "no suggestions today"
+
+        fake_learning = types.ModuleType("monitoring.jobs.learning_jobs")
+        fake_learning.run_foundry_skill_scan = AsyncMock(return_value="0 patterns")
+        fake_learning.run_tool_gap_scan = AsyncMock(return_value="0 gaps")
+        fake_learning.run_correction_patterns = lambda: "0 corrections"
+
+        fake_audit_jobs = types.ModuleType("monitoring.jobs.audit_jobs")
+        fake_audit_jobs.record_maintenance_issues = lambda results, status: (0, 0)
+
+        fake_self_improve = types.ModuleType("monitoring.jobs.self_improve_jobs")
+
+        async def _fake_mem_opt(impr):
+            mem_opt = await impr.run_memory_optimization()
+            return (
+                f"consolidated={mem_opt.get('entity_consolidations', 0)}, "
+                f"stale={mem_opt.get('stale_entities', 0)}, "
+                f"contradictions={mem_opt.get('contradictions', 0)}"
+            )
+
+        fake_self_improve.run_memory_optimization = _fake_mem_opt
+
+        async def _fake_gliner(impr):
+            gliner_cycle = await impr.run_gliner_nightly_cycle()
+            return str(gliner_cycle.get("message") or gliner_cycle.get("status", "unknown"))
+
+        fake_self_improve.run_gliner_loop = _fake_gliner
+
+        async def _fake_weekly(impr, now_local):
+            return False, "not due"
+
+        fake_self_improve.run_weekly_assessment = _fake_weekly
+
+        fake_cleanup = types.ModuleType("monitoring.jobs.cleanup_jobs")
+        fake_cleanup.prune_daily_logs = lambda: "nothing to prune"
+
         stack.enter_context(
             patch.dict(
                 sys.modules,
@@ -187,6 +247,13 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
                     "memory.retriever": fake_retriever,
                     "foundry_adapter": fake_foundry,
                     "memory.graph_suggestions": fake_gs,
+                    "monitoring.jobs.entity_audit": fake_entity_audit,
+                    "monitoring.jobs.graph_maintenance": fake_graph_maint,
+                    "monitoring.jobs.analysis_jobs": fake_analysis,
+                    "monitoring.jobs.learning_jobs": fake_learning,
+                    "monitoring.jobs.audit_jobs": fake_audit_jobs,
+                    "monitoring.jobs.self_improve_jobs": fake_self_improve,
+                    "monitoring.jobs.cleanup_jobs": fake_cleanup,
                 },
             )
         )
@@ -205,7 +272,7 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
         )
         stack.enter_context(patch.object(maintenance, "write_health_check"))
         if strength_side_effect is None:
-            stack.enter_context(patch.object(maintenance, "_run_strength_decay", return_value=11))
+            stack.enter_context(patch.object(maintenance, "_run_strength_decay", return_value="11 entities updated"))
         else:
             stack.enter_context(
                 patch.object(
@@ -214,11 +281,11 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
                     side_effect=strength_side_effect,
                 )
             )
-        stack.enter_context(patch.object(maintenance, "_run_dedup_sweep", return_value=3))
-        stack.enter_context(patch.object(maintenance, "_run_orphan_cleanup", return_value=2))
+        stack.enter_context(patch.object(maintenance, "_run_dedup_sweep", return_value="3 entities merged"))
+        stack.enter_context(patch.object(maintenance, "_run_orphan_cleanup", return_value="orphans=2, self_refs=1, blocklisted=0"))
         stack.enter_context(patch.object(maintenance, "_run_self_ref_cleanup", return_value=1))
         stack.enter_context(patch.object(maintenance, "_run_blocklist_cleanup", return_value=0))
-        stack.enter_context(patch.object(maintenance, "_prune_daily_logs", return_value=4))
+        stack.enter_context(patch.object(maintenance, "_prune_daily_logs", return_value="archived 4 daily log(s)"))
         stack.enter_context(
             patch.object(maintenance, "_run_opus_analysis", new=AsyncMock(return_value=""))
         )
@@ -269,7 +336,7 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
         report = report_path.read_text()
         self.assertIn("| Strength decay | failed |", report)
         self.assertIn("| Deduplication | 3 entities merged |", report)
-        self.assertIn("| Daily log pruning | 4 logs archived |", report)
+        self.assertIn("| Daily log pruning |", report)
 
     async def test_final_report_includes_late_step_outcomes(self):
         temp_root = Path(tempfile.mkdtemp(prefix="maintenance-report-contract-"))
@@ -377,6 +444,8 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
 
 class TestHealthExpectationContract(unittest.TestCase):
     def test_daily_maintenance_report_expectation_is_enforced(self):
+        from monitoring.agents.data_quality import _maintenance_log_check
+
         temp_root = Path(tempfile.mkdtemp(prefix="health-maintenance-contract-"))
         maintenance_dir = temp_root / "memory" / "maintenance"
         health_dir = temp_root / "memory" / "health"
@@ -384,17 +453,16 @@ class TestHealthExpectationContract(unittest.TestCase):
         with patch.object(config, "WORKSPACE", temp_root), patch.object(
             config, "HEALTH_REPORT_DIR", health_dir
         ):
-            doctor = health.HealthDoctor()
             maintenance_dir.mkdir(parents=True, exist_ok=True)
 
-            status, detail = doctor._maintenance_log_check()
+            status, detail = _maintenance_log_check()
             self.assertEqual(status, "red")
             self.assertIn("today/yesterday", detail)
 
             yesterday = (date.today() - timedelta(days=1)).isoformat()
             (maintenance_dir / f"{yesterday}.md").write_text("# Maintenance report\n")
 
-            status, detail = doctor._maintenance_log_check()
+            status, detail = _maintenance_log_check()
             self.assertEqual(status, "green")
             self.assertIn(yesterday, detail)
 

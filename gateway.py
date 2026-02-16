@@ -11,7 +11,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency guard
     croniter = None
 
-import automations_legacy
+from commitments import AutomationEngine as _LegacyEngine
+from proposals import propose_automation as _propose_automation
 import config
 from agent import handle_message
 from memory.email_digest import build_digest
@@ -74,7 +75,7 @@ class GatewayEngine:
 
     def __init__(self, molly):
         self.molly = molly
-        self._legacy = automations_legacy.AutomationEngine(molly)
+        self._legacy = _LegacyEngine(molly)
         self._state_path = config.AUTOMATIONS_STATE_FILE
         self._state_lock = asyncio.Lock()
         self._tick_lock = asyncio.Lock()
@@ -477,7 +478,7 @@ def propose_automation(operational_logs: list[dict]) -> str | None:
     regress while the gateway scheduler is replacing YAML execution paths.
     """
 
-    return automations_legacy.propose_automation(operational_logs)
+    return _propose_automation(operational_logs)
 
 
 def attach_gateway_routes(app, molly) -> None:
