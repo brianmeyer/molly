@@ -21,6 +21,12 @@ if [[ ! -f "$MAIN_PATH" ]]; then
     exit 1
 fi
 
+# Ensure dependencies are up to date (quiet, only prints if something changes)
+PIP_BIN="${ROOT_DIR}/.venv/bin/pip"
+if [[ -x "$PIP_BIN" ]] && [[ -f "$ROOT_DIR/requirements.txt" ]]; then
+    "$PIP_BIN" install --quiet --upgrade -r "$ROOT_DIR/requirements.txt" 2>/dev/null || true
+fi
+
 request_stop() {
     STOP_REQUESTED=1
     if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" >/dev/null 2>&1; then

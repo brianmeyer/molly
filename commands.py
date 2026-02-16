@@ -414,7 +414,7 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             return f"Commitments report failed: {e}"
 
     if cmd == "/health":
-        from health import get_health_doctor
+        from monitoring import get_health_doctor
 
         doctor = get_health_doctor(molly)
         arg = args.strip().lower()

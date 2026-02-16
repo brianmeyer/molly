@@ -151,8 +151,10 @@ async def run_heartbeat(molly):
     if "daily-digest" in skills.HEARTBEAT_SKILLS:
         await _check_morning_digest(molly, chat_jid)
 
+    # Meeting prep now runs via gateway scheduling/webhook flow.
+    # Keep the legacy helper for rollback, but avoid double-notifying.
     if "meeting-prep" in skills.HEARTBEAT_SKILLS:
-        await _check_meeting_prep(molly, chat_jid)
+        log.debug("Meeting prep heartbeat path disabled (gateway owns scheduling)")
 
     # Standard heartbeat: HEARTBEAT.md evaluation
     from agent import handle_message

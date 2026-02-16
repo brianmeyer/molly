@@ -23,12 +23,12 @@ from zoneinfo import ZoneInfo
 
 import config
 from agent import handle_message
-from automations import AutomationEngine
+from gateway import GatewayEngine
 from approval import ApprovalManager
 from commands import handle_command
 from database import Database
 from heartbeat import run_heartbeat, should_heartbeat
-from maintenance import run_maintenance, should_run_maintenance
+from monitoring import run_maintenance, should_run_maintenance
 from self_improve import SelfImprovementEngine
 from utils import atomic_write_json
 from whatsapp import WhatsAppClient
@@ -487,7 +487,7 @@ def preflight_checks():
     ensure_google_auth()
     prewarm_ml_models()
     try:
-        from health import get_health_doctor
+        from monitoring import get_health_doctor
 
         doctor = get_health_doctor()
         doctor.run_abbreviated_preflight()
@@ -537,7 +537,7 @@ class Molly:
         self._auto_calendar_seen: dict[tuple[str, str], float] = {}
         self._auto_calendar_lock = asyncio.Lock()
         self.approvals = ApprovalManager()
-        self.automations = AutomationEngine(self)
+        self.automations = GatewayEngine(self)
         self.self_improvement = SelfImprovementEngine(self)
         self._automation_tick_task: asyncio.Task | None = None
         self._self_improve_tick_task: asyncio.Task | None = None
