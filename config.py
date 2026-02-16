@@ -96,9 +96,9 @@ AUTOMATION_MIN_PATTERN_COUNT = int(os.getenv("MOLLY_AUTOMATION_MIN_PATTERN_COUNT
 EMAIL_TRIAGE_INTERVAL = int(os.getenv("MOLLY_EMAIL_TRIAGE_INTERVAL", "600"))
 
 # Feature flags — kill switches for proactive automation (V3 safety).
-# Keep OFF by default until dedup + undo are verified in production-like tests.
-AUTO_CALENDAR_EXTRACTION_ENABLED = _env_bool("MOLLY_AUTO_CALENDAR_EXTRACTION_ENABLED", False)
-AUTO_TASK_EXTRACTION_ENABLED = _env_bool("MOLLY_AUTO_TASK_EXTRACTION_ENABLED", False)
+# ON by default; dedup + undo verified. Override via env var to disable.
+AUTO_CALENDAR_EXTRACTION_ENABLED = _env_bool("MOLLY_AUTO_CALENDAR_EXTRACTION_ENABLED", True)
+AUTO_TASK_EXTRACTION_ENABLED = _env_bool("MOLLY_AUTO_TASK_EXTRACTION_ENABLED", True)
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent
