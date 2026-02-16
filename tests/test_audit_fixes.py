@@ -20,7 +20,7 @@ class TestMaintenanceNoBypass(unittest.TestCase):
     """Verify maintenance.py does NOT use bypassPermissions or MCP tools."""
 
     def setUp(self):
-        self.source = _read_source("maintenance.py")
+        self.source = _read_source("monitoring/maintenance.py")
 
     def test_no_bypass_permissions_in_code(self):
         """maintenance.py must not have permission_mode='bypassPermissions' in code."""
