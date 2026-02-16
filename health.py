@@ -1,11 +1,19 @@
-"""Compatibility shim: legacy health implementation.
+from monitoring import (
+    HEALTH_SKILL_BASH_RATIO_RED,
+    HEALTH_SKILL_BASH_RATIO_YELLOW,
+    HEALTH_SKILL_LOW_WATERMARK,
+    HealthDoctor,
+    _parse_iso,
+    get_health_doctor,
+    route_health_signal,
+)
 
-Runtime call sites now import monitoring.py directly, but a wide test/runtime
-surface still imports ``health``.  Keep this alias for one-week rollback safety.
-"""
-
-import importlib
-import sys
-
-_legacy = importlib.import_module("health_legacy")
-sys.modules[__name__] = _legacy
+__all__ = [
+    "HEALTH_SKILL_BASH_RATIO_RED",
+    "HEALTH_SKILL_BASH_RATIO_YELLOW",
+    "HEALTH_SKILL_LOW_WATERMARK",
+    "HealthDoctor",
+    "_parse_iso",
+    "get_health_doctor",
+    "route_health_signal",
+]
