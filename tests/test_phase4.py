@@ -70,6 +70,16 @@ class TestConfigDefaults(unittest.TestCase):
 # 2. web.py -- create_app, routes, token auth
 # ===================================================================
 
+def _has_fastapi():
+    try:
+        import fastapi
+        # Guard against MagicMock stubs injected by other test modules
+        return hasattr(fastapi, "FastAPI") and callable(fastapi.FastAPI)
+    except (ImportError, TypeError, AttributeError):
+        return False
+
+
+@unittest.skipUnless(_has_fastapi(), "fastapi not installed")
 class TestWebCreateApp(unittest.TestCase):
     """Verify create_app() returns a usable FastAPI application."""
 
@@ -101,6 +111,7 @@ class TestWebCreateApp(unittest.TestCase):
         self.assertIn("/ws", route_paths, "WebSocket /ws route is missing")
 
 
+@unittest.skipUnless(_has_fastapi(), "fastapi not installed")
 class TestWebTokenAuth(unittest.TestCase):
     """Test WebSocket /ws token authentication."""
 

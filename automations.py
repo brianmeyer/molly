@@ -1,19 +1,18 @@
-"""Compatibility shim for legacy YAML automation engine.
+"""Backward-compatible re-exports from commitments and proposals modules.
 
-GatewayEngine in ``gateway.py`` is the active scheduler used by main runtime.
-This module remains as an alias during migration to preserve test/runtime
-imports and rollback safety.
-
-Sentinel strings kept for source-assertion tests:
-- _DIRECT_ACTIONS
-- _is_direct_action
-- _execute_direct_action
-- _should_skip_digest_delivery
-- NO_DIGEST_ITEMS
+All real code lives in commitments.py and proposals.py.
+This module provides ``from automations import ...`` compatibility
+for tests and any remaining runtime callers.
 """
 
-import importlib
-import sys
+from commitments import (  # noqa: F401
+    Automation,
+    AutomationEngine,
+    _COMMITMENT_TRAILING_DUE_RE,
+    _extract_commitment_title,
+    _extract_due_datetime,
+    _extract_due_datetime_with_llm,
+    _titles_similar,
+)
 
-_legacy = importlib.import_module("automations_legacy")
-sys.modules[__name__] = _legacy
+from proposals import propose_automation  # noqa: F401

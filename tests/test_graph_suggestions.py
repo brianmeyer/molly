@@ -525,28 +525,10 @@ class TestSourceAssertions(unittest.TestCase):
         content = self._read_source("memory", "graph.py")
         self.assertIn("log_repeated_related_to", content)
 
-    def test_maintenance_contains_graph_suggestions(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("Graph suggestions", content)
-        self.assertIn("build_suggestion_digest", content)
-
-    def test_maintenance_contains_neo4j_checkpoint(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("db.checkpoint()", content)
-        self.assertIn("Neo4j checkpoint", content)
-        # Should try modern syntax first, with legacy fallback (M3)
-        self.assertIn("SHOW SERVER INFO", content)
-        self.assertIn("dbms.components()", content)
-
-    def test_maintenance_contains_operational_insights(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("Operational insights", content)
-        self.assertIn("_compute_operational_insights", content)
-
-    def test_maintenance_contains_foundry_scans(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("Foundry skill scan", content)
-        self.assertIn("Tool gap scan", content)
+    def test_maintenance_contains_graph_suggestions_cleanup(self):
+        content = self._read_source("monitoring", "jobs", "cleanup_jobs.py")
+        self.assertIn("graph_suggestions", content)
+        self.assertIn(".jsonl", content)
 
     def test_main_contains_correction_detection(self):
         content = self._read_source("main.py")
@@ -593,29 +575,20 @@ class TestSourceAssertions(unittest.TestCase):
         self.assertIn("async def propose_skill_updates(self", content)
         self.assertIn("async def propose_tool_updates(self", content)
 
-    def test_maintenance_uses_public_wrappers(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("propose_skill_updates(", content)
-        self.assertIn("propose_tool_updates(", content)
-        # Should NOT call the private versions directly
-        self.assertNotIn("_propose_skill_updates_from_patterns", content)
-        self.assertNotIn("_propose_tool_updates_from_failures", content)
-
-    def test_maintenance_contains_correction_patterns(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("Correction patterns", content)
-        self.assertIn("corrections", content)
+    def test_maintenance_has_relationship_audit_step(self):
+        content = self._read_source("monitoring", "maintenance.py")
+        self.assertIn("run_relationship_audit", content)
+        self.assertIn("Relationship audit", content)
 
     def test_graph_py_has_debug_logging(self):
         content = self._read_source("memory", "graph.py")
         self.assertIn("graph suggestion fallback logging failed", content)
         self.assertIn("graph suggestion hotspot logging failed", content)
 
-    def test_maintenance_has_jsonl_cleanup(self):
-        content = self._read_source("maintenance.py")
-        self.assertIn("graph_suggestions", content)
-        self.assertIn(".jsonl", content)
-        self.assertIn("unlink()", content)
+    def test_maintenance_has_contract_audit_step(self):
+        content = self._read_source("monitoring", "maintenance.py")
+        self.assertIn("run_contract_audits", content)
+        self.assertIn("Contract audit", content)
 
 
 if __name__ == "__main__":

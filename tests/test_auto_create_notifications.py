@@ -375,6 +375,10 @@ class TestUndoDeleteDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(success)
         mock_delete.assert_awaited_once_with({"event_id": "evt-dispatch-test"})
 
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("google.auth"),
+        "google-auth not installed",
+    )
     async def test_task_delete_dispatches_with_tasklist_id(self):
         molly = _new_molly()
         entry = {

@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
-# Stub heavyweight modules so importing automations.py doesn't fail
+# Stub heavyweight modules so importing automations.py doesn't fail.
+# IMPORTANT: Clean up stubs after import to avoid polluting other tests.
 # ---------------------------------------------------------------------------
 _STUBS: dict[str, MagicMock] = {}
 for _mod in (
@@ -24,6 +25,13 @@ for _mod in (
         _STUBS[_mod] = MagicMock()
 if _STUBS:
     sys.modules.update(_STUBS)
+    # Force the import that needs these stubs
+    import automations  # noqa: F401
+    import commitments  # noqa: F401
+    # Clean up: remove stubs we injected so other test modules aren't polluted
+    for _mod_name in _STUBS:
+        if sys.modules.get(_mod_name) is _STUBS[_mod_name]:
+            del sys.modules[_mod_name]
 
 
 # ---------------------------------------------------------------------------
@@ -507,18 +515,18 @@ class TestSourceAssertions(unittest.TestCase):
         self.assertIn("email_digest", content)
 
     def test_automations_has_direct_action_dispatch(self):
-        content = self._read_source("automations.py")
+        content = self._read_source("commitments.py")
         self.assertIn("_is_direct_action", content)
         self.assertIn("_execute_direct_action", content)
         self.assertIn("_DIRECT_ACTIONS", content)
 
     def test_automations_has_digest_delivery_skip(self):
-        content = self._read_source("automations.py")
+        content = self._read_source("commitments.py")
         self.assertIn("_should_skip_digest_delivery", content)
         self.assertIn("NO_DIGEST_ITEMS", content)
 
     def test_maintenance_has_digest_queue_cleanup(self):
-        content = self._read_source("maintenance.py")
+        content = self._read_source("monitoring", "jobs", "cleanup_jobs.py")
         self.assertIn("cleanup_old_files", content)
         self.assertIn("email_digest", content)
 

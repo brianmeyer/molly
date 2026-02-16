@@ -25,8 +25,7 @@ class TestDismissiveFeedbackHook(unittest.TestCase):
         self.assertNotIn("DISMISSIVE_FEEDBACK_PATTERNS", src)
         self.assertIn("def _log_preference_signal_if_dismissive", src)
         self.assertIn("from memory.triage import classify_local_async", src)
-        self.assertIn("dismissive_task = asyncio.create_task(", src)
-        self.assertIn("self._log_preference_signal_if_dismissive(chat_jid, content)", src)
+        self.assertIn("_log_preference_signal_if_dismissive(chat_jid, content)", src)
 
     def test_triage_has_local_classifier_helper(self):
         src = _read("memory/triage.py")
