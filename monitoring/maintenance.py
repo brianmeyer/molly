@@ -261,7 +261,7 @@ def _send_summary_to_owner(molly, summary_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main maintenance orchestrator — full 22-step sequence
+# Main maintenance orchestrator — full 23-step sequence
 # ---------------------------------------------------------------------------
 
 async def run_maintenance(molly=None) -> dict[str, Any]:
@@ -435,6 +435,10 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
         async def _step_graph_suggestions() -> str:
             from monitoring.jobs.analysis_jobs import run_graph_suggestions_digest
             return run_graph_suggestions_digest()
+
+        async def _step_code_loop() -> str:
+            from evolution.code_loop import run_code_loop  # LAZY — avoids circular import
+            return await run_code_loop(improver)
 
         async def _step_issue_registry() -> str:
             from monitoring.jobs.audit_jobs import record_maintenance_issues
@@ -636,17 +640,20 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
             # Step 20: Issue registry sync (NEW)
             await _run_step(20, "Issue registry", _step_issue_registry)
 
-            # Step 21: Report
-            if not _is_done(21, "Report"):
+            # Step 21: Code loop (evolution engine proposals)
+            await _run_step(21, "Code loop", _step_code_loop)
+
+            # Step 22: Report
+            if not _is_done(22, "Report"):
                 report = _build_maintenance_report(results, run_status=_status(), failed_steps=failed_steps)
                 if analysis_text.strip():
                     report = report.rstrip() + f"\n\n## Analysis\n\n{analysis_text.strip()}\n"
                 atomic_write(report_path, report)
                 _record("Report", "written")
-                _final(21)
+                _final(22)
 
-            # Step 22: Summary
-            if not _is_done(22, "Summary"):
+            # Step 23: Summary
+            if not _is_done(23, "Summary"):
                 try:
                     from memory.graph import entity_count, relationship_count
 
@@ -664,7 +671,7 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 except Exception:
                     _record("Summary", "failed", failed=True)
                 finally:
-                    _final(22)
+                    _final(23)
 
             _RUN_STATE.status = _status()
             _RUN_STATE.last_error = ""

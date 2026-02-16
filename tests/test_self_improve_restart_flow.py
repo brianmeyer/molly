@@ -10,7 +10,8 @@ import sys
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from self_improve import PatchValidation, SelfImprovementEngine
+from evolution._base import PatchValidation
+from evolution.skills import SelfImprovementEngine
 
 
 def _agit_result(stdout: str = ""):

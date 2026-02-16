@@ -29,7 +29,7 @@ from commands import handle_command
 from database import Database
 from heartbeat import run_heartbeat, should_heartbeat
 from monitoring import run_maintenance, should_run_maintenance
-from self_improve import SelfImprovementEngine
+from evolution.skills import SelfImprovementEngine
 from utils import atomic_write_json
 from whatsapp import WhatsAppClient
 
