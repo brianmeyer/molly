@@ -162,6 +162,9 @@ EMAIL_DIGEST_QUEUE_DIR = WORKSPACE / "memory" / "email_digest_queue"
 TOOL_GAP_MIN_FAILURES = max(1, int(os.getenv("MOLLY_TOOL_GAP_MIN_FAILURES", "5")))
 TOOL_GAP_WINDOW_DAYS = max(1, int(os.getenv("MOLLY_TOOL_GAP_WINDOW_DAYS", "7")))
 
+# Phase 4: Evolution Engine
+CODE_LOOP_ENABLED = _env_bool("MOLLY_CODE_LOOP_ENABLED", False)
+
 # Phase 7: Health Doctor
 HEALTH_REPORT_DIR = WORKSPACE / "memory" / "health"
 HEALTH_REPORT_RETENTION_DAYS = int(os.getenv("MOLLY_HEALTH_REPORT_RETENTION_DAYS", "30"))
@@ -282,6 +285,8 @@ CONTACTS_DB = Path.home() / "Library" / "Application Support" / "AddressBook" / 
 IMESSAGE_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
 # External model APIs (Phase 5)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: for GPT-OSS 120B judge
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
 MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")

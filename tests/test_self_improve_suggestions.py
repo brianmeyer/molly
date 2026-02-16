@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 import db_pool
 from foundry_adapter import FoundrySequenceSignal
-from self_improve import SelfImprovementEngine
+from evolution.skills import SelfImprovementEngine
 
 
 class TestSelfImproveSuggestions(unittest.TestCase):

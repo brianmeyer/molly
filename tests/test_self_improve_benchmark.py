@@ -8,7 +8,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
-from self_improve import SelfImprovementEngine
+from evolution.skills import SelfImprovementEngine
 
 
 class TestSelfImproveBenchmark(unittest.TestCase):

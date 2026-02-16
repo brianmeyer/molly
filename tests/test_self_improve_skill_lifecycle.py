@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config
 import db_pool
-from self_improve import SelfImprovementEngine
+from evolution.skills import SelfImprovementEngine
 
 
 class _RecordingVectorStore:
