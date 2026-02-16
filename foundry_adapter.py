@@ -146,6 +146,8 @@ def write_observation(
         entry = {
             "timestamp": now.isoformat(),
             "tool_sequence": list(tool_sequence),
+            "workflow": " -> ".join(str(step) for step in tool_sequence),
+            "workflow_steps": len(tool_sequence),
             "outcome": outcome,
             "context": (context or "")[:200],
         }

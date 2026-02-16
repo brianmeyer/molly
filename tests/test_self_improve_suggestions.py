@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
+import db_pool
 from foundry_adapter import FoundrySequenceSignal
 from self_improve import SelfImprovementEngine
 
@@ -39,7 +40,7 @@ class TestSelfImproveSuggestions(unittest.TestCase):
     def test_detect_tool_gap_candidates_filters_by_failure_count(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="self-improve-tool-gaps-"))
         db_path = tmpdir / "mollygraph.db"
-        conn = sqlite3.connect(str(db_path))
+        conn = db_pool.sqlite_connect(str(db_path))
         conn.execute(
             """
             CREATE TABLE tool_calls (
@@ -79,7 +80,7 @@ class TestSelfImproveSuggestions(unittest.TestCase):
     def test_detect_tool_gap_candidates_default_threshold_and_window(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="self-improve-tool-gap-defaults-"))
         db_path = tmpdir / "mollygraph.db"
-        conn = sqlite3.connect(str(db_path))
+        conn = db_pool.sqlite_connect(str(db_path))
         conn.execute(
             """
             CREATE TABLE tool_calls (
@@ -204,7 +205,7 @@ class TestSelfImproveSuggestionFlow(unittest.IsolatedAsyncioTestCase):
 
 class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
     def _setup_skill_gap_schema(self, db_path: Path):
-        conn = sqlite3.connect(str(db_path))
+        conn = db_pool.sqlite_connect(str(db_path))
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS skill_gaps (
@@ -240,7 +241,7 @@ class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
         db_path = tmpdir / "mollygraph.db"
         self._setup_skill_gap_schema(db_path)
 
-        conn = sqlite3.connect(str(db_path))
+        conn = db_pool.sqlite_connect(str(db_path))
         conn.executemany(
             "INSERT INTO skill_gaps (cluster_key, status, addressed) VALUES (?, ?, ?)",
             [
@@ -264,7 +265,7 @@ class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
         events = 0
         try:
             result = await engine._propose_skill_updates_from_gap_clusters(min_cluster_size=3)
-            conn = sqlite3.connect(str(db_path))
+            conn = db_pool.sqlite_connect(str(db_path))
             rows = conn.execute(
                 "SELECT status, addressed, proposal_id, cooldown_until FROM skill_gaps WHERE cluster_key = ?",
                 ("calendar-followups",),
@@ -296,7 +297,7 @@ class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
         now = datetime.now(timezone.utc)
         future = (now + timedelta(days=2)).isoformat()
 
-        conn = sqlite3.connect(str(db_path))
+        conn = db_pool.sqlite_connect(str(db_path))
         conn.executemany(
             "INSERT INTO skill_gaps (cluster_key, status, addressed, cooldown_until) VALUES (?, ?, ?, ?)",
             [

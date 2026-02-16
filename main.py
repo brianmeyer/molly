@@ -30,6 +30,7 @@ from database import Database
 from heartbeat import run_heartbeat, should_heartbeat
 from maintenance import run_maintenance, should_run_maintenance
 from self_improve import SelfImprovementEngine
+from utils import atomic_write_json
 from whatsapp import WhatsAppClient
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,7 @@ MAX_RECENT_SURFACED_ITEMS = 100
 LAST_RESPONSE_TTL_SECONDS = 300  # 5 minutes
 AUTO_CREATE_UNDO_TTL_SECONDS = 24 * 60 * 60
 AUTO_CREATE_UNDO_MAX_ENTRIES = 200
+AUTO_CALENDAR_SEEN_TTL_SECONDS = 2 * 60 * 60
 
 _CORRECTION_KEYWORDS = re.compile(
     r"\b(?:no[,.]|that'?s wrong|that is wrong|actually|not (?:that|what)|"
@@ -59,6 +61,20 @@ _CORRECTION_KEYWORDS = re.compile(
     r"you got .{1,20} wrong|that'?s not what)\b",
     re.IGNORECASE,
 )
+
+_CANCEL_EVENT: asyncio.Event | None = None
+_CANCEL_EVENT_LOOP_ID: int | None = None
+
+
+def get_cancel_event() -> asyncio.Event:
+    """Return a loop-safe singleton cancellation token for background work."""
+    global _CANCEL_EVENT, _CANCEL_EVENT_LOOP_ID
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    if _CANCEL_EVENT is None or _CANCEL_EVENT_LOOP_ID != loop_id:
+        _CANCEL_EVENT = asyncio.Event()
+        _CANCEL_EVENT_LOOP_ID = loop_id
+    return _CANCEL_EVENT
 
 
 _TOOL_DEPENDENCY_SPECS = [
@@ -173,6 +189,14 @@ _TOOL_DEPENDENCY_SPECS = [
             ("claude_agent_sdk", "claude-agent-sdk"),
             ("httpx", "httpx"),
             ("xai_sdk", "xai-sdk"),
+        ],
+    },
+    {
+        "server": "groq",
+        "tools": {"groq_reason"},
+        "requirements": [
+            ("claude_agent_sdk", "claude-agent-sdk"),
+            ("httpx", "httpx"),
         ],
     },
 ]
@@ -486,8 +510,8 @@ def load_json(path: Path, default=None):
 
 
 def save_json(path: Path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
+    """Write JSON atomically: write to .tmp, then os.replace (POSIX-atomic)."""
+    atomic_write_json(path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +534,8 @@ class Molly:
         self._last_responses: dict[str, tuple[str, float]] = {}  # chat_jid → (response_text, timestamp)
         self._recent_surfaces: list[dict] = []  # recent surfaced notifications for feedback linking
         self._auto_create_undo_map: dict[str, dict] = {}  # notification msg_id -> created resource metadata
+        self._auto_calendar_seen: dict[tuple[str, str], float] = {}
+        self._auto_calendar_lock: asyncio.Lock | None = None
         self.approvals = ApprovalManager()
         self.automations = AutomationEngine(self)
         self.self_improvement = SelfImprovementEngine(self)
@@ -520,6 +546,8 @@ class Molly:
         self.exit_code = 0
         self._bg_semaphore = asyncio.Semaphore(12)  # cap concurrent background tasks
         self._bg_tasks: set[asyncio.Task] = set()  # prevent GC before completion
+        self.cancel_event: asyncio.Event | None = None
+        self._cancel_clear_task: asyncio.Task | None = None
 
     # --- Background task management ---
 
@@ -534,12 +562,40 @@ class Molly:
         task.add_done_callback(_task_done_callback)
         return task
 
+    async def _clear_cancel_after_grace(self, grace_s: int = 5):
+        await asyncio.sleep(grace_s)
+        if self.cancel_event is not None:
+            self.cancel_event.clear()
+            log.info("Background cancellation token cleared after %ss grace", grace_s)
+
+    def _request_background_cancel(self):
+        if self.cancel_event is None:
+            return
+        self.cancel_event.set()
+        log.info("Background cancellation requested by owner")
+        if self._cancel_clear_task and not self._cancel_clear_task.done():
+            self._cancel_clear_task.cancel()
+        self._cancel_clear_task = self._spawn_bg(
+            self._clear_cancel_after_grace(),
+            name="cancel-clear",
+        )
+
     # --- State persistence ---
 
     def load_state(self):
         self.sessions = load_json(config.SESSIONS_FILE, {})
         self.registered_chats = load_json(config.REGISTERED_CHATS_FILE, {})
         self.state = load_json(config.STATE_FILE, {})
+
+        # Load persisted undo map (survives restarts)
+        persisted = load_json(config.UNDO_MAP_FILE, {})
+        if isinstance(persisted, dict):
+            pre_count = len(persisted)
+            self._auto_create_undo_map = persisted
+            self._prune_auto_create_undo_map()
+            if len(self._auto_create_undo_map) < pre_count:
+                self._save_undo_map()  # persist pruned state
+        log.info("Undo map loaded: %d entries", len(self._auto_create_undo_map))
 
         # Migrate: add "mode" field to existing registered chat entries
         migrated = False
@@ -757,6 +813,13 @@ class Molly:
                 return text
         return ""
 
+    def _save_undo_map(self):
+        """Persist the undo map to disk so it survives restarts."""
+        try:
+            save_json(config.UNDO_MAP_FILE, self._auto_create_undo_map)
+        except Exception:
+            log.warning("Failed to persist undo map to disk", exc_info=True)
+
     def _prune_auto_create_undo_map(self):
         now = time.time()
         cutoff = now - AUTO_CREATE_UNDO_TTL_SECONDS
@@ -780,6 +843,19 @@ class Molly:
                 fresh.pop(notification_id, None)
 
         self._auto_create_undo_map = fresh
+
+    def _prune_auto_calendar_seen(self, now_ts: float | None = None):
+        now = now_ts or time.time()
+        cutoff = now - AUTO_CALENDAR_SEEN_TTL_SECONDS
+        self._auto_calendar_seen = {
+            key: seen_ts
+            for key, seen_ts in self._auto_calendar_seen.items()
+            if seen_ts >= cutoff
+        }
+
+    def _remember_auto_calendar_seen(self, dedup_key: tuple[str, str]):
+        self._prune_auto_calendar_seen()
+        self._auto_calendar_seen[dedup_key] = time.time()
 
     def _record_auto_create_undo_entry(
         self,
@@ -805,6 +881,7 @@ class Molly:
             "created_ts": time.time(),
         }
         self._prune_auto_create_undo_map()
+        self._save_undo_map()
 
     @staticmethod
     def _extract_undo_request(text: str) -> str | None:
@@ -832,7 +909,9 @@ class Molly:
                 return None, None
             if entry.get("chat_jid") != chat:
                 return None, None
-            return requested, self._auto_create_undo_map.pop(requested)
+            popped = self._auto_create_undo_map.pop(requested)
+            self._save_undo_map()
+            return requested, popped
 
         best_id = None
         best_entry = None
@@ -852,6 +931,7 @@ class Molly:
             return None, None
 
         self._auto_create_undo_map.pop(best_id, None)
+        self._save_undo_map()
         return best_id, best_entry
 
     async def _undo_auto_created_entry(self, entry: dict) -> tuple[bool, str]:
@@ -895,11 +975,28 @@ class Molly:
         requested_id = requested or None
         notification_id, entry = self._pop_auto_create_undo_entry(chat_jid, requested_id)
         if not entry:
-            suffix = f" '{requested_id}'" if requested_id else ""
+            # Only consume bare "undo" or "undo <notification_id>" messages.
+            # If the message is "undo something else" (not a known ID), fall
+            # through so normal processing can handle it — avoids hijacking
+            # every message starting with "undo".
+            if requested_id:
+                # User tried "undo <specific_id>" that doesn't exist — inform them
+                self._track_send(
+                    self.wa.send_message(
+                        chat_jid,
+                        f"No recent auto-created item found for undo '{requested_id}'.",
+                    )
+                )
+                return True
+            # Bare "undo" with nothing in the map — check if there are ANY entries
+            # (across all chats). If the map is empty, this likely isn't an undo
+            # request, so fall through to normal processing.
+            if not self._auto_create_undo_map:
+                return False
             self._track_send(
                 self.wa.send_message(
                     chat_jid,
-                    f"No recent auto-created item found for undo{suffix}.",
+                    "No recent auto-created item found for undo.",
                 )
             )
             return True
@@ -914,6 +1011,7 @@ class Molly:
         if notification_id:
             self._auto_create_undo_map[notification_id] = entry
             self._prune_auto_create_undo_map()
+            self._save_undo_map()
         item_label = (entry.get("title") or "").strip() or entry.get("resource_id", "item")
         reason = f": {detail}" if detail else "."
         self._track_send(self.wa.send_message(chat_jid, f"Undo failed for {item_label}{reason}"))
@@ -971,8 +1069,13 @@ class Molly:
 
         title = " ".join(title.split()) or "Untitled item"
         location = " ".join(location.split()) or "no location"
+        source_label = str(tool_input.get("_auto_source") or "").strip().lower()
+        if source_label:
+            prefix = f"Auto-created from {source_label}: "
+        else:
+            prefix = "Auto-created: "
         message = (
-            f"Auto-created: {title} on {date_text} at {time_text} at {location}. "
+            f"{prefix}{title} on {date_text} at {time_text} at {location}. "
             "Reply 'undo' to remove."
         )
 
@@ -980,7 +1083,14 @@ class Molly:
         notification_msg = self.wa.send_message(target_jid, message)
         self._track_send(notification_msg)
 
-        for notification_id in self._coerce_message_ids(notification_msg):
+        notification_ids = list(self._coerce_message_ids(notification_msg))
+        if not notification_ids:
+            log.warning(
+                "Auto-created %s '%s' (%s) but WhatsApp notification failed — "
+                "orphaned resource with no undo capability",
+                resource_type, title, resource_id,
+            )
+        for notification_id in notification_ids:
             self._record_auto_create_undo_entry(
                 notification_id,
                 target_jid,
@@ -1187,6 +1297,18 @@ class Molly:
         if await self._maybe_handle_auto_create_undo(content.strip(), chat_jid):
             return
 
+        owner_directive = content.strip().lower()
+        if owner_directive in {"stop", "cancel"}:
+            self._request_background_cancel()
+            if self.wa:
+                self._track_send(
+                    self.wa.send_message(
+                        chat_jid,
+                        "Stopping background processing now. I will clear the cancel token in 5 seconds.",
+                    )
+                )
+            return
+
         # Passive data collection only: log dismissive feedback to surfaced items
         self._spawn_bg(
             self._log_preference_signal_if_dismissive(chat_jid, content),
@@ -1304,6 +1426,122 @@ class Molly:
         finally:
             self.wa.send_typing_stopped(chat_jid)
 
+    async def _auto_action_from_triage(
+        self,
+        message_text: str,
+        triage_result,
+        channel: str,
+        sender_name: str = "",
+        source_chat_jid: str = "",
+        cycle_seen: set[tuple[str, str]] | None = None,
+    ) -> bool:
+        """Create calendar events automatically for relevant/urgent event messages."""
+        if not config.AUTO_CALENDAR_EXTRACTION_ENABLED:
+            return False
+
+        classification = str(getattr(triage_result, "classification", "") or "").strip().lower()
+        if classification not in {"urgent", "relevant"}:
+            return False
+
+        try:
+            from memory.triage import (
+                EVENT_PATTERNS,
+                calendar_event_dedup_key,
+                calendar_event_is_duplicate_async,
+                extract_calendar_event_async,
+                mark_calendar_event_seen,
+            )
+        except Exception:
+            log.warning("Auto-calendar triage helpers unavailable", exc_info=True)
+            return False
+
+        text = (message_text or "").strip()
+        if not text or not EVENT_PATTERNS.search(text):
+            return False
+
+        try:
+            event = await extract_calendar_event_async(
+                text,
+                sender_name=sender_name,
+                channel=channel,
+            )
+        except Exception:
+            log.warning("Calendar extraction failed", exc_info=True)
+            return False
+
+        if not event or not isinstance(event, dict):
+            return False
+
+        title = str(event.get("title") or "").strip()
+        event_dt = event.get("datetime")
+        if not title or not isinstance(event_dt, datetime):
+            return False
+
+        if self._auto_calendar_lock is None:
+            self._auto_calendar_lock = asyncio.Lock()
+
+        async with self._auto_calendar_lock:
+            self._prune_auto_calendar_seen()
+            dedup_key = calendar_event_dedup_key(title, event_dt)
+            if dedup_key in self._auto_calendar_seen:
+                if cycle_seen is not None:
+                    cycle_seen.add(dedup_key)
+                log.info("Auto-calendar skip (recent seen cache): %s", title)
+                return False
+
+            is_duplicate = await calendar_event_is_duplicate_async(
+                event,
+                cycle_seen=cycle_seen,
+                window_minutes=30,
+            )
+            if is_duplicate:
+                self._remember_auto_calendar_seen(dedup_key)
+                log.info("Auto-calendar skip (dedup hit): %s", title)
+                return False
+
+            try:
+                from tools.calendar import calendar_create
+            except Exception:
+                log.warning("calendar_create tool unavailable", exc_info=True)
+                return False
+
+            source_label = (channel or "message").strip().lower()
+            description = f"Auto-created from {source_label}"
+            sender = (sender_name or "").strip()
+            if sender:
+                description += f" (sender: {sender})"
+
+            tool_input = {
+                "summary": title,
+                "start": event_dt.isoformat(),
+                "location": str(event.get("location") or ""),
+                "description": description,
+                "_auto_source": source_label,
+            }
+
+            try:
+                created = await calendar_create(tool_input)
+            except Exception:
+                log.warning("calendar_create failed for auto-calendar event", exc_info=True)
+                return False
+
+            if isinstance(created, dict) and created.get("is_error"):
+                detail = self._extract_tool_response_text(created)
+                log.warning("Auto-calendar create rejected for '%s': %s", title, detail)
+                return False
+
+            mark_calendar_event_seen(event, cycle_seen)
+            self._remember_auto_calendar_seen(dedup_key)
+
+            target_chat_jid = source_chat_jid or self._get_owner_dm_jid() or ""
+            self.notify_auto_created_tool_result(
+                source_chat_jid=target_chat_jid,
+                tool_name="calendar_create",
+                tool_input=tool_input,
+                tool_response=created,
+            )
+            return True
+
     # --- Passive processing (all messages Molly doesn't respond to) ---
 
     async def _process_passive(
@@ -1312,8 +1550,8 @@ class Molly:
     ):
         """Background processing for messages Molly doesn't respond to.
 
-        owner_dm / respond: always full processing (embed + graph)
-        listen / store_only: run through triage model first
+        owner_dm and owner-authored respond-group messages: full processing.
+        Other passive messages run through triage first:
           - urgent: notify Brian via WhatsApp + full extraction
           - relevant: full extraction (embed + graph)
           - background: embed only
@@ -1321,16 +1559,26 @@ class Molly:
         """
         from memory.processor import embed_and_store, extract_to_graph
 
-        # DMs and respond groups: always full processing, skip triage
-        if chat_mode in ("owner_dm", "respond"):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            log.info("Passive processing cancelled by owner")
+            return
+
+        is_owner_sender = self._is_owner(sender_jid)
+
+        # Owner DMs and owner-authored respond-group messages bypass triage.
+        if chat_mode == "owner_dm" or (chat_mode == "respond" and is_owner_sender):
             await asyncio.gather(
                 embed_and_store(content, chat_jid),
                 extract_to_graph(content, chat_jid),
             )
             return
 
-        # listen / store_only: triage first
+        # Non-owner passive messages: triage first
         from memory.triage import triage_message
+
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            log.info("Passive processing cancelled by owner")
+            return
 
         result = await triage_message(content, sender_name, group_name, chat_jid=chat_jid)
 
@@ -1346,7 +1594,21 @@ class Molly:
             chat_mode, result.classification, result.score, result.reason,
         )
 
+        try:
+            await self._auto_action_from_triage(
+                message_text=content,
+                triage_result=result,
+                channel="whatsapp",
+                sender_name=sender_name,
+                source_chat_jid=chat_jid,
+            )
+        except Exception:
+            log.warning("Passive auto-calendar action failed", exc_info=True)
+
         if result.classification == "urgent":
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                log.info("Passive urgent handling cancelled by owner")
+                return
             # Notify Brian + full extraction
             await asyncio.gather(
                 embed_and_store(content, chat_jid),
@@ -1371,6 +1633,9 @@ class Molly:
                 )
 
         elif result.classification == "relevant":
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                log.info("Passive relevant handling cancelled by owner")
+                return
             await asyncio.gather(
                 embed_and_store(content, chat_jid),
                 extract_to_graph(content, chat_jid),
@@ -1489,6 +1754,7 @@ class Molly:
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
+        self.cancel_event = get_cancel_event()
         self.start_time = datetime.now()
 
         # Load persisted state

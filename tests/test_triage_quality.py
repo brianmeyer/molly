@@ -24,6 +24,8 @@ if "numpy" not in sys.modules:
 if "sqlite_vec" not in sys.modules:
     sys.modules["sqlite_vec"] = types.SimpleNamespace(load=lambda _conn: None)
 
+import db_pool
+
 
 def _read(path: str) -> str:
     return (PROJECT_ROOT / path).read_text()
@@ -64,10 +66,14 @@ class TestTriageSourceContracts(unittest.TestCase):
         self.assertIn("system_prompt", self.src)
 
     def test_build_context_accepts_sender_group(self):
+        # PLAN-16: _build_context now also accepts chat_jid for thread context
         self.assertIn(
-            'def _build_context(sender_name: str = "", group_name: str = "")',
+            'def _build_context(',
             self.src,
         )
+        self.assertIn('sender_name: str = ""', self.src)
+        self.assertIn('group_name: str = ""', self.src)
+        self.assertIn('chat_jid: str = ""', self.src)
 
 
 class TestVectorstoreSourceContracts(unittest.TestCase):
@@ -389,7 +395,7 @@ class TestSenderTierDB(unittest.TestCase):
     """Test sender tier CRUD against a real in-memory SQLite database."""
 
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = db_pool.sqlite_connect(":memory:")
         self.conn.row_factory = sqlite3.Row
 
         # Create just the tables we need (no vec extension required)

@@ -191,30 +191,136 @@ _BASH_DANGER_TOKENS: frozenset[str] = frozenset({
 # Commands allowed to write within config.WORKSPACE
 _WORKSPACE_WRITE_COMMANDS: frozenset[str] = frozenset({"mkdir", "touch"})
 
-# Characters/sequences that indicate compound commands — reject before parsing
-_COMPOUND_OPERATORS: tuple[str, ...] = (
-    "|", ";", "&&", "||", "`", "$(", "${", "\n",
-    "<(", ">(",  # process substitution
+# Disallowed shell syntax fragments (always denied)
+_BASH_BLOCKED_SYNTAX: tuple[str, ...] = (
+    "`", "$(", "${", "\n", "<(", ">(",
 )
 
 
-def _contains_compound_operator(raw: str) -> bool:
-    """Check if a raw command string contains shell compound operators or redirects."""
-    for op in _COMPOUND_OPERATORS:
-        if op in raw:
+def _contains_disallowed_shell_syntax(raw: str) -> bool:
+    for token in _BASH_BLOCKED_SYNTAX:
+        if token in raw:
             return True
-    # Catch all redirect operators: >, >>, <, <<, <<<, 2>, &>, etc.
+    # Reject redirects (>, >>, <, <<, 2>, &>, etc.)
     if ">" in raw or "<" in raw:
         return True
     return False
 
 
+def _split_compound_commands(raw: str) -> list[str] | None:
+    """Split on top-level shell command operators (&&, ||, ;, |)."""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+
+    while i < len(raw):
+        ch = raw[i]
+        nxt = raw[i : i + 2]
+
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and i + 1 < len(raw):
+                i += 1
+                buf.append(raw[i])
+            i += 1
+            continue
+
+        if ch in {"'", '"'}:
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "\\" and i + 1 < len(raw):
+            buf.append(ch)
+            i += 1
+            buf.append(raw[i])
+            i += 1
+            continue
+
+        if nxt in {"&&", "||"}:
+            segment = "".join(buf).strip()
+            if segment:
+                segments.append(segment)
+            buf = []
+            i += 2
+            continue
+
+        if ch in {";", "|"}:
+            segment = "".join(buf).strip()
+            if segment:
+                segments.append(segment)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    if quote is not None:
+        return None
+
+    tail = "".join(buf).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _workspace_path_ok(path_arg: str) -> bool:
+    workspace_real = os.path.realpath(str(config.WORKSPACE))
+    resolved = os.path.realpath(os.path.expanduser(path_arg))
+    return resolved == workspace_real or resolved.startswith(workspace_real + os.sep)
+
+
+def _is_workspace_cd(tokens: list[str]) -> bool:
+    if not tokens or tokens[0] != "cd":
+        return False
+    if len(tokens) != 2:
+        return False
+    return _workspace_path_ok(tokens[1])
+
+
+def _is_safe_read_segment(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    if _is_workspace_cd(tokens):
+        return True
+    for token in tokens:
+        if token in _BASH_DANGER_TOKENS:
+            return False
+
+    base_cmd = tokens[0]
+    if base_cmd in _SAFE_BASH_COMMANDS:
+        return True
+    for prefix in _SAFE_BASH_PREFIXES:
+        if len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix:
+            return True
+    return False
+
+
+def _is_workspace_write_segment(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    if _is_workspace_cd(tokens):
+        return True
+    base_cmd = tokens[0]
+    if base_cmd not in _WORKSPACE_WRITE_COMMANDS:
+        return False
+
+    path_args = [t for t in tokens[1:] if not t.startswith("-")]
+    if not path_args:
+        return False
+    return all(_workspace_path_ok(path_arg) for path_arg in path_args)
+
+
 def is_safe_bash_command(tool_input: dict[str, Any] | None) -> bool:
     """Determine if a Bash command is safe (read-only) and can be auto-approved.
 
-    Returns True only for simple, single commands whose base executable is in
-    the safe-command whitelist and which contain no compound operators, pipes,
-    redirects, or dangerous tokens.
+    Compound commands are split and each sub-command is validated independently.
+    This prevents bypasses such as `cd /etc && cat passwd`.
 
     Conservative by design: returns False for anything it cannot parse or
     does not recognize.
@@ -227,37 +333,21 @@ def is_safe_bash_command(tool_input: dict[str, Any] | None) -> bool:
         return False
 
     raw = command.strip()
-
-    # Reject compound commands before parsing
-    if _contains_compound_operator(raw):
+    if _contains_disallowed_shell_syntax(raw):
         return False
 
-    # Parse with shlex to handle quoting correctly
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
+    segments = _split_compound_commands(raw)
+    if not segments:
         return False
 
-    if not tokens:
-        return False
-
-    # Check for danger tokens anywhere in the command
-    for token in tokens:
-        if token in _BASH_DANGER_TOKENS:
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
             return False
-
-    base_cmd = tokens[0]
-
-    # Check single-word safe commands
-    if base_cmd in _SAFE_BASH_COMMANDS:
-        return True
-
-    # Check multi-word safe prefixes (e.g., "git status", "docker ps")
-    for prefix in _SAFE_BASH_PREFIXES:
-        if len(tokens) >= len(prefix) and tuple(tokens[: len(prefix)]) == prefix:
-            return True
-
-    return False
+        if not _is_safe_read_segment(tokens):
+            return False
+    return True
 
 
 def is_bash_workspace_safe(tool_input: dict[str, Any] | None) -> bool:
@@ -278,39 +368,20 @@ def is_bash_workspace_safe(tool_input: dict[str, Any] | None) -> bool:
         return False
 
     raw = command.strip()
-
-    # Reject compound commands and redirects
-    if _contains_compound_operator(raw):
+    if _contains_disallowed_shell_syntax(raw):
         return False
 
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
+    segments = _split_compound_commands(raw)
+    if not segments:
         return False
 
-    if not tokens:
-        return False
-
-    base_cmd = tokens[0]
-    if base_cmd not in _WORKSPACE_WRITE_COMMANDS:
-        return False
-
-    # Build safe prefix from config
-    workspace_prefix = str(config.WORKSPACE) + "/"
-
-    # Collect non-flag arguments (path arguments)
-    path_args = [t for t in tokens[1:] if not t.startswith("-")]
-
-    if not path_args:
-        return False
-
-    for path_arg in path_args:
-        # Expand ~ and resolve symlinks / ..
-        resolved = os.path.realpath(os.path.expanduser(path_arg))
-        # Must start with workspace prefix or be exactly the workspace dir
-        if not (resolved + "/").startswith(workspace_prefix):
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
             return False
-
+        if not _is_workspace_write_segment(tokens):
+            return False
     return True
 
 
@@ -470,17 +541,20 @@ class RequestApprovalState:
     prompts_sent: int = 0
     auto_approved: int = 0
     turn_tool_calls: list[str] = field(default_factory=list)
+    executed_tool_calls: list[str] = field(default_factory=list)
 
     def reset_for_retry(self):
         """Clear transient deny/inflight state before a transport retry."""
         self.denied_tools.clear()
         self.inflight_tool_approvals.clear()
         self.turn_tool_calls.clear()
+        self.executed_tool_calls.clear()
 
 
 @dataclass
 class PendingApproval:
     id: str
+    request_id: str
     category: str
     description: str
     chat_jid: str
@@ -507,8 +581,8 @@ class ApprovalManager:
 
     def __init__(self):
         self._pending: dict[str, PendingApproval] = {}  # approval_id -> approval
-        self._pending_by_request_chat: dict[str, str] = {}  # request_chat_jid -> approval_id
-        self._pending_by_response_chat: dict[str, str] = {}  # response_chat_jid -> approval_id
+        self._pending_by_request_chat: dict[str, set[str]] = {}  # request_chat_jid -> approval_ids
+        self._pending_by_response_chat: dict[str, set[str]] = {}  # response_chat_jid -> approval_ids
 
     @staticmethod
     def _is_whatsapp_jid(chat_jid: str) -> bool:
@@ -604,10 +678,17 @@ class ApprovalManager:
     def _retarget_pending_response_chat(self, approval: PendingApproval, response_chat_jid: str):
         if approval.response_chat_jid == response_chat_jid:
             return
-        if self._pending_by_response_chat.get(approval.response_chat_jid) == approval.id:
-            self._pending_by_response_chat.pop(approval.response_chat_jid, None)
+        self._discard_pending_index(
+            self._pending_by_response_chat,
+            approval.response_chat_jid,
+            approval.id,
+        )
         approval.response_chat_jid = response_chat_jid
-        self._pending_by_response_chat[response_chat_jid] = approval.id
+        self._add_pending_index(
+            self._pending_by_response_chat,
+            response_chat_jid,
+            approval.id,
+        )
 
     def _send_approval_message(
         self,
@@ -657,34 +738,88 @@ class ApprovalManager:
         )
         return None
 
-    def _lookup_pending_id(self, chat_jid: str) -> str | None:
-        pending_id = self._pending_by_response_chat.get(chat_jid)
-        if pending_id:
-            return pending_id
-        return self._pending_by_request_chat.get(chat_jid)
+    @staticmethod
+    def _add_pending_index(index: dict[str, set[str]], chat_jid: str, approval_id: str) -> None:
+        ids = index.setdefault(chat_jid, set())
+        ids.add(approval_id)
 
-    def _lookup_pending(self, chat_jid: str) -> PendingApproval | None:
-        pending_id = self._lookup_pending_id(chat_jid)
-        if not pending_id:
+    @staticmethod
+    def _discard_pending_index(index: dict[str, set[str]], chat_jid: str, approval_id: str) -> None:
+        ids = index.get(chat_jid)
+        if not ids:
+            return
+        ids.discard(approval_id)
+        if not ids:
+            index.pop(chat_jid, None)
+
+    def _pending_ids_for_chat(self, chat_jid: str) -> set[str]:
+        response_ids = set(self._pending_by_response_chat.get(chat_jid, set()))
+        request_ids = set(self._pending_by_request_chat.get(chat_jid, set()))
+        return response_ids | request_ids
+
+    @staticmethod
+    def _extract_request_id(text: str) -> str | None:
+        match = re.search(r"\b(?:id|request)\s*[:#]?\s*([a-f0-9]{8})\b", text.lower())
+        if match:
+            return match.group(1)
+        bare = re.fullmatch(r"\s*([a-f0-9]{8})\s*", text.lower())
+        if bare:
+            return bare.group(1)
+        return None
+
+    def _lookup_pending(
+        self,
+        chat_jid: str,
+        request_id: str | None = None,
+    ) -> PendingApproval | None:
+        ids = self._pending_ids_for_chat(chat_jid)
+        if not ids:
             return None
-        return self._pending.get(pending_id)
+
+        candidates: list[PendingApproval] = []
+        for pending_id in ids:
+            approval = self._pending.get(pending_id)
+            if approval is None:
+                continue
+            if request_id and approval.request_id != request_id:
+                continue
+            candidates.append(approval)
+
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # When there are multiple pending approvals and no explicit ID,
+        # prefer the most recent prompt for backward compatibility.
+        return max(candidates, key=lambda item: item.created_at)
 
     def _register_pending(self, approval: PendingApproval):
         self._pending[approval.id] = approval
-        self._pending_by_request_chat[approval.chat_jid] = approval.id
-        self._pending_by_response_chat[approval.response_chat_jid] = approval.id
+        self._add_pending_index(self._pending_by_request_chat, approval.chat_jid, approval.id)
+        self._add_pending_index(
+            self._pending_by_response_chat,
+            approval.response_chat_jid,
+            approval.id,
+        )
 
     def _remove_pending(self, approval: PendingApproval):
         existing = self._pending.pop(approval.id, None)
         if not existing:
             return
-        if self._pending_by_request_chat.get(existing.chat_jid) == existing.id:
-            self._pending_by_request_chat.pop(existing.chat_jid, None)
-        if self._pending_by_response_chat.get(existing.response_chat_jid) == existing.id:
-            self._pending_by_response_chat.pop(existing.response_chat_jid, None)
+        self._discard_pending_index(self._pending_by_request_chat, existing.chat_jid, existing.id)
+        self._discard_pending_index(
+            self._pending_by_response_chat,
+            existing.response_chat_jid,
+            existing.id,
+        )
 
-    def _pop_pending_for_chat(self, chat_jid: str) -> PendingApproval | None:
-        pending = self._lookup_pending(chat_jid)
+    def _pop_pending_for_chat(
+        self,
+        chat_jid: str,
+        request_id: str | None = None,
+    ) -> PendingApproval | None:
+        pending = self._lookup_pending(chat_jid, request_id=request_id)
         if not pending:
             return None
         self._remove_pending(pending)
@@ -728,56 +863,35 @@ class ApprovalManager:
             log.info("Tool auto-approved (request-level ALL grant): %s", tool_name)
             return True
 
-        if request_state is not None and tool_name in request_state.approved_tools:
-            request_state.auto_approved += 1
-            log.info("Tool auto-approved (session grant): %s", tool_name)
-            return True
-
-        if request_state is not None and tool_name in request_state.denied_tools:
-            log.info("Tool auto-denied (session deny): %s", tool_name)
-            return False
-
-        if request_state is not None:
-            inflight = request_state.inflight_tool_approvals.get(tool_name)
-            if inflight is not None:
-                log.info("Awaiting in-flight approval for [%s] in %s", tool_name, chat_jid)
-                try:
-                    result = await asyncio.wait_for(
-                        asyncio.shield(inflight), timeout=config.APPROVAL_TIMEOUT
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    return False
-                except asyncio.CancelledError:
-                    return False
-                final = self._apply_tool_approval_result(tool_name, result, request_state)
-                if final is True:
-                    request_state.auto_approved += 1
-                return final
-
         response_chat_jid = self._resolve_response_chat_jid(chat_jid, molly)
-
-        # Cancel any stale pending approval for this request or approval-response chat
-        self._cancel_pending(chat_jid)
-        if response_chat_jid != chat_jid:
-            self._cancel_pending(response_chat_jid)
+        approval_request_id = uuid.uuid4().hex[:8]
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         if request_state is not None:
-            request_state.inflight_tool_approvals[tool_name] = future
+            request_state.inflight_tool_approvals[approval_request_id] = future
 
         description = format_approval_message(tool_name, tool_input)
         if request_state is not None:
             session_header = (
-                f"🔧 {tool_name} requested — approve for this request? "
-                f"(Reply ALL to approve all CONFIRM actions in this request)"
+                f"🔧 {tool_name} requested\n"
+                f"Request ID: {approval_request_id}\n"
+                "Reply YES <id> to approve this tool call."
             )
             description = f"{session_header}\n\n{description}"
+        else:
+            description = (
+                f"🔧 {tool_name} requested\n"
+                f"Request ID: {approval_request_id}\n"
+                "Reply YES <id> to approve this tool call.\n\n"
+                f"{description}"
+            )
         if response_chat_jid != chat_jid:
             description = f"{description}\n\nOrigin chat: {chat_jid}"
 
         approval = PendingApproval(
             id=str(uuid.uuid4()),
+            request_id=approval_request_id,
             category=tool_name,
             description=description,
             chat_jid=chat_jid,
@@ -861,9 +975,9 @@ class ApprovalManager:
             return False
         finally:
             if request_state is not None:
-                current = request_state.inflight_tool_approvals.get(tool_name)
+                current = request_state.inflight_tool_approvals.get(approval_request_id)
                 if current is future:
-                    request_state.inflight_tool_approvals.pop(tool_name, None)
+                    request_state.inflight_tool_approvals.pop(approval_request_id, None)
 
     @staticmethod
     def _apply_tool_approval_result(
@@ -872,25 +986,16 @@ class ApprovalManager:
         request_state: RequestApprovalState | None,
     ) -> bool | str:
         if isinstance(result, tuple) and result and result[0] == "edit":
-            if request_state is not None:
-                request_state.denied_tools.add(tool_name)
             return result[1]
 
         if isinstance(result, tuple) and result and result[0] == "approve_all":
             if request_state is not None:
                 request_state.approved_all_confirm = True
-                request_state.approved_tools.add(tool_name)
-                request_state.denied_tools.discard(tool_name)
             return True
 
         if result is True:
-            if request_state is not None:
-                request_state.approved_tools.add(tool_name)
-                request_state.denied_tools.discard(tool_name)
             return True
 
-        if request_state is not None:
-            request_state.denied_tools.add(tool_name)
         return False
 
     # --- Tag-based approval (prompt-level fallback) ---
@@ -917,6 +1022,7 @@ class ApprovalManager:
 
         approval = PendingApproval(
             id=str(uuid.uuid4()),
+            request_id=uuid.uuid4().hex[:8],
             category=category,
             description=description,
             chat_jid=chat_jid,
@@ -999,6 +1105,7 @@ class ApprovalManager:
         key = (required_keyword or "YES").strip().upper()
         approval = PendingApproval(
             id=str(uuid.uuid4()),
+            request_id=uuid.uuid4().hex[:8],
             category=category,
             description=description,
             chat_jid=chat_jid,
@@ -1070,11 +1177,25 @@ class ApprovalManager:
 
         Returns True if the message was consumed as an approval response.
         """
-        pending = self._lookup_pending(chat_jid)
+        request_id = self._extract_request_id(text)
+        pending_ids = self._pending_ids_for_chat(chat_jid)
+        if len(pending_ids) > 1 and not request_id:
+            # Multiple approvals are pending; require an explicit request ID.
+            return False
+
+        pending = self._lookup_pending(chat_jid, request_id=request_id)
         if not pending:
             return False
 
         normalized = text.strip().lower()
+        if request_id:
+            normalized = re.sub(
+                rf"\b(?:id|request)\s*[:#]?\s*{re.escape(request_id)}\b",
+                "",
+                normalized,
+            )
+            normalized = re.sub(rf"\b{re.escape(request_id)}\b", "", normalized)
+            normalized = " ".join(normalized.split())
         keyword = pending.required_keyword.strip().lower()
 
         if _is_approve_all_reply(normalized):
@@ -1082,7 +1203,7 @@ class ApprovalManager:
                 return False
             if keyword and keyword != "yes":
                 return False
-            approval = self._pop_pending_for_chat(chat_jid)
+            approval = self._pop_pending_for_chat(chat_jid, request_id=request_id)
             if not approval:
                 return False
             if not approval.future.done():
@@ -1091,7 +1212,7 @@ class ApprovalManager:
             return True
 
         if keyword and normalized == keyword:
-            approval = self._pop_pending_for_chat(chat_jid)
+            approval = self._pop_pending_for_chat(chat_jid, request_id=request_id)
             if not approval:
                 return False
             if not approval.future.done():
@@ -1102,7 +1223,7 @@ class ApprovalManager:
         if normalized in YES_WORDS:
             if keyword and keyword != "yes":
                 return False
-            approval = self._pop_pending_for_chat(chat_jid)
+            approval = self._pop_pending_for_chat(chat_jid, request_id=request_id)
             if not approval:
                 return False
             if not approval.future.done():
@@ -1113,10 +1234,8 @@ class ApprovalManager:
         if normalized in NO_WORDS or normalized.startswith("no:") or normalized.startswith("no "):
             reason = ""
             if normalized not in NO_WORDS:
-                raw = text.strip()
-                if len(raw) > 2:
-                    reason = raw[2:].lstrip(": ").strip()
-            approval = self._pop_pending_for_chat(chat_jid)
+                reason = normalized[2:].lstrip(": ").strip()
+            approval = self._pop_pending_for_chat(chat_jid, request_id=request_id)
             if not approval:
                 return False
             if not approval.future.done():
@@ -1135,7 +1254,7 @@ class ApprovalManager:
                 edit_instruction = raw[5:].strip()
             else:
                 edit_instruction = raw[4:].strip()
-            approval = self._pop_pending_for_chat(chat_jid)
+            approval = self._pop_pending_for_chat(chat_jid, request_id=request_id)
             if not approval:
                 return False
             if not approval.future.done():
@@ -1148,7 +1267,7 @@ class ApprovalManager:
     # --- Query ---
 
     def has_pending(self, chat_jid: str) -> bool:
-        return self._lookup_pending(chat_jid) is not None
+        return bool(self._pending_ids_for_chat(chat_jid))
 
     def get_pending(self, chat_jid: str) -> PendingApproval | None:
         return self._lookup_pending(chat_jid)
@@ -1161,6 +1280,11 @@ class ApprovalManager:
         self._cancel_pending(chat_jid)
 
     def _cancel_pending(self, chat_jid: str):
-        old = self._pop_pending_for_chat(chat_jid)
-        if old and not old.future.done():
-            old.future.set_result(False)
+        pending_ids = list(self._pending_ids_for_chat(chat_jid))
+        for pending_id in pending_ids:
+            approval = self._pending.get(pending_id)
+            if approval is None:
+                continue
+            self._remove_pending(approval)
+            if not approval.future.done():
+                approval.future.set_result(False)

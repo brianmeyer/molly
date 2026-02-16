@@ -4,6 +4,7 @@ Runs Qwen3-4B GGUF in-process via llama-cpp-python to classify group messages
 into: urgent, relevant, background, or noise.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +12,10 @@ import re
 from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from threading import Lock
+from zoneinfo import ZoneInfo
 
 import config
 
@@ -46,6 +50,12 @@ EVENT_PATTERNS = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+_SUBJECT_LINE_RE = re.compile(r"(?im)^subject:\s*(.+)$")
+_HEADER_LINE_RE = re.compile(r"(?im)^(?:from|to|date|cc|bcc):")
+_LOCATION_LINE_RE = re.compile(r"(?im)^(?:location|where|venue|address)\s*:\s*(.+)$")
+_LOCATION_INLINE_RE = re.compile(r"(?i)\b(?:at|@)\s+([a-z0-9][^\n]{2,80})")
+_ONLY_TIME_RE = re.compile(r"^\d{1,2}(?::\d{2})?\s*(?:am|pm)?$", re.IGNORECASE)
 
 # ---------- Automated sender / noise subject patterns ----------
 
@@ -142,7 +152,8 @@ NOISE_SUBJECT_PATTERNS = re.compile(
 _BASE_CLASSIFICATION_SCHEMA = (
     'Respond with JSON: '
     '{"classification":"urgent|relevant|background|noise",'
-    '"score":0.0-1.0,"reason":"brief explanation"}\n\n'
+    '"score":0.0-1.0,"reason":"brief explanation",'
+    '"calendar_event":null}\n\n'
     "Definitions:\n"
     "- urgent: ONLY for VIP senders or messages that explicitly require Brian to take action within 24 hours (e.g. a real person asking Brian a direct question, a deadline). Most emails are NOT urgent.\n"
     "- relevant: A real human who Brian knows personally wrote to him about something actionable. NOT automated notifications.\n"
@@ -150,7 +161,15 @@ _BASE_CLASSIFICATION_SCHEMA = (
     "- noise: THE DEFAULT. Automated emails, company notifications, transactional messages, marketing, newsletters, shipping updates, account alerts, financial statements, smart home alerts, travel confirmations, receipts, and anything from a company rather than a person.\n\n"
     "CRITICAL: When in doubt, classify as noise. 90%+ of emails are noise.\n"
     "If the sender is flagged as VIP or upgraded, bias toward urgent/relevant.\n"
-    "If the sender is flagged as muted or frequently dismissed, classify as noise."
+    "If the sender is flagged as muted or frequently dismissed, classify as noise.\n\n"
+    "CALENDAR EVENT DETECTION (applies to ALL classifications including noise):\n"
+    "If the email contains a schedulable event (flight confirmation, event invite/RSVP, "
+    "restaurant reservation, doctor/dentist appointment, meeting with specific date+time, "
+    "concert/show tickets, hotel check-in), set calendar_event to:\n"
+    '{"title":"short event title","start":"ISO datetime","end":"ISO datetime or null",'
+    '"location":"venue/address or null","notes":"key details (confirmation codes, seat numbers, etc.)"}\n'
+    "If no calendar event is detected, set calendar_event to null.\n"
+    "An email can be noise AND still have a calendar_event — these are independent."
 )
 
 SYSTEM_PROMPT_EMAIL = (
@@ -161,14 +180,18 @@ SYSTEM_PROMPT_EMAIL = (
     "- Company/brand emails = ALWAYS noise (hotels, airlines, banks, retailers, utilities, smart home, package tracking, insurance, SaaS products)\n"
     "- Newsletters, digests, marketing, promotions = ALWAYS noise\n"
     "- Transactional: receipts, confirmations, statements, alerts = ALWAYS noise\n"
-    "- Travel: reservations, check-in, itineraries, booking updates = ALWAYS noise\n"
+    "- Travel: reservations, check-in, itineraries, booking updates = noise for classification, BUT still extract calendar_event if it has a flight/hotel with date+time\n"
     "- Financial: statements, balance updates, investment reports, bill reminders = ALWAYS noise\n"
     "- Smart home / IoT: device alerts, energy reports, sensor notifications = ALWAYS noise\n"
     "- Shipping / delivery: tracking, delivery status, package updates = ALWAYS noise\n"
     "- Security: password resets, login alerts, verification codes = ALWAYS noise\n"
+    "- If an email from a known school (Guidepost, Montessori), childcare provider, doctor's office, or personal service contains dates, events, deadlines, or RSVPs, classify as relevant even if it looks like a newsletter. Brian's child's school events are personally relevant.\n"
+    "- If EVENT_PATTERNS-like signals are present in the body and the sender is not muted, bias toward relevant (not noise).\n"
     "- Only classify as relevant/urgent if a REAL PERSON Brian knows is writing to him directly about something that requires his response or action\n"
     "- Meeting invites from a real person = relevant\n"
-    "- VIP senders = urgent"
+    "- VIP senders = urgent\n"
+    "- Event invites (Evite, Eventbrite, Paperless Post, etc.) = noise for classification, BUT always extract calendar_event with full details\n"
+    "- Flight confirmations (AA, United, Delta, Southwest, etc.) = noise for classification, BUT always extract calendar_event with flight number, airports, times"
 )
 
 SYSTEM_PROMPT_IMESSAGE = (
@@ -178,8 +201,13 @@ SYSTEM_PROMPT_IMESSAGE = (
     "- Direct questions to Brian = urgent\n"
     "- Group mentions of Brian or @Brian = urgent\n"
     "- Plans, events, logistics involving Brian = relevant\n"
+    "- If the message contains plans, events, dates, or meetups relevant to Brian, classify as relevant and mention calendar_event in the reason.\n"
     "- Reactions, emoji-only, tapbacks = noise\n"
-    "- VIP senders = urgent"
+    "- VIP senders = urgent\n"
+    "- If a message contains event details (date + time + activity/location), extract calendar_event\n"
+    "  Examples: 'Birthday party Saturday at 2pm at Sky Zone', 'Dinner Friday 7pm at Doya',\n"
+    "  'Can you pick her up at 3:30?', 'Flight lands at 9am Sunday'\n"
+    "- Include the sender's name in the event title when relevant (e.g. 'Dinner with Danielle')"
 )
 
 SYSTEM_PROMPT_GROUP = (
@@ -188,6 +216,7 @@ SYSTEM_PROMPT_GROUP = (
     "Group chat guidance:\n"
     "- Direct mentions of Brian = urgent\n"
     "- Events, meetings, plans = relevant\n"
+    "- If the message contains plans, events, dates, or meetups relevant to Brian, classify as relevant and mention calendar_event in the reason.\n"
     "- General conversation = background\n"
     "- Memes, random chat, off-topic = noise"
 )
@@ -216,7 +245,50 @@ def _check_prefilter(
     """
     sender_lower = (sender_name or "").strip().lower()
 
-    # 1. VIP contacts from config
+    # 1. Muted/downgraded sender tier check FIRST (overrides VIP wildcards)
+    #    e.g. muting "mkt.databricks.com" takes priority over VIP "@databricks.com"
+    #    Uses both exact match AND substring scan so domain-level mutes work.
+    tier = None
+    try:
+        from memory.retriever import get_vectorstore
+        vs = get_vectorstore()
+        # Exact match first
+        tier = vs.get_sender_tier(sender_lower)
+        if tier in ("muted", "downgraded"):
+            log.debug("Triage pre-filter: %s tier (exact) '%s'", tier, sender_name)
+            if tier == "muted":
+                return TriageResult(
+                    classification="noise", score=0.0,
+                    reason=f"Muted sender: {sender_name}",
+                )
+            return TriageResult(
+                classification="background", score=0.3,
+                reason=f"Downgraded sender: {sender_name}",
+            )
+        # Substring scan: check all muted/downgraded patterns against sender
+        all_tiers = vs.get_sender_tiers()
+        for t in all_tiers:
+            pat = t["sender_pattern"]
+            t_tier = t["tier"]
+            if t_tier not in ("muted", "downgraded"):
+                continue
+            if pat in sender_lower:
+                log.debug("Triage pre-filter: %s tier (substring '%s') '%s'",
+                          t_tier, pat, sender_name)
+                if t_tier == "muted":
+                    return TriageResult(
+                        classification="noise", score=0.0,
+                        reason=f"Muted sender (pattern {pat}): {sender_name}",
+                    )
+                return TriageResult(
+                    classification="background", score=0.3,
+                    reason=f"Downgraded sender (pattern {pat}): {sender_name}",
+                )
+    except Exception:
+        log.debug("Sender tier lookup (muted/downgraded) failed", exc_info=True)
+        tier = None
+
+    # 2. VIP contacts from config
     for vip in config.VIP_CONTACTS:
         vip_name = (vip.get("name") or "").lower()
         vip_email = (vip.get("email") or "").lower()
@@ -233,22 +305,17 @@ def _check_prefilter(
                 reason=f"VIP sender (config): {sender_name}",
             )
 
-    # 2. Sender tier from DB
+    # 3. Remaining sender tiers from DB (vip, upgraded)
     try:
-        from memory.retriever import get_vectorstore
-        vs = get_vectorstore()
-        tier = vs.get_sender_tier(sender_lower)
+        if tier is None:
+            from memory.retriever import get_vectorstore
+            vs = get_vectorstore()
+            tier = vs.get_sender_tier(sender_lower)
         if tier == "vip":
             log.debug("Triage pre-filter: DB VIP tier '%s'", sender_name)
             return TriageResult(
                 classification="urgent", score=1.0,
                 reason=f"VIP sender (tier): {sender_name}",
-            )
-        if tier == "muted":
-            log.debug("Triage pre-filter: muted tier '%s'", sender_name)
-            return TriageResult(
-                classification="noise", score=0.0,
-                reason=f"Muted sender: {sender_name}",
             )
         if tier == "upgraded":
             log.debug("Triage pre-filter: upgraded tier '%s'", sender_name)
@@ -256,16 +323,10 @@ def _check_prefilter(
                 classification="relevant", score=0.8,
                 reason=f"Upgraded sender: {sender_name}",
             )
-        if tier == "downgraded":
-            log.debug("Triage pre-filter: downgraded tier '%s'", sender_name)
-            return TriageResult(
-                classification="background", score=0.3,
-                reason=f"Downgraded sender: {sender_name}",
-            )
     except Exception:
         log.debug("Sender tier lookup failed", exc_info=True)
 
-    # 3. Email only: automated sender regex (address patterns)
+    # 4. Email only: automated sender regex (address patterns)
     is_email = (group_name or "").strip().lower() in {"email", "gmail", "mail"}
     if is_email and AUTOMATED_SENDER_PATTERNS.search(sender_lower):
         log.debug("Triage pre-filter: automated sender '%s'", sender_name)
@@ -274,7 +335,7 @@ def _check_prefilter(
             reason=f"Automated sender pattern: {sender_name}",
         )
 
-    # 4. Email only: noise subject patterns (check first 500 chars — covers From+Subject+snippet start)
+    # 5. Email only: noise subject patterns (check first 500 chars — covers From+Subject+snippet start)
     if is_email and NOISE_SUBJECT_PATTERNS.search(message[:500]):
         log.debug("Triage pre-filter: noise subject in '%s'", message[:60])
         return TriageResult(
@@ -290,6 +351,7 @@ class TriageResult:
     classification: str  # urgent, relevant, background, noise
     score: float  # 0.0-1.0 relevance
     reason: str  # brief explanation
+    calendar_event: dict | None = None  # extracted event: {title, start, end, location, notes}
 
 
 def _load_model() -> object | None:
@@ -343,8 +405,14 @@ def preload_model() -> bool:
     return _load_model() is not None
 
 
-def _build_context(sender_name: str = "", group_name: str = "") -> str:
-    """Build context blob for the triage prompt: who Brian is + tracked entities + signals."""
+def _build_context(
+    sender_name: str = "", group_name: str = "", chat_jid: str = "",
+) -> str:
+    """Build context blob for the triage prompt: who Brian is + tracked entities + signals.
+
+    Enhanced (PLAN-16): also injects recent thread history, sender→Brian relationship
+    from Neo4j, and sender message frequency for richer classification context.
+    """
     parts = []
 
     # Load USER.md summary
@@ -368,6 +436,86 @@ def _build_context(sender_name: str = "", group_name: str = "") -> str:
             parts.append("Entities Brian tracks:\n" + "\n".join(entity_lines))
     except Exception:
         log.debug("Could not load graph entities for triage context", exc_info=True)
+
+    # --- PLAN-16: Sender relationship to Brian from knowledge graph ---
+    if sender_name and sender_name not in ("Unknown", ""):
+        try:
+            from memory.graph import query_entity
+            entity_info = query_entity(sender_name)
+            if entity_info and entity_info.get("relationships"):
+                rel_lines = []
+                for rel in entity_info["relationships"]:
+                    rel_type = rel.get("type", "RELATED_TO")
+                    if rel.get("direction") == "outgoing":
+                        rel_lines.append(
+                            f"- {sender_name} {rel_type} {rel.get('target', '?')}"
+                        )
+                    else:
+                        rel_lines.append(
+                            f"- {rel.get('source', '?')} {rel_type} {sender_name}"
+                        )
+                if rel_lines:
+                    parts.append(
+                        f"Brian's relationship with {sender_name}:\n"
+                        + "\n".join(rel_lines[:5])  # cap at 5 to save tokens
+                    )
+        except Exception:
+            log.debug("Could not load sender relationship for triage", exc_info=True)
+
+    # --- PLAN-16: Recent thread messages for conversation context ---
+    if chat_jid:
+        try:
+            import sqlite3 as _sql
+            db_path = config.DATABASE_PATH
+            with _sql.connect(str(db_path)) as conn:
+                conn.row_factory = _sql.Row
+                rows = conn.execute(
+                    """SELECT sender_name, content
+                       FROM messages
+                       WHERE chat_jid = ?
+                       ORDER BY timestamp DESC
+                       LIMIT 5""",
+                    (chat_jid,),
+                ).fetchall()
+            if rows:
+                thread_lines = []
+                for r in reversed(rows):
+                    name = r["sender_name"] or "Unknown"
+                    snippet = (r["content"] or "")[:120]
+                    thread_lines.append(f"  {name}: {snippet}")
+                parts.append(
+                    "Recent messages in this thread:\n" + "\n".join(thread_lines)
+                )
+        except Exception:
+            log.debug("Could not load thread history for triage", exc_info=True)
+
+    # --- PLAN-16: Sender message frequency (last 7 days) ---
+    if sender_name and sender_name not in ("Unknown", "") and chat_jid:
+        try:
+            import sqlite3 as _sql
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            db_path = config.DATABASE_PATH
+            with _sql.connect(str(db_path)) as conn:
+                row = conn.execute(
+                    """SELECT COUNT(*) FROM messages
+                       WHERE sender_name = ? AND timestamp > ?""",
+                    (sender_name, cutoff),
+                ).fetchone()
+            msg_count = row[0] if row else 0
+            if msg_count > 0:
+                freq_label = (
+                    "very active" if msg_count > 50
+                    else "active" if msg_count > 20
+                    else "moderate" if msg_count > 5
+                    else "infrequent"
+                )
+                parts.append(
+                    f"Sender frequency (last 7 days): {sender_name} sent "
+                    f"{msg_count} messages ({freq_label})"
+                )
+        except Exception:
+            log.debug("Could not load sender frequency for triage", exc_info=True)
 
     # Sender tiers + dismissed sender signals
     try:
@@ -651,9 +799,12 @@ def parse_time_local(text: str, now_local) -> "datetime | None":
     return _parse_time_offset(raw, now_local)
 
 
-async def parse_time_local_async(text: str, now_local) -> "datetime | None":
+async def parse_time_local_async(text: str, now_local=None) -> "datetime | None":
     """Async wrapper — runs :func:`parse_time_local` on the triage executor."""
     import asyncio
+
+    if now_local is None:
+        now_local = datetime.now(ZoneInfo(config.TIMEZONE))
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -664,14 +815,265 @@ async def parse_time_local_async(text: str, now_local) -> "datetime | None":
     )
 
 
+def _clean_event_text(value: str, limit: int = 140) -> str:
+    text = " ".join(str(value or "").split())
+    text = text.strip(" -,:;")
+    if len(text) > limit:
+        text = text[:limit].rstrip(" ,.;:-")
+    return text
+
+
+def _extract_event_title_heuristic(
+    message_text: str,
+    sender_name: str = "",
+    channel: str = "",
+) -> str:
+    subject_match = _SUBJECT_LINE_RE.search(message_text or "")
+    if subject_match:
+        title = _clean_event_text(subject_match.group(1))
+        if title:
+            return title
+
+    for raw_line in (message_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _HEADER_LINE_RE.match(line):
+            continue
+        line = re.sub(r"^[>\-*]+\s*", "", line)
+        title = _clean_event_text(line)
+        if len(title) >= 4:
+            return title
+
+    sender = _clean_event_text(sender_name, limit=60)
+    if sender and sender.lower() != "unknown":
+        return f"Event with {sender}"
+
+    channel_name = _clean_event_text(channel, limit=40)
+    if channel_name:
+        return f"{channel_name} event"
+    return "Calendar event"
+
+
+def _extract_event_location_heuristic(message_text: str) -> str | None:
+    content = message_text or ""
+
+    for match in _LOCATION_LINE_RE.finditer(content):
+        candidate = _clean_event_text(match.group(1), limit=120)
+        if candidate and not _ONLY_TIME_RE.fullmatch(candidate):
+            return candidate
+
+    inline = _LOCATION_INLINE_RE.search(content)
+    if inline:
+        candidate = re.split(r"[\n,.;]", inline.group(1), maxsplit=1)[0]
+        candidate = _clean_event_text(candidate, limit=120)
+        if candidate and not _ONLY_TIME_RE.fullmatch(candidate):
+            return candidate
+
+    return None
+
+
+def _normalize_event_title(title: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", (title or "").lower())
+    return " ".join(normalized.split())
+
+
+def calendar_event_dedup_key(title: str, when_utc: datetime) -> tuple[str, str]:
+    normalized = _normalize_event_title(title)
+    title_hash = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+    if when_utc.tzinfo is None:
+        when_utc = when_utc.replace(tzinfo=timezone.utc)
+    else:
+        when_utc = when_utc.astimezone(timezone.utc)
+    local_day = when_utc.astimezone(ZoneInfo(config.TIMEZONE)).date().isoformat()
+    return (title_hash, local_day)
+
+
+def mark_calendar_event_seen(
+    event: dict,
+    cycle_seen: set[tuple[str, str]] | None,
+) -> tuple[str, str] | None:
+    if cycle_seen is None:
+        return None
+    title = _clean_event_text(str(event.get("title") or ""))
+    event_dt = event.get("datetime")
+    if not title or not isinstance(event_dt, datetime):
+        return None
+    key = calendar_event_dedup_key(title, event_dt)
+    cycle_seen.add(key)
+    return key
+
+
+def _decode_tool_payload(tool_response) -> object:
+    if not isinstance(tool_response, dict):
+        return None
+
+    content = tool_response.get("content")
+    if not isinstance(content, list):
+        return None
+
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        raw_text = str(part.get("text", "")).strip()
+        if not raw_text:
+            continue
+        try:
+            return json.loads(raw_text)
+        except Exception:
+            return raw_text
+    return None
+
+
+def _calendar_search_events(search_result) -> list[dict]:
+    payload = _decode_tool_payload(search_result)
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _parse_calendar_time_utc(raw_when) -> "datetime | None":
+    if isinstance(raw_when, dict):
+        raw_when = raw_when.get("dateTime") or raw_when.get("date")
+    if not raw_when:
+        return None
+    when_text = str(raw_when).strip()
+    if not when_text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(when_text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    return parsed.astimezone(timezone.utc)
+
+
+def _titles_similar(left: str, right: str) -> bool:
+    left_norm = _normalize_event_title(left)
+    right_norm = _normalize_event_title(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    if left_norm in right_norm or right_norm in left_norm:
+        return True
+
+    left_tokens = set(left_norm.split())
+    right_tokens = set(right_norm.split())
+    if left_tokens and right_tokens:
+        overlap = left_tokens.intersection(right_tokens)
+        min_size = min(len(left_tokens), len(right_tokens))
+        if min_size > 0 and (len(overlap) / min_size) >= 0.6:
+            return True
+
+    return SequenceMatcher(None, left_norm, right_norm).ratio() >= 0.78
+
+
+async def extract_calendar_event_async(
+    message_text: str,
+    sender_name: str = "",
+    channel: str = "",
+) -> dict | None:
+    """Extract a calendar event from event-like message text.
+
+    Caller should invoke this only after triage marks the message relevant/urgent.
+    Returns {"title": str, "datetime": datetime, "location": str | None} or None.
+    """
+    text = (message_text or "").strip()
+    if not text or not EVENT_PATTERNS.search(text):
+        return None
+
+    now_local = datetime.now(ZoneInfo(config.TIMEZONE))
+    event_dt = await parse_time_local_async(text, now_local)
+    if event_dt is None:
+        return None
+
+    if event_dt.tzinfo is None:
+        event_dt = event_dt.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    event_dt = event_dt.astimezone(timezone.utc)
+
+    title = _extract_event_title_heuristic(
+        text, sender_name=sender_name, channel=channel,
+    )
+    if not title:
+        return None
+
+    return {
+        "title": title,
+        "datetime": event_dt,
+        "location": _extract_event_location_heuristic(text),
+    }
+
+
+async def calendar_event_is_duplicate_async(
+    event: dict,
+    cycle_seen: set[tuple[str, str]] | None = None,
+    window_minutes: int = 30,
+) -> bool:
+    """Check for duplicate calendar events via in-memory + calendar_search.
+
+    Returns True when a duplicate is known or when dedup safety checks fail.
+    """
+    title = _clean_event_text(str(event.get("title") or ""))
+    event_dt = event.get("datetime")
+    if not title or not isinstance(event_dt, datetime):
+        return False
+
+    if event_dt.tzinfo is None:
+        event_dt = event_dt.replace(tzinfo=timezone.utc)
+    event_dt = event_dt.astimezone(timezone.utc)
+    dedup_key = calendar_event_dedup_key(title, event_dt)
+
+    if cycle_seen is not None and dedup_key in cycle_seen:
+        return True
+
+    try:
+        from tools.calendar import calendar_search
+
+        search_result = await calendar_search({"query": title})
+    except Exception:
+        log.warning("Calendar dedup search failed for '%s'", title, exc_info=True)
+        return True
+
+    if isinstance(search_result, dict) and search_result.get("is_error"):
+        log.warning("Calendar dedup search returned an error for '%s'", title)
+        return True
+
+    window_seconds = max(1, int(window_minutes)) * 60
+    for candidate in _calendar_search_events(search_result):
+        existing_title = _clean_event_text(str(candidate.get("summary") or ""))
+        if not existing_title or not _titles_similar(existing_title, title):
+            continue
+
+        existing_start = _parse_calendar_time_utc(candidate.get("start"))
+        if existing_start is None:
+            continue
+
+        if abs((existing_start - event_dt).total_seconds()) <= window_seconds:
+            if cycle_seen is not None:
+                cycle_seen.add(dedup_key)
+            return True
+
+    return False
+
+
 async def triage_message(
     message: str,
     sender_name: str = "Unknown",
     group_name: str = "Unknown Group",
+    chat_jid: str = "",
 ) -> TriageResult | None:
     """Run a message through the local triage model.
 
     Returns TriageResult or None if triage is unavailable.
+    chat_jid: Optional WhatsApp/iMessage chat ID for thread context (PLAN-16).
     """
     if not message.strip():
         return TriageResult(classification="noise", score=0.0, reason="Empty message")
@@ -692,7 +1094,7 @@ async def triage_message(
     try:
         result = await loop.run_in_executor(
             _TRIAGE_EXECUTOR,
-            _sync_triage, message, sender_name, group_name, use_think,
+            _sync_triage, message, sender_name, group_name, use_think, chat_jid,
         )
         return result
     except Exception:
@@ -702,6 +1104,7 @@ async def triage_message(
 
 def _sync_triage(
     message: str, sender_name: str, group_name: str, use_think: bool,
+    chat_jid: str = "",
 ) -> TriageResult | None:
     """Synchronous triage: pre-filter → build context → run local model → parse."""
     # Deterministic pre-filter — skip model for obvious cases
@@ -713,7 +1116,9 @@ def _sync_triage(
     if model is None:
         return None
 
-    context = _build_context(sender_name=sender_name, group_name=group_name)
+    context = _build_context(
+        sender_name=sender_name, group_name=group_name, chat_jid=chat_jid,
+    )
     user_prompt = _build_user_prompt(message, sender_name, group_name, context)
     system_prompt = _get_channel_prompt(group_name)
 
@@ -796,10 +1201,14 @@ def _parse_response(raw: str) -> TriageResult:
         score = float(data.get("score", 0.5))
         score = max(0.0, min(1.0, score))
         reason = data.get("reason", "")
+        cal_event = data.get("calendar_event")
+        if cal_event is not None and not isinstance(cal_event, dict):
+            cal_event = None
         return TriageResult(
             classification=classification,
             score=score,
             reason=reason,
+            calendar_event=cal_event,
         )
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
@@ -812,10 +1221,14 @@ def _parse_response(raw: str) -> TriageResult:
             classification = data.get("classification", "background").lower()
             if classification not in ("urgent", "relevant", "background", "noise"):
                 classification = "background"
+            cal_event = data.get("calendar_event")
+            if cal_event is not None and not isinstance(cal_event, dict):
+                cal_event = None
             return TriageResult(
                 classification=classification,
                 score=float(data.get("score", 0.5)),
                 reason=data.get("reason", ""),
+                calendar_event=cal_event,
             )
         except (json.JSONDecodeError, ValueError, TypeError):
             pass

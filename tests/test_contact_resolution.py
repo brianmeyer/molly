@@ -178,8 +178,8 @@ class TestEnrichGraph(unittest.TestCase):
     def _make_graph_mock(self):
         """Create a mock memory.graph module with the functions enrich_graph imports."""
         mock_mod = MagicMock()
-        mock_mod.upsert_entity = MagicMock(side_effect=lambda name, *a: name)
-        mock_mod.upsert_relationship = MagicMock()
+        mock_mod.upsert_entity_sync = MagicMock(side_effect=lambda name, *a: name)
+        mock_mod.upsert_relationship_sync = MagicMock()
         mock_mod.set_entity_properties = MagicMock()
         return mock_mod
 
@@ -191,10 +191,10 @@ class TestEnrichGraph(unittest.TestCase):
         with patch.dict("sys.modules", {"memory.graph": mock_graph}):
             resolver.enrich_graph("Alice", "+12125551234", "contacts_json", "alice@gmail.com")
 
-        mock_graph.upsert_entity.assert_any_call("Alice", "Person", 0.9)
-        mock_graph.upsert_entity.assert_any_call("Brian", "Person", 1.0)
+        mock_graph.upsert_entity_sync.assert_any_call("Alice", "Person", 0.9)
+        mock_graph.upsert_entity_sync.assert_any_call("Brian", "Person", 1.0)
         mock_graph.set_entity_properties.assert_called_once_with("Alice", {"phone": "2125551234", "email": "alice@gmail.com"})
-        mock_graph.upsert_relationship.assert_called_once_with("Alice", "Brian", "CONTACT_OF", 0.9, "from contacts_json")
+        mock_graph.upsert_relationship_sync.assert_called_once_with("Alice", "Brian", "CONTACT_OF", 0.9, "from contacts_json")
 
     @patch("contacts.config")
     def test_enrich_phone_only_no_email(self, mock_config):
@@ -210,7 +210,7 @@ class TestEnrichGraph(unittest.TestCase):
     def test_enrich_exception_does_not_propagate(self, mock_config):
         mock_config.OWNER_NAME = "Brian"
         mock_graph = self._make_graph_mock()
-        mock_graph.upsert_entity.side_effect = RuntimeError("Neo4j down")
+        mock_graph.upsert_entity_sync.side_effect = RuntimeError("Neo4j down")
         resolver = self._make_resolver()
         with patch.dict("sys.modules", {"memory.graph": mock_graph}):
             # Should not raise
@@ -220,7 +220,7 @@ class TestEnrichGraph(unittest.TestCase):
     def test_enrich_uses_canonical_name(self, mock_config):
         mock_config.OWNER_NAME = "Brian"
         mock_graph = self._make_graph_mock()
-        mock_graph.upsert_entity.side_effect = lambda name, *a: "Alice Smith" if "Alice" in name else name
+        mock_graph.upsert_entity_sync.side_effect = lambda name, *a: "Alice Smith" if "Alice" in name else name
         resolver = self._make_resolver()
         with patch.dict("sys.modules", {"memory.graph": mock_graph}):
             resolver.enrich_graph("Alice", "2125551234", "test", "a@b.com")

@@ -1,11 +1,18 @@
 import logging
+import threading
+import time
 from typing import Callable
 
 import config
 from database import normalize_timestamp
 from formatting import render_for_whatsapp, split_for_whatsapp
 from neonize import NewClient
-from neonize.proto.Neonize_pb2 import Connected, GroupInfo, Message as MessageEv
+from neonize.exc import SendMessageError
+from neonize.proto.Neonize_pb2 import (
+    Connected, ConnectFailure, Disconnected, GroupInfo,
+    KeepAliveRestored, KeepAliveTimeout, LoggedOut,
+    Message as MessageEv, StreamError, StreamReplaced,
+)
 from neonize.utils import extract_text
 from neonize.utils.enum import ChatPresence, ChatPresenceMedia
 from neonize.utils.jid import Jid2String, build_jid
@@ -66,14 +73,59 @@ class WhatsAppClient:
         self._message_callback = message_callback
         self._non_whatsapp_sender = non_whatsapp_sender
         self.connected = False
+        self._reconnect_backoff_seconds = 1.0
+        self._last_reconnect_kick = 0.0
+        self._reconnect_lock = threading.Lock()
         self._setup_events()
 
     def _setup_events(self):
         @self.client.event(Connected)
         def on_connected(client: NewClient, event: Connected):
             self.connected = True
+            self._reconnect_backoff_seconds = 1.0
             me = client.me
             log.info("WhatsApp connected (device: %s)", me)
+
+        @self.client.event(Disconnected)
+        def on_disconnected(client: NewClient, event: Disconnected):
+            self.connected = False
+            log.warning("WhatsApp disconnected")
+            self._request_reconnect("disconnected event")
+
+        @self.client.event(StreamError)
+        def on_stream_error(client: NewClient, event: StreamError):
+            self.connected = False
+            log.warning("WhatsApp stream error: %s", event)
+            self._request_reconnect("stream error")
+
+        @self.client.event(StreamReplaced)
+        def on_stream_replaced(client: NewClient, event: StreamReplaced):
+            self.connected = False
+            log.warning("WhatsApp stream replaced (logged in elsewhere?)")
+            self._request_reconnect("stream replaced")
+
+        @self.client.event(KeepAliveTimeout)
+        def on_keepalive_timeout(client: NewClient, event: KeepAliveTimeout):
+            self.connected = False
+            log.warning("WhatsApp keepalive timeout — connection likely dead")
+            self._request_reconnect("keepalive timeout")
+
+        @self.client.event(KeepAliveRestored)
+        def on_keepalive_restored(client: NewClient, event: KeepAliveRestored):
+            self.connected = True
+            self._reconnect_backoff_seconds = 1.0
+            log.info("WhatsApp keepalive restored")
+
+        @self.client.event(ConnectFailure)
+        def on_connect_failure(client: NewClient, event: ConnectFailure):
+            self.connected = False
+            log.error("WhatsApp connection failure: %s", event)
+            self._request_reconnect("connect failure")
+
+        @self.client.event(LoggedOut)
+        def on_logged_out(client: NewClient, event: LoggedOut):
+            self.connected = False
+            log.error("WhatsApp logged out — re-pairing required")
 
         @self.client.event(MessageEv)
         def on_message(client: NewClient, event: MessageEv):
@@ -128,6 +180,20 @@ class WhatsAppClient:
             )
 
     # --- Outbound ---
+
+    def _request_reconnect(self, reason: str):
+        """Nudge the blocking connect loop to re-dial after transport failures."""
+        now = time.monotonic()
+        with self._reconnect_lock:
+            if now - self._last_reconnect_kick < 5.0:
+                return
+            self._last_reconnect_kick = now
+
+        log.warning("Requesting WhatsApp reconnect (%s)", reason)
+        try:
+            self.client.disconnect()
+        except Exception:
+            log.debug("Failed to force disconnect during reconnect request", exc_info=True)
 
     @staticmethod
     def _is_whatsapp_jid(jid_str: str) -> bool:
@@ -210,7 +276,10 @@ class WhatsAppClient:
             if len(msg_ids) == 1:
                 return msg_ids[0]
             return msg_ids
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, SendMessageError) and "websocket not connected" in str(exc).lower():
+                self.connected = False
+                self._request_reconnect("send failed: websocket not connected")
             log.error("Failed to send message to %s", chat_jid, exc_info=True)
             return None
 
@@ -275,6 +344,18 @@ class WhatsAppClient:
             return None
 
     def connect(self):
-        """Blocking — run in a background thread."""
-        log.info("Connecting to WhatsApp...")
-        self.client.connect()
+        """Blocking reconnect loop — run in a background thread."""
+        while True:
+            delay = self._reconnect_backoff_seconds
+            try:
+                log.info("Connecting to WhatsApp...")
+                self.client.connect()
+                self.connected = False
+                log.warning("WhatsApp connection loop exited")
+            except Exception:
+                self.connected = False
+                log.error("WhatsApp connect loop crashed", exc_info=True)
+
+            log.warning("Reconnecting to WhatsApp in %.1fs", delay)
+            time.sleep(delay)
+            self._reconnect_backoff_seconds = min(delay * 2.0, 30.0)

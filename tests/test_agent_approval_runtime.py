@@ -1,11 +1,12 @@
 import asyncio
 import inspect
+import re
 import sys
 import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -127,7 +128,7 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_coalesces_concurrent_bash_approvals(self):
+    async def test_concurrent_bash_approvals_require_explicit_request_ids(self):
         state = RequestApprovalState()
         tasks = [
             asyncio.create_task(
@@ -143,17 +144,29 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         ]
 
         await asyncio.sleep(0.05)
-        self.assertEqual(len(self.molly.wa.sent), 1)
+        self.assertEqual(len(self.molly.wa.sent), 5)
         self.assertTrue(self.manager.has_pending(self.chat))
 
+        # Ambiguous without request id when multiple prompts are pending.
         consumed = self.manager.try_resolve("YES", self.chat)
-        self.assertTrue(consumed)
+        self.assertFalse(consumed)
+
+        request_ids: list[str] = []
+        for _chat_jid, message in self.molly.wa.sent:
+            match = re.search(r"Request ID:\s*([a-f0-9]{8})", message)
+            self.assertIsNotNone(match)
+            request_ids.append(match.group(1))
+        self.assertEqual(len(set(request_ids)), 5)
+
+        for request_id in request_ids:
+            consumed = self.manager.try_resolve(f"YES id:{request_id}", self.chat)
+            self.assertTrue(consumed)
 
         results = await asyncio.gather(*tasks)
         self.assertEqual(results, [True, True, True, True, True])
         self.assertEqual(state.tool_asks, 5)
-        self.assertEqual(state.prompts_sent, 1)
-        self.assertEqual(state.auto_approved, 4)
+        self.assertEqual(state.prompts_sent, 5)
+        self.assertEqual(state.auto_approved, 0)
         self.assertFalse(state.approved_all_confirm)
 
     async def test_all_only_applies_within_request_state(self):
@@ -206,7 +219,7 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(consumed)
         self.assertTrue(await third)
 
-    async def test_deny_propagates_to_coalesced_waiters(self):
+    async def test_concurrent_denials_require_request_ids(self):
         state = RequestApprovalState()
         tasks = [
             asyncio.create_task(
@@ -222,17 +235,24 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         ]
 
         await asyncio.sleep(0.05)
-        self.assertEqual(len(self.molly.wa.sent), 1)
+        self.assertEqual(len(self.molly.wa.sent), 4)
+
         consumed = self.manager.try_resolve("NO", self.chat)
-        self.assertTrue(consumed)
+        self.assertFalse(consumed)
+
+        for _chat_jid, message in self.molly.wa.sent:
+            match = re.search(r"Request ID:\s*([a-f0-9]{8})", message)
+            self.assertIsNotNone(match)
+            consumed = self.manager.try_resolve(f"NO id:{match.group(1)}", self.chat)
+            self.assertTrue(consumed)
 
         results = await asyncio.gather(*tasks)
         self.assertEqual(results, [False, False, False, False])
         self.assertEqual(state.tool_asks, 4)
-        self.assertEqual(state.prompts_sent, 1)
+        self.assertEqual(state.prompts_sent, 4)
         self.assertEqual(state.auto_approved, 0)
 
-    async def test_timeout_is_coalesced_to_one_prompt(self):
+    async def test_timeout_applies_per_request_id_prompt(self):
         state = RequestApprovalState()
         tasks = []
         with patch("approval.config.APPROVAL_TIMEOUT", 0.05):
@@ -261,9 +281,8 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(normalized, [False, False, False])
         self.assertEqual(state.tool_asks, 3)
-        self.assertEqual(state.prompts_sent, 1)
+        self.assertEqual(state.prompts_sent, 3)
         self.assertEqual(state.auto_approved, 0)
-        self.assertIn("Bash", state.denied_tools)
 
     async def test_web_request_routes_to_owner_whatsapp_for_resolution(self):
         owner_chat = OWNER_PRIMARY_WHATSAPP_JID
@@ -826,24 +845,36 @@ class TestSafeBashAutoApproval(unittest.IsolatedAsyncioTestCase):
                     f"Expected dangerous: {cmd}",
                 )
 
-    def test_compound_commands_remain_confirm(self):
-        """Pipes, chaining, and subshells must NOT be auto-approved."""
+    def test_compound_commands_validate_each_segment(self):
+        """Compound operators should be split and each segment validated."""
         from approval import is_safe_bash_command
 
-        compound = [
-            "ls | grep foo",
+        unsafe_compound = [
             "echo hello; rm file",
             "cat file && curl http://evil.com",
             "echo hello || rm file",
+            "cd /etc && cat passwd",
             "echo `whoami`",
             "echo $(cat /etc/passwd)",
             "ls\nrm -rf /",
         ]
-        for cmd in compound:
+        for cmd in unsafe_compound:
             with self.subTest(cmd=cmd):
                 self.assertFalse(
                     is_safe_bash_command({"command": cmd}),
                     f"Expected unsafe (compound): {cmd}",
+                )
+
+        safe_compound = [
+            "ls | grep foo",
+            "pwd && ls -la",
+            "git status | head -n 5",
+        ]
+        for cmd in safe_compound:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(
+                    is_safe_bash_command({"command": cmd}),
+                    f"Expected safe (compound): {cmd}",
                 )
 
     def test_redirect_commands_remain_confirm(self):
@@ -1241,6 +1272,35 @@ class TestSafeBashAutoApproval(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, PermissionResultAllow)
         # No WhatsApp messages should have been sent
         self.assertEqual(len(molly.wa.sent), 0)
+
+
+class TestClaudeDisconnectRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_cross_task_error_uses_fallback_cleanup(self):
+        runtime = agent._ChatRuntime()
+        fake_client = MagicMock()
+        fake_client.disconnect = AsyncMock(
+            side_effect=RuntimeError(
+                "Attempted to exit cancel scope in a different task than it was entered in"
+            )
+        )
+        runtime.client = fake_client
+
+        with patch.object(agent, "_force_close_sdk_transport", new=AsyncMock()) as close_mock:
+            with patch.object(agent, "_force_kill_sdk_client") as kill_mock:
+                await agent._disconnect_runtime(runtime)
+
+        self.assertIsNone(runtime.client)
+        close_mock.assert_awaited_once_with(fake_client)
+        kill_mock.assert_called_once_with(fake_client)
+
+    def test_cross_task_cancel_scope_classifier(self):
+        self.assertTrue(
+            agent._is_cross_task_cancel_scope_error(
+                RuntimeError("Attempted to exit cancel scope in a different task than it was entered in")
+            )
+        )
+        self.assertFalse(agent._is_cross_task_cancel_scope_error(RuntimeError("other runtime error")))
+        self.assertFalse(agent._is_cross_task_cancel_scope_error(ValueError("cancel scope")))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@ from difflib import SequenceMatcher
 import json
 import logging
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -15,8 +14,10 @@ from zoneinfo import ZoneInfo
 import yaml
 
 import config
+import db_pool
 from agent import handle_message
 from automation_triggers import BaseTrigger, create_trigger
+from utils import atomic_write_json, normalize_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -149,32 +150,13 @@ def _parse_payload_timestamp(value: Any, fallback: datetime) -> datetime:
     if value is None:
         return fallback
 
-    if isinstance(value, (int, float)):
-        raw_num = float(value)
-    else:
-        raw = str(value).strip()
-        if not raw:
-            return fallback
-        if raw.isdigit():
-            raw_num = float(raw)
-        else:
-            maybe_dt = _iso_to_datetime(raw.replace("Z", "+00:00"))
-            if maybe_dt is None:
-                return fallback
-            if maybe_dt.tzinfo is None:
-                maybe_dt = maybe_dt.replace(tzinfo=timezone.utc)
-            return maybe_dt.astimezone(timezone.utc)
-
-    if raw_num > 1e18:
-        raw_num /= 1_000_000_000.0
-    elif raw_num > 1e14:
-        raw_num /= 1_000_000.0
-    elif raw_num > 1e11:
-        raw_num /= 1_000.0
-
     try:
-        return datetime.fromtimestamp(raw_num, tz=timezone.utc)
-    except Exception:
+        normalized = normalize_timestamp(value)
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
         return fallback
 
 
@@ -395,12 +377,7 @@ def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
 
 
 def _iso_to_datetime(value: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
+    return _safe_iso_datetime(value)
 
 
 def _render_path(payload: dict, path_expr: str, default: str = "") -> str:
@@ -1157,7 +1134,7 @@ class AutomationEngine:
         since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
 
         def _run() -> bool:
-            conn = sqlite3.connect(str(config.DATABASE_PATH))
+            conn = db_pool.sqlite_connect(str(config.DATABASE_PATH))
             try:
                 placeholders = ",".join("?" for _ in candidates)
                 sql = (
@@ -1180,7 +1157,7 @@ class AutomationEngine:
         today_iso = date.today().isoformat()
 
         def _run() -> int:
-            conn = sqlite3.connect(str(config.DATABASE_PATH))
+            conn = db_pool.sqlite_connect(str(config.DATABASE_PATH))
             try:
                 cursor = conn.execute("SELECT COUNT(*) FROM messages WHERE timestamp > ?", (today_iso,))
                 return int(cursor.fetchone()[0])
@@ -1674,11 +1651,9 @@ class AutomationEngine:
             await self._save_state_locked()
 
     async def _save_state_locked(self):
-        payload = json.dumps(self._state, indent=2, default=str)
-
         def _write():
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(payload)
+            atomic_write_json(self.state_path, self._state)
 
         try:
             await asyncio.to_thread(_write)
@@ -1787,9 +1762,8 @@ def _safe_iso_datetime(value: Any) -> datetime | None:
     if not text:
         return None
     try:
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(text)
+        normalized = normalize_timestamp(text)
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:

@@ -3,6 +3,10 @@ import threading
 import time
 from typing import Any
 
+import yaml
+
+import config
+
 log = logging.getLogger(__name__)
 
 _model = None
@@ -37,7 +41,7 @@ ENTITY_SCHEMA = {
 }
 
 # Description-enriched relationship types
-RELATION_SCHEMA = {
+_BASE_RELATION_SCHEMA = {
     "works on": {
         "description": "Person actively works on a project or task",
         "threshold": 0.45,
@@ -132,6 +136,49 @@ RELATION_SCHEMA = {
     },
 }
 
+
+def _load_user_relation_schema() -> dict[str, dict[str, Any]]:
+    """Load user-extended relation schema from ~/.molly/workspace/config/relation_schema.yaml."""
+    path = getattr(config, "RELATION_SCHEMA_FILE", None)
+    if path is None:
+        return {}
+    schema_path = path.expanduser()
+    if not schema_path.exists():
+        return {}
+
+    try:
+        payload = yaml.safe_load(schema_path.read_text())
+    except Exception:
+        log.warning("Failed to parse relation schema file: %s", schema_path, exc_info=True)
+        return {}
+
+    merged: dict[str, dict[str, Any]] = {}
+    if isinstance(payload, dict):
+        items = payload.items()
+    elif isinstance(payload, list):
+        items = [(str(item), {}) for item in payload]
+    else:
+        log.warning("Unsupported relation schema format at %s", schema_path)
+        return {}
+
+    for raw_name, raw_cfg in items:
+        name = str(raw_name or "").strip().lower()
+        if not name:
+            continue
+        cfg = raw_cfg if isinstance(raw_cfg, dict) else {}
+        description = str(cfg.get("description") or f"User-defined relation: {name}").strip()
+        threshold_raw = cfg.get("threshold", 0.45)
+        try:
+            threshold = float(threshold_raw)
+        except (TypeError, ValueError):
+            threshold = 0.45
+        merged[name] = {"description": description, "threshold": max(0.0, min(1.0, threshold))}
+    return merged
+
+
+RELATION_SCHEMA = dict(_BASE_RELATION_SCHEMA)
+RELATION_SCHEMA.update(_load_user_relation_schema())
+
 # Message type classification
 MESSAGE_LABELS = {
     "actionable": "Message contains a task, request, reminder, or something requiring follow-up action",
@@ -142,17 +189,28 @@ MESSAGE_LABELS = {
 
 
 def _get_model():
-    """Lazy-load the GLiNER2 model (unified NER + relations + classification)."""
+    """Lazy-load the GLiNER2 model (unified NER + relations + classification).
+
+    Checks for a fine-tuned active model first at ~/.molly/workspace/models/gliner_active/.
+    Falls back to the base HuggingFace model if no active model exists.
+    """
     global _model
     if _model is not None:
         return _model
     with _model_lock:
         if _model is None:
+            from pathlib import Path
             from gliner2 import GLiNER2
 
-            log.info("Loading GLiNER2 model (fastino/gliner2-large-v1)...")
-            _model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
-            log.info("GLiNER2 model loaded.")
+            active_dir = Path.home() / ".molly" / "workspace" / "models" / "gliner_active"
+            if active_dir.exists() and (active_dir / "model.safetensors").exists():
+                log.info("Loading fine-tuned GLiNER2 model from %s ...", active_dir)
+                _model = GLiNER2.from_pretrained(str(active_dir))
+                log.info("Fine-tuned GLiNER2 model loaded.")
+            else:
+                log.info("Loading GLiNER2 base model (fastino/gliner2-large-v1)...")
+                _model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
+                log.info("GLiNER2 base model loaded.")
     return _model
 
 

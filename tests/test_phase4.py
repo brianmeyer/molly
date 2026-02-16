@@ -294,6 +294,7 @@ class TestCheckEmailRateLimiting(unittest.TestCase):
         state_path.write_text(json.dumps(state))
 
         molly = MagicMock()
+        molly.cancel_event = None
 
         # Build mock gmail service chain
         mock_list_execute = MagicMock(return_value={"messages": []})
@@ -335,6 +336,7 @@ class TestCheckEmailRateLimiting(unittest.TestCase):
         state_path.write_text(json.dumps(state))
 
         molly = MagicMock()
+        molly.cancel_event = None
 
         mock_list_execute = MagicMock(return_value={"messages": []})
         mock_list = MagicMock()
@@ -374,6 +376,7 @@ class TestCheckEmailRateLimiting(unittest.TestCase):
         state_path.write_text(json.dumps({}))
 
         molly = MagicMock()
+        molly.cancel_event = None
 
         mock_list_execute = MagicMock(return_value={"messages": []})
         mock_list = MagicMock()

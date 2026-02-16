@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
+import db_pool
 
 _SUCCESS_MARKERS = (
     "success",
@@ -69,7 +70,7 @@ def _query_rows(
     params: tuple | None = None,
     path: Path | None = None,
 ) -> list[sqlite3.Row]:
-    conn = sqlite3.connect(str(_db_path(path)))
+    conn = db_pool.sqlite_connect(str(_db_path(path)))
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.execute(query, params or ())

@@ -135,7 +135,7 @@ async def extract_to_graph(
         raw_to_canonical: dict[str, str] = {}
         entity_names = []
         for ent in entities:
-            canonical = graph.upsert_entity(
+            canonical = await graph.upsert_entity(
                 name=ent["text"],
                 entity_type=ent["label"],
                 confidence=ent["score"],
@@ -147,7 +147,7 @@ async def extract_to_graph(
             # Resolve raw extracted names to canonical graph names
             head = raw_to_canonical.get(rel["head"], rel["head"])
             tail = raw_to_canonical.get(rel["tail"], rel["tail"])
-            graph.upsert_relationship(
+            await graph.upsert_relationship(
                 head_name=head,
                 tail_name=tail,
                 rel_type=rel["label"],
@@ -155,7 +155,7 @@ async def extract_to_graph(
                 context_snippet=content[:200],
             )
 
-        graph.create_episode(
+        await graph.create_episode(
             content_preview=content,
             source=source,
             entity_names=list(set(entity_names)),

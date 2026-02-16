@@ -21,7 +21,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config
+import db_pool
 from foundry_adapter import FoundrySequenceSignal, load_foundry_sequence_signals
+from utils import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -1571,9 +1573,9 @@ class SelfImprovementEngine:
         )
 
     def _run_memory_optimization_sync(self) -> dict[str, Any]:
-        from memory.graph import get_driver, run_strength_decay
+        from memory.graph import get_driver, run_strength_decay_sync
 
-        decayed = run_strength_decay()
+        decayed = run_strength_decay_sync()
         consolidated = self._consolidate_entities()
         stale = self._stale_entities(days=60)
         contradictions = self._detect_contradictions()
@@ -1657,7 +1659,7 @@ class SelfImprovementEngine:
 
     def _save_state(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(self._state, indent=2, default=str))
+        atomic_write_json(self.state_path, self._state, indent=2)
 
     def _request_runtime_restart(self, reason: str) -> bool:
         runtime = self.molly
@@ -1901,7 +1903,7 @@ class SelfImprovementEngine:
         event_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS self_improvement_events (
@@ -2082,7 +2084,7 @@ class SelfImprovementEngine:
         owner_ids = set(config.OWNER_IDS)
         if not owner_ids:
             return []
-        conn = sqlite3.connect(str(config.DATABASE_PATH))
+        conn = db_pool.sqlite_connect(str(config.DATABASE_PATH))
         placeholders = ",".join("?" for _ in owner_ids)
         query = (
             f"SELECT content FROM messages WHERE timestamp > ? AND sender IN ({placeholders}) "
@@ -2740,7 +2742,7 @@ class SelfImprovementEngine:
                 continue
 
             try:
-                conn = sqlite3.connect(str(db_path))
+                conn = db_pool.sqlite_connect(str(db_path))
                 values = [value for _, value in assignments]
                 set_clause = ", ".join(f"{field} = ?" for field, _ in assignments)
                 conn.execute(
@@ -2856,7 +2858,7 @@ class SelfImprovementEngine:
                         "error": f"mollygraph_missing:{{DB_PATH}}",
                     }}
 
-                conn = sqlite3.connect(str(DB_PATH))
+                conn = db_pool.sqlite_connect(str(DB_PATH))
                 conn.row_factory = sqlite3.Row
                 try:
                     rows = conn.execute(
@@ -3695,6 +3697,9 @@ class SelfImprovementEngine:
         metadata_path = candidate_dir / "fine_tune_metadata.json"
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True))
 
+        # Prune old training runs to prevent unbounded disk growth
+        self._prune_gliner_dirs()
+
         return {
             "ok": True,
             "candidate_model": str(candidate_dir),
@@ -3704,6 +3709,32 @@ class SelfImprovementEngine:
             "mode": normalized_mode,
             "result": result,
         }
+
+    _GLINER_MAX_RUNS = 3          # keep last N training runs
+    _GLINER_MAX_BACKUPS = 2        # keep last N deployment backups
+
+    def _prune_gliner_dirs(self) -> dict[str, Any]:
+        """Prune old GLiNER training runs and deployment backups to save disk."""
+        pruned: dict[str, list[str]] = {"runs": [], "backups": []}
+        for subdir, limit in [
+            (self._gliner_models_dir() / "gliner_runs", self._GLINER_MAX_RUNS),
+            (self._gliner_models_dir() / "gliner_backups", self._GLINER_MAX_BACKUPS),
+        ]:
+            if not subdir.exists():
+                continue
+            dirs = sorted(
+                [d for d in subdir.iterdir() if d.is_dir()],
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            for old_dir in dirs[limit:]:
+                try:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+                    pruned[subdir.name].append(old_dir.name)
+                    log.info("Pruned old GLiNER dir: %s", old_dir)
+                except Exception:
+                    log.warning("Failed to prune %s", old_dir, exc_info=True)
+        return pruned
 
     def _discard_gliner_candidate_model(self, candidate_path: Path | None):
         if not candidate_path:
@@ -3771,12 +3802,16 @@ class SelfImprovementEngine:
         config_path.write_text(json.dumps(config_payload, indent=2, ensure_ascii=True))
         commit = self._commit_gliner_training_config(config_path)
 
+        # Prune old training runs and backups to prevent unbounded disk growth
+        pruned = self._prune_gliner_dirs()
+
         return {
             "ok": True,
             "active_model": str(active_dir),
             "backup_model": str(backup_dir) if backup_dir else None,
             "training_config": str(config_path),
             "git": commit,
+            "pruned": pruned,
         }
 
     def _commit_gliner_training_config(self, config_path: Path) -> dict[str, Any]:
@@ -4068,7 +4103,7 @@ class SelfImprovementEngine:
 
     def _count_rows(self, db_path: Path, sql: str, params: tuple[Any, ...]) -> int:
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = db_pool.sqlite_connect(str(db_path))
             value = conn.execute(sql, params).fetchone()[0]
             conn.close()
             return int(value or 0)
@@ -4083,7 +4118,7 @@ class SelfImprovementEngine:
         default: float = 0.0,
     ) -> float:
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = db_pool.sqlite_connect(str(db_path))
             value = conn.execute(sql, params).fetchone()[0]
             conn.close()
             if value is None:
@@ -4094,7 +4129,7 @@ class SelfImprovementEngine:
 
     def _rows(self, db_path: Path, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = db_pool.sqlite_connect(str(db_path))
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
             conn.close()
@@ -4104,7 +4139,7 @@ class SelfImprovementEngine:
 
     def _table_columns(self, db_path: Path, table_name: str) -> list[str]:
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = db_pool.sqlite_connect(str(db_path))
             rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
             conn.close()
             return [str(row[1]) for row in rows if len(row) > 1]

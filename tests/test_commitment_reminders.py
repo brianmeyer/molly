@@ -123,10 +123,10 @@ class TestReminderTiering(unittest.TestCase):
         tier = get_action_tier("list_reminders", {})
         self.assertEqual(tier, "AUTO")
 
-    def test_google_tasks_create_confirm(self):
-        """Google Tasks create should be CONFIRM tier (called directly, not via MCP)."""
+    def test_google_tasks_create_auto(self):
+        """Google Tasks create should be AUTO tier for reminder pipeline flow."""
         tier = get_action_tier("tasks_create", {})
-        self.assertEqual(tier, "CONFIRM")
+        self.assertEqual(tier, "AUTO")
 
 
 class TestSyncCommitmentStatus(unittest.TestCase):

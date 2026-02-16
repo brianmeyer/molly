@@ -1,13 +1,91 @@
-import json
 import logging
 import time
 from datetime import datetime, date
 
 import config
+from utils import atomic_write_json, load_json
 
 log = logging.getLogger(__name__)
 
 HEARTBEAT_SENTINEL = "HEARTBEAT_OK"
+_HEARTBEAT_CHECKPOINT_MAX_IDS = 100
+
+# --------------- Calendar event auto-creation from triage ---------------
+
+async def _maybe_create_calendar_event(
+    triage_result,
+    molly,
+    owner_jid: str,
+    source_label: str = "",
+) -> bool:
+    """If triage_result has a calendar_event, route it through Claude to create.
+
+    Uses handle_message so the agent can use calendar_search (dedup) and
+    calendar_create (MCP tool) properly.  Returns True if dispatched.
+    """
+    cal = getattr(triage_result, "calendar_event", None)
+    if not cal or not isinstance(cal, dict):
+        return False
+
+    title = cal.get("title", "").strip()
+    start = cal.get("start", "").strip()
+    if not title or not start:
+        log.debug("calendar_event missing title or start, skipping: %s", cal)
+        return False
+
+    try:
+        from agent import handle_message
+
+        end = cal.get("end") or start
+        location = cal.get("location") or ""
+        notes = cal.get("notes") or ""
+        if source_label:
+            notes = f"{notes}\n(Auto-detected from {source_label})".strip()
+
+        prompt = (
+            f"Auto-detected calendar event from triage. "
+            f"First search Google Calendar to check if this event already exists. "
+            f"If it does NOT exist, create it. If it DOES exist, skip silently.\n\n"
+            f"Event details:\n"
+            f"- Title: {title}\n"
+            f"- Start: {start}\n"
+            f"- End: {end}\n"
+            f"- Location: {location}\n"
+            f"- Notes: {notes}\n\n"
+            f"If you create the event, respond with: CALENDAR_CREATED: {{title}}\n"
+            f"If it already exists, respond with: CALENDAR_EXISTS: {{title}}\n"
+            f"Keep your response to one line."
+        )
+
+        response, _ = await handle_message(
+            user_message=prompt,
+            chat_id=owner_jid,
+            session_id=None,
+            approval_manager=getattr(molly, "approvals", None),
+            molly_instance=molly,
+            source="calendar-auto",
+        )
+
+        if response and "CALENDAR_CREATED" in response:
+            msg = f"\U0001f4c5 *Auto-added to calendar:* {title}"
+            if location:
+                msg += f"\n\U0001f4cd {location}"
+            msg += f"\n\u23f0 {start}"
+            _send_surface(
+                molly, owner_jid, msg,
+                source="calendar-auto",
+                surfaced_summary=f"Auto-calendar: {title}",
+                sender_pattern="calendar:auto",
+            )
+            log.info("Auto-created calendar event: %s at %s", title, start)
+            return True
+        else:
+            log.info("Calendar event skipped (exists or failed): %s", title)
+            return False
+
+    except Exception:
+        log.warning("Failed to auto-create calendar event: %s", title, exc_info=True)
+        return False
 _skill_reload_count = 0
 
 # Morning digest window: first heartbeat between 7:00-7:59
@@ -44,14 +122,57 @@ def _update_state_key(key: str, value) -> None:
     Re-reads the file before writing to avoid clobbering concurrent updates
     from the heartbeat or MCP tools.
     """
-    config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    state_data = (
-        json.loads(config.STATE_FILE.read_text())
-        if config.STATE_FILE.exists()
-        else {}
-    )
+    state_data = _load_state_data()
     state_data[key] = value
-    config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+    _save_state_data(state_data)
+
+
+def _load_state_data() -> dict:
+    data = load_json(config.STATE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_state_data(state_data: dict) -> None:
+    atomic_write_json(config.STATE_FILE, state_data)
+
+
+def _is_cancelled(molly) -> bool:
+    cancel_event = getattr(molly, "cancel_event", None)
+    return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def _load_heartbeat_checkpoint() -> dict:
+    data = load_json(config.HEARTBEAT_CHECKPOINT_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    ids = [
+        str(item).strip()
+        for item in data.get("processed_email_ids", [])
+        if str(item).strip()
+    ][-_HEARTBEAT_CHECKPOINT_MAX_IDS :]
+    return {
+        "processed_email_ids": ids,
+        "last_run_ts": str(data.get("last_run_ts", "") or ""),
+        "last_imessage_ts": str(data.get("last_imessage_ts", "") or ""),
+    }
+
+
+def _write_heartbeat_checkpoint(checkpoint: dict) -> None:
+    atomic_write_json(config.HEARTBEAT_CHECKPOINT_FILE, checkpoint)
+
+
+def _checkpoint_email_processed(checkpoint: dict, msg_id: str) -> dict:
+    ids = [
+        str(item).strip()
+        for item in checkpoint.get("processed_email_ids", [])
+        if str(item).strip()
+    ]
+    if msg_id not in ids:
+        ids.append(msg_id)
+    checkpoint["processed_email_ids"] = ids[-_HEARTBEAT_CHECKPOINT_MAX_IDS :]
+    checkpoint["last_run_ts"] = datetime.utcnow().replace(microsecond=0).isoformat()
+    _write_heartbeat_checkpoint(checkpoint)
+    return checkpoint
 
 
 def should_heartbeat(last_heartbeat: datetime | None) -> bool:
@@ -70,6 +191,10 @@ async def run_heartbeat(molly):
     """Run a heartbeat check: HEARTBEAT.md evaluation + skill triggers + iMessage/email monitoring."""
     global _skill_reload_count
     import skills
+
+    if _is_cancelled(molly):
+        log.info("Heartbeat cancelled by owner before cycle start")
+        return
 
     try:
         reloaded = skills.check_for_changes()
@@ -305,7 +430,7 @@ async def _check_morning_digest(molly, chat_jid: str):
         return
 
     # Check if we already sent a digest today
-    state_data = json.loads(config.STATE_FILE.read_text()) if config.STATE_FILE.exists() else {}
+    state_data = _load_state_data()
     last_digest = state_data.get("last_digest_date", "")
     today = date.today().isoformat()
 
@@ -316,8 +441,7 @@ async def _check_morning_digest(molly, chat_jid: str):
 
     # Mark as sent (even if it fails, don't retry every 30 min)
     state_data["last_digest_date"] = today
-    config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+    _save_state_data(state_data)
 
     from agent import handle_message
 
@@ -398,7 +522,7 @@ async def _check_meeting_prep(molly, chat_jid: str):
             event_id = event["id"]
 
             # Check if we already prepped this event
-            state_data = json.loads(config.STATE_FILE.read_text()) if config.STATE_FILE.exists() else {}
+            state_data = _load_state_data()
             prepped = state_data.get("prepped_events", [])
             if event_id in prepped:
                 continue
@@ -407,7 +531,7 @@ async def _check_meeting_prep(molly, chat_jid: str):
             prepped.append(event_id)
             # Keep only last 50 to avoid unbounded growth
             state_data["prepped_events"] = prepped[-50:]
-            config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+            _save_state_data(state_data)
 
             title = event.get("summary", "Untitled meeting")
             start = event.get("start", {}).get("dateTime", "")
@@ -460,17 +584,19 @@ async def _check_imessages(molly):
     """
     try:
         from tools.imessage import get_new_messages_since
+        if _is_cancelled(molly):
+            log.info("iMessage heartbeat cancelled by owner")
+            return
 
         # Load high-water mark
-        state_data = json.loads(config.STATE_FILE.read_text()) if config.STATE_FILE.exists() else {}
+        state_data = _load_state_data()
         last_check = float(state_data.get("imessage_heartbeat_hw", 0))
 
         if last_check == 0:
             # First run — default to 7 days ago (not epoch 0 which scans entire history)
             last_check = time.time() - (7 * 86400)
             state_data["imessage_heartbeat_hw"] = last_check
-            config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+            _save_state_data(state_data)
             log.info("iMessage monitoring: initialized high-water mark to 7 days ago")
 
         messages = get_new_messages_since(last_check)
@@ -496,15 +622,21 @@ async def _check_imessages(molly):
         from memory.triage import triage_message
         from memory.processor import embed_and_store, extract_to_graph
 
+        imessage_cycle_seen: set[tuple[str, str]] = set()
+
         for msg in messages:
+            if _is_cancelled(molly):
+                log.info("iMessage heartbeat cancelled by owner")
+                return
             if msg["is_from_me"] or not msg["text"]:
                 continue
 
-            # Run triage
+            # Run triage (PLAN-16: pass handle as chat_jid for thread context)
             result = await triage_message(
                 msg["text"],
                 sender_name=msg["sender"],
                 group_name="iMessage",
+                chat_jid=msg.get("handle", ""),
             )
 
             if result and result.classification == "urgent":
@@ -523,6 +655,23 @@ async def _check_imessages(molly):
                     sender_pattern=f"sender:{msg['sender']}",
                 )
 
+            if (
+                config.AUTO_CALENDAR_EXTRACTION_ENABLED
+                and result
+                and hasattr(molly, "_auto_action_from_triage")
+            ):
+                try:
+                    await molly._auto_action_from_triage(
+                        message_text=msg["text"],
+                        triage_result=result,
+                        channel="imessage",
+                        sender_name=msg["sender"],
+                        source_chat_jid=owner_jid,
+                        cycle_seen=imessage_cycle_seen,
+                    )
+                except Exception:
+                    log.warning("iMessage auto-calendar action failed", exc_info=True)
+
             # Embed + graph extract for relevant/urgent messages
             if result and result.classification in ("urgent", "relevant"):
                 imsg_text = f"iMessage from {msg['sender']}: {msg['text']}"
@@ -531,7 +680,10 @@ async def _check_imessages(molly):
 
         # Update high-water mark AFTER processing so a crash doesn't lose messages
         state_data["imessage_heartbeat_hw"] = time.time()
-        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+        _save_state_data(state_data)
+        checkpoint = _load_heartbeat_checkpoint()
+        checkpoint["last_imessage_ts"] = datetime.utcnow().replace(microsecond=0).isoformat()
+        _write_heartbeat_checkpoint(checkpoint)
 
     except Exception:
         log.debug("iMessage heartbeat check failed", exc_info=True)
@@ -550,11 +702,7 @@ async def _check_imessage_mentions(molly):
         from tools.imessage import get_mention_messages_since, get_thread_context
 
         # Separate high-water mark from the heartbeat's imessage_heartbeat_hw
-        state_data = (
-            json.loads(config.STATE_FILE.read_text())
-            if config.STATE_FILE.exists()
-            else {}
-        )
+        state_data = _load_state_data()
         last_check = float(state_data.get("imessage_mention_hw", 0))
 
         if last_check == 0:
@@ -673,6 +821,10 @@ async def _check_email(molly):
     try:
         from tools.google_auth import get_gmail_service
 
+        if _is_cancelled(molly):
+            log.info("Email heartbeat cancelled by owner")
+            return
+
         service = get_gmail_service()
         if not service:
             return
@@ -680,7 +832,7 @@ async def _check_email(molly):
         # Rate limit: only poll every EMAIL_POLL_INTERVAL seconds.
         # Keep legacy fallback for existing state files that only have
         # email_heartbeat_hw.
-        state_data = json.loads(config.STATE_FILE.read_text()) if config.STATE_FILE.exists() else {}
+        state_data = _load_state_data()
         last_poll = float(
             state_data.get(
                 "email_heartbeat_last_poll",
@@ -714,6 +866,13 @@ async def _check_email(molly):
             high_water_ids_list.append(legacy_high_water_id)
         high_water_ids = set(high_water_ids_list)
 
+        checkpoint = _load_heartbeat_checkpoint()
+        processed_email_ids = {
+            str(value).strip()
+            for value in checkpoint.get("processed_email_ids", [])
+            if str(value).strip()
+        }
+
         # Use precise high-water timestamp for query, with a one-second overlap
         # to avoid dropping messages on second-level boundaries.
         if high_water_ts_ms > 0:
@@ -736,8 +895,7 @@ async def _check_email(molly):
             # No messages — update poll timestamp but keep high-water cursor.
             state_data["email_heartbeat_last_poll"] = now
             state_data["email_heartbeat_hw"] = now
-            config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+            _save_state_data(state_data)
             return
 
         log.info("Email heartbeat: %d new unread emails", len(messages))
@@ -745,18 +903,21 @@ async def _check_email(molly):
         import asyncio
         from memory.triage import triage_message
         from memory.processor import batch_embed_and_store, extract_to_graph
+        from tools.gmail import _extract_body
 
         owner_jid = molly._get_owner_dm_jid()
 
-        # --- Phase 1: Fetch all email metadata ---
-        email_data = []  # list of (msg_id, internal_ts_ms, sender, subject, snippet, email_text)
+        # --- Phase 1: Fetch full email metadata + body excerpt ---
+        email_data = []  # list of (msg_id, internal_ts_ms, sender, subject, snippet, body_excerpt, triage_text)
         for msg_ref in messages:
+            if _is_cancelled(molly):
+                log.info("Email heartbeat cancelled by owner")
+                return
             try:
                 msg = (
                     service.users()
                     .messages()
-                    .get(userId="me", id=msg_ref["id"], format="metadata",
-                         metadataHeaders=["From", "Subject", "Date"])
+                    .get(userId="me", id=msg_ref["id"], format="full")
                     .execute()
                 )
                 headers = {
@@ -766,6 +927,8 @@ async def _check_email(molly):
 
                 msg_id = str(msg.get("id", "")).strip()
                 if not msg_id:
+                    continue
+                if msg_id in processed_email_ids:
                     continue
 
                 try:
@@ -787,42 +950,74 @@ async def _check_email(molly):
                 sender = headers.get("from", "Unknown")
                 subject = headers.get("subject", "(no subject)")
                 snippet = msg.get("snippet", "")
-                email_text = f"From: {sender}\nSubject: {subject}\n{snippet}"
-                email_data.append((msg_id, internal_ts_ms, sender, subject, snippet, email_text))
+                body = _extract_body(msg.get("payload", {}))
+                body_excerpt = (body or snippet or "")[:2000]
+                email_text = (
+                    f"From: {sender}\n"
+                    f"Subject: {subject}\n"
+                    f"Body:\n{body_excerpt}"
+                )
+                email_data.append(
+                    (
+                        msg_id,
+                        internal_ts_ms,
+                        sender,
+                        subject,
+                        snippet,
+                        body_excerpt,
+                        email_text,
+                    )
+                )
             except Exception:
                 log.debug("Failed to fetch email %s", msg_ref.get("id"), exc_info=True)
 
         if not email_data:
             state_data["email_heartbeat_last_poll"] = now
             state_data["email_heartbeat_hw"] = now
-            config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+            _save_state_data(state_data)
             return
 
         # --- Phase 2: Triage all emails in parallel ---
+        # PLAN-16: emails don't have a chat_jid, but sender relationship context still applies
         triage_tasks = [
-            triage_message(email_text, sender_name=sender, group_name="Email")
-            for _msg_id, _internal_ts_ms, sender, _subject, _snippet, email_text in email_data
+            triage_message(email_text, sender_name=sender, group_name="Email", chat_jid="")
+            for _msg_id, _internal_ts_ms, sender, _subject, _snippet, _body_excerpt, email_text in email_data
         ]
         triage_results = await asyncio.gather(*triage_tasks, return_exceptions=True)
 
         # --- Phase 3: Surface urgent notifications + collect texts for memory ---
         texts_to_embed = []
         texts_to_extract = []
+        email_cycle_seen: set[tuple[str, str]] = set()
 
         for i, triage_result in enumerate(triage_results):
+            if _is_cancelled(molly):
+                log.info("Email heartbeat cancelled by owner")
+                return
             if isinstance(triage_result, Exception):
                 log.debug("Triage failed for email %d", i, exc_info=triage_result)
                 continue
 
-            msg_id, internal_ts_ms, sender, subject, snippet, email_text = email_data[i]
+            (
+                msg_id,
+                internal_ts_ms,
+                sender,
+                subject,
+                snippet,
+                _body_excerpt,
+                email_text,
+            ) = email_data[i]
 
-            # Queue non-noise emails for digest
-            if triage_result.classification != "noise":
+            classification = (triage_result.classification or "").strip().lower()
+            is_digest_only = classification in {"digest_only", "background"}
+
+            # Queue digest-only messages (background is current digest-only equivalent)
+            # plus urgent/relevant so digest can show "already notified" context.
+            if is_digest_only or classification in {"urgent", "relevant"}:
                 from memory.email_digest import append_digest_item
                 append_digest_item(
                     msg_id=msg_id, sender=sender, subject=subject,
-                    snippet=snippet, classification=triage_result.classification,
+                    snippet=snippet, classification=classification,
                     score=triage_result.score, reason=triage_result.reason,
                     internal_ts_ms=internal_ts_ms,
                 )
@@ -844,9 +1039,29 @@ async def _check_email(molly):
                         sender_pattern=f"sender:{sender}",
                     )
 
+            if (
+                config.AUTO_CALENDAR_EXTRACTION_ENABLED
+                and triage_result
+                and hasattr(molly, "_auto_action_from_triage")
+            ):
+                try:
+                    await molly._auto_action_from_triage(
+                        message_text=email_text,
+                        triage_result=triage_result,
+                        channel="email",
+                        sender_name=sender,
+                        source_chat_jid=owner_jid or "",
+                        cycle_seen=email_cycle_seen,
+                    )
+                except Exception:
+                    log.warning("Email auto-calendar action failed", exc_info=True)
+
             if triage_result and triage_result.classification in ("urgent", "relevant"):
                 texts_to_embed.append(email_text)
                 texts_to_extract.append(email_text)
+
+            processed_email_ids.add(msg_id)
+            checkpoint = _checkpoint_email_processed(checkpoint, msg_id)
 
         # --- Phase 4: Batch embed + parallel graph extraction ---
         if texts_to_embed:
@@ -869,7 +1084,7 @@ async def _check_email(molly):
         # Update high-water mark AFTER processing so a crash doesn't lose emails.
         latest_ts_ms = 0
         latest_ids: list[str] = []
-        for msg_id, internal_ts_ms, _sender, _subject, _snippet, _email_text in email_data:
+        for msg_id, internal_ts_ms, _sender, _subject, _snippet, _body_excerpt, _email_text in email_data:
             if internal_ts_ms > latest_ts_ms:
                 latest_ts_ms = internal_ts_ms
                 latest_ids = [msg_id]
@@ -882,7 +1097,7 @@ async def _check_email(molly):
             latest_ts_ms = max(high_water_ts_ms, int(now * 1000))
             latest_ids = [
                 msg_id
-                for msg_id, _internal_ts_ms, _sender, _subject, _snippet, _email_text in email_data
+                for msg_id, _internal_ts_ms, _sender, _subject, _snippet, _body_excerpt, _email_text in email_data
                 if msg_id
             ][-50:]
 
@@ -900,8 +1115,10 @@ async def _check_email(molly):
 
         state_data["email_heartbeat_last_poll"] = now
         state_data["email_heartbeat_hw"] = now
-        config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        config.STATE_FILE.write_text(json.dumps(state_data, indent=2))
+        _save_state_data(state_data)
+
+        checkpoint["last_run_ts"] = datetime.utcnow().replace(microsecond=0).isoformat()
+        _write_heartbeat_checkpoint(checkpoint)
 
     except Exception:
         log.warning("Email heartbeat check failed", exc_info=True)

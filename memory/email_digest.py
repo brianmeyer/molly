@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
+from utils import atomic_write_json, load_json
 
 log = logging.getLogger(__name__)
 
@@ -102,9 +103,8 @@ def get_queue_items(date_str: str | None = None) -> list[dict]:
 def _get_consumed_ts(slot: str) -> int:
     """Read the last-consumed timestamp for a slot from state.json."""
     try:
-        if config.STATE_FILE.exists():
-            state = json.loads(config.STATE_FILE.read_text())
-            return int(state.get(_STATE_KEY, {}).get(slot, 0))
+        state = load_json(config.STATE_FILE, {})
+        return int(state.get(_STATE_KEY, {}).get(slot, 0))
     except Exception:
         log.debug("Failed to read consumed ts for slot %s", slot, exc_info=True)
     return 0
@@ -113,18 +113,13 @@ def _get_consumed_ts(slot: str) -> int:
 def _set_consumed_ts(slot: str, ts_ms: int) -> None:
     """Update the high-water timestamp for a slot in state.json."""
     try:
-        config.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        state = (
-            json.loads(config.STATE_FILE.read_text())
-            if config.STATE_FILE.exists()
-            else {}
-        )
+        state = load_json(config.STATE_FILE, {})
         consumed = state.get(_STATE_KEY, {})
         if not isinstance(consumed, dict):
             consumed = {}
         consumed[slot] = ts_ms
         state[_STATE_KEY] = consumed
-        config.STATE_FILE.write_text(json.dumps(state, indent=2))
+        atomic_write_json(config.STATE_FILE, state)
     except OSError:
         log.debug("Failed to update consumed ts for slot %s", slot, exc_info=True)
 

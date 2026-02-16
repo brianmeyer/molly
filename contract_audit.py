@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import config
+import db_pool
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ def query_underperforming_skills(
     if not path.exists():
         return []
 
-    conn = sqlite3.connect(str(path))
+    conn = db_pool.sqlite_connect(str(path))
     conn.row_factory = sqlite3.Row
     try:
         tables = {

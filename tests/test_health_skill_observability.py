@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import config
+import db_pool
 import health
 
 
@@ -14,7 +15,7 @@ class TestHealthSkillObservability(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp(prefix="health-skill-observability-"))
         self.db_path = self.temp_dir / "mollygraph.sqlite"
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         conn.executescript(
             """
             CREATE TABLE skill_executions (
@@ -42,7 +43,7 @@ class TestHealthSkillObservability(unittest.TestCase):
         conn.close()
 
     def _insert_skill(self, outcome: str):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             """
@@ -56,7 +57,7 @@ class TestHealthSkillObservability(unittest.TestCase):
         conn.close()
 
     def _insert_tool_call(self, tool_name: str):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             """

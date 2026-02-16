@@ -4,7 +4,7 @@ Tools:
   calendar_list   (AUTO)    — List upcoming events for N days
   calendar_get    (AUTO)    — Get details of a specific event
   calendar_search (AUTO)    — Search events by query string
-  calendar_create (CONFIRM) — Create a new event
+  calendar_create (AUTO)    — Create a new event
   calendar_update (CONFIRM) — Modify an existing event
   calendar_delete (CONFIRM) — Delete an event
 """
