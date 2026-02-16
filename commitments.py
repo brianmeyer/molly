@@ -47,7 +47,7 @@ _VAGUE_FALLBACK_HOUR = 9  # 9 AM next day if past default hour
 
 _COMMITMENT_TITLE_PATTERNS = (
     re.compile(r"\bremind me to\s+(.+)$", flags=re.IGNORECASE),
-    re.compile(r"\bi['']?ll\s+(.+)$", flags=re.IGNORECASE),
+    re.compile(r"\bi['\u2018\u2019]?ll\s+(.+)$", flags=re.IGNORECASE),
     re.compile(r"\bi\s+(?:will|can|need to|have to|must)\s+(.+)$", flags=re.IGNORECASE),
     re.compile(r"\bfollow up(?:\s+with|\s+on)?\s+(.+)$", flags=re.IGNORECASE),
 )
