@@ -261,7 +261,7 @@ def _send_summary_to_owner(molly, summary_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main maintenance orchestrator — full 23-step sequence
+# Main maintenance orchestrator — full 22-step sequence
 # ---------------------------------------------------------------------------
 
 async def run_maintenance(molly=None) -> dict[str, Any]:
