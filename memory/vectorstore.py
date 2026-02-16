@@ -11,7 +11,6 @@ import threading
 import sqlite_vec
 
 import db_pool
-from memory.issue_registry import ensure_issue_registry_tables
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +20,86 @@ EMBEDDING_DIM = 768
 def _serialize_float32(vec: list[float]) -> bytes:
     """Pack a list of floats into a compact binary blob for sqlite-vec."""
     return struct.pack(f"{len(vec)}f", *vec)
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+    required_columns: dict[str, str],
+):
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = {str(row[1]) for row in rows}
+    for column, definition in required_columns.items():
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
+
+
+def ensure_issue_registry_tables(conn: sqlite3.Connection):
+    """Initialize maintenance issue tables used by monitoring/reporting."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS maintenance_issues (
+            fingerprint TEXT PRIMARY KEY,
+            check_id TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            status TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_detail TEXT,
+            source TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS maintenance_issue_events (
+            issue_fingerprint TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            payload TEXT
+        );
+        """
+    )
+    _ensure_columns(
+        conn,
+        "maintenance_issues",
+        {
+            "check_id": "TEXT NOT NULL DEFAULT ''",
+            "severity": "TEXT NOT NULL DEFAULT 'green'",
+            "status": "TEXT NOT NULL DEFAULT 'resolved'",
+            "first_seen": "TEXT NOT NULL DEFAULT ''",
+            "last_seen": "TEXT NOT NULL DEFAULT ''",
+            "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+            "last_detail": "TEXT",
+            "source": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "maintenance_issue_events",
+        {
+            "issue_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "event_type": "TEXT NOT NULL DEFAULT 'observed'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "payload": "TEXT",
+        },
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_issues_status "
+        "ON maintenance_issues(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_issues_last_seen "
+        "ON maintenance_issues(last_seen)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_issue_events_fingerprint "
+        "ON maintenance_issue_events(issue_fingerprint)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_issue_events_created_at "
+        "ON maintenance_issue_events(created_at)"
+    )
+    conn.commit()
 
 
 class VectorStore:

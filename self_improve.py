@@ -142,7 +142,7 @@ class SelfImprovementEngine:
         baseline_health = ""
 
         try:
-            from health import get_health_doctor
+            from monitoring import get_health_doctor
 
             doctor = get_health_doctor(self.molly)
             baseline_health = await asyncio.to_thread(
@@ -2208,7 +2208,7 @@ class SelfImprovementEngine:
             return {"loaded": 0, "last_run": "-", "failed": 0}
 
     def _latest_health_summary(self) -> str:
-        from health import get_health_doctor
+        from monitoring import get_health_doctor
 
         doctor = get_health_doctor(self.molly)
         path = doctor.latest_report_path()
@@ -3089,7 +3089,7 @@ class SelfImprovementEngine:
     async def _propose_automation_updates_from_patterns(self, patterns: list[dict[str, Any]]):
         if not patterns:
             return
-        from automations import propose_automation
+        from gateway import propose_automation
 
         selected = []
         for pattern in patterns:
@@ -4213,7 +4213,7 @@ class SelfImprovementEngine:
         if not config.HEALTH_POST_DEPLOY_CHECK:
             return None
         try:
-            from health import get_health_doctor
+            from monitoring import get_health_doctor
 
             doctor = get_health_doctor(self.molly)
             baseline_state = doctor.extract_status_map(baseline_health)

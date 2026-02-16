@@ -101,4 +101,11 @@ def create_app(molly) -> FastAPI:
         except Exception:
             log.error("WebSocket error for %s", session_key, exc_info=True)
 
+    try:
+        from gateway import attach_gateway_routes
+
+        attach_gateway_routes(app, molly)
+    except Exception:
+        log.debug("Gateway routes unavailable", exc_info=True)
+
     return app
