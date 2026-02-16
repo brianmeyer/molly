@@ -10,6 +10,7 @@ Do not add top-level imports from those modules.
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -60,8 +61,14 @@ def append_digest_item(
             "reason": (reason or "")[:200],
             "internal_ts_ms": internal_ts_ms,
         }
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        line = json.dumps(entry, ensure_ascii=True) + "\n"
+        # Use os.open with O_APPEND for POSIX-level atomicity on short lines.
+        # Reader (get_queue_items) handles partial lines gracefully.
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
     except OSError:
         log.debug("Failed to write email digest item", exc_info=True)
 

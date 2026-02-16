@@ -17,6 +17,10 @@ _driver = None
 _driver_lock = threading.Lock()
 _GRAPH_WRITE_LOCK: asyncio.Lock | None = None
 _GRAPH_WRITE_LOCK_LOOP_ID: int | None = None
+# threading.Lock for sync callers (ThreadPoolExecutor, direct calls).
+# asyncio.Lock only serializes async callers on the event loop; sync wrappers
+# called via asyncio.to_thread() bypass it entirely.
+_GRAPH_SYNC_WRITE_LOCK = threading.Lock()
 
 VALID_REL_TYPES = {
     "WORKS_ON", "WORKS_AT", "KNOWS", "USES", "LOCATED_IN",
@@ -162,7 +166,7 @@ def _upsert_entity_sync(
     # Check for existing match
     existing = find_matching_entity(name, entity_type)
 
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         if existing:
             # Merge into existing entity
             session.run(
@@ -229,7 +233,7 @@ def set_entity_properties(name: str, properties: dict) -> None:
     driver = get_driver()
     # Keys are validated by caller; values are parameterized.
     set_clauses = ", ".join(f"e.{k} = ${k}" for k in properties)
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         session.run(
             f"MATCH (e:Entity {{name: $name}}) SET {set_clauses}",
             name=name,
@@ -260,7 +264,7 @@ def _upsert_relationship_sync(
 
     snippet = context_snippet[:200]
 
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         # Dynamic relationship type requires a workaround since Cypher
         # doesn't allow parameterized relationship types.
         # Validated against whitelist above, so f-string is safe.
@@ -357,7 +361,7 @@ def _create_episode_sync(
     episode_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         session.run(
             """CREATE (ep:Episode {
                    id: $id,
@@ -573,7 +577,7 @@ def delete_entity(name: str) -> bool:
     driver = get_driver()
     normalized = _normalize(name)
 
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         result = session.run(
             """MATCH (e:Entity)
                WHERE toLower(e.name) = $name
@@ -595,7 +599,7 @@ def _run_strength_decay_sync() -> int:
     Returns the number of entities updated.
     """
     driver = get_driver()
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         result = session.run(
             """
             MATCH (e:Entity)
@@ -627,7 +631,7 @@ def _delete_orphan_entities_sync() -> int:
     Returns the number of entities deleted.
     """
     driver = get_driver()
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         result = session.run(
             """
             MATCH (e:Entity)
@@ -656,7 +660,7 @@ def delete_self_referencing_rels() -> int:
     Returns the number of relationships deleted.
     """
     driver = get_driver()
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         result = session.run(
             """
             MATCH (e:Entity)-[r]->(e)
@@ -676,7 +680,7 @@ def delete_blocklisted_entities(blocklist: set[str]) -> int:
     """
     driver = get_driver()
     names_lower = [n.lower() for n in blocklist]
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         result = session.run(
             """
             MATCH (e:Entity)
@@ -742,7 +746,7 @@ def set_relationship_audit_status(
     driver = get_driver()
     if rel_type not in VALID_REL_TYPES:
         return
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         session.run(
             f"""MATCH (h:Entity {{name: $head}})-[r:{rel_type}]->(t:Entity {{name: $tail}})
                 SET r.audit_status = $status""",
@@ -775,7 +779,7 @@ def reclassify_relationship(
     now = datetime.now(timezone.utc).isoformat()
     snippets = context_snippets or []
     first_ts = first_mentioned or now
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         with session.begin_transaction() as tx:
             tx.run(
                 f"""MATCH (h:Entity {{name: $head}})-[r:{old_type}]->(t:Entity {{name: $tail}})
@@ -820,7 +824,7 @@ def delete_specific_relationship(head: str, tail: str, rel_type: str) -> bool:
     driver = get_driver()
     if rel_type not in VALID_REL_TYPES:
         return False
-    with driver.session() as session:
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         result = session.run(
             f"""MATCH (h:Entity {{name: $head}})-[r:{rel_type}]->(t:Entity {{name: $tail}})
                 DELETE r

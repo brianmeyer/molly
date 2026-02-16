@@ -25,6 +25,7 @@ croniter
 numpy
 sentence-transformers
 sqlite-vec
+aiosqlite
 gliner2
 neo4j
 neo4j-rust-ext
