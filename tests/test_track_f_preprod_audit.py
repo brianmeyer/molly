@@ -7,7 +7,15 @@ from unittest.mock import patch
 
 import config
 import db_pool
-import health
+from monitoring.agents.track_f_preprod import (
+    _check_result,
+    _foundry_ingestion_health_check,
+    _parser_compatibility_check,
+    _promotion_drift_status_check,
+    _skill_telemetry_presence_check,
+    run_track_f_audit,
+)
+from monitoring.health import HealthDoctor
 
 
 def _seed_operational_tables(db_path: Path):
@@ -98,36 +106,29 @@ class TestTrackFPreprodAuditChecks(unittest.TestCase):
         self.health_dir = self.temp_root / "health"
         self.audit_dir = self.temp_root / "audits"
 
-    def _doctor(self) -> health.HealthDoctor:
-        return health.HealthDoctor()
-
     def test_parser_compatibility_is_green(self):
-        with patch.object(config, "HEALTH_REPORT_DIR", self.health_dir):
-            doctor = self._doctor()
-            check = doctor._track_f_parser_compatibility_check()
+        check = _parser_compatibility_check()
         self.assertEqual(check.status, "green")
 
     def test_skill_telemetry_missing_table_is_report_only_by_default(self):
-        with patch.object(config, "HEALTH_REPORT_DIR", self.health_dir), patch.object(
+        with patch.object(
             config, "MOLLYGRAPH_PATH", self.mollygraph
         ), patch.object(config, "TRACK_F_REPORT_ONLY", True), patch.object(
             config, "TRACK_F_ENFORCE_SKILL_TELEMETRY", False
         ):
-            doctor = self._doctor()
-            check = doctor._track_f_skill_telemetry_presence_check()
+            check = _skill_telemetry_presence_check()
 
         self.assertEqual(check.status, "yellow")
         self.assertFalse(check.action_required)
         self.assertIn("report-only", check.detail)
 
     def test_skill_telemetry_missing_table_can_be_hard_enforced(self):
-        with patch.object(config, "HEALTH_REPORT_DIR", self.health_dir), patch.object(
+        with patch.object(
             config, "MOLLYGRAPH_PATH", self.mollygraph
         ), patch.object(config, "TRACK_F_REPORT_ONLY", False), patch.object(
             config, "TRACK_F_ENFORCE_SKILL_TELEMETRY", True
         ):
-            doctor = self._doctor()
-            check = doctor._track_f_skill_telemetry_presence_check()
+            check = _skill_telemetry_presence_check()
 
         self.assertEqual(check.status, "red")
         self.assertTrue(check.action_required)
@@ -146,14 +147,13 @@ class TestTrackFPreprodAuditChecks(unittest.TestCase):
             ],
         )
 
-        with patch.object(config, "HEALTH_REPORT_DIR", self.health_dir), patch.object(
+        with patch.object(
             config, "MOLLYGRAPH_PATH", self.mollygraph
         ), patch.object(config, "TRACK_F_REPORT_ONLY", True), patch.object(
             config, "TRACK_F_ENFORCE_FOUNDRY_INGESTION", False
         ), patch.object(config, "TRACK_F_ENFORCE_PROMOTION_DRIFT", False):
-            doctor = self._doctor()
-            foundry = doctor._track_f_foundry_ingestion_health_check()
-            drift = doctor._track_f_promotion_drift_status_check()
+            foundry = _foundry_ingestion_health_check()
+            drift = _promotion_drift_status_check()
 
         self.assertEqual(foundry.status, "green")
         self.assertEqual(drift.status, "green")
@@ -176,8 +176,7 @@ class TestTrackFPreprodAuditChecks(unittest.TestCase):
         with patch.object(config, "HEALTH_REPORT_DIR", self.health_dir), patch.object(
             config, "TRACK_F_AUDIT_DIR", self.audit_dir
         ), patch.object(config, "MOLLYGRAPH_PATH", self.mollygraph):
-            doctor = self._doctor()
-            report_path = doctor.run_track_f_preprod_audit()
+            report_path = run_track_f_audit()
 
         self.assertTrue(report_path.exists())
         text = report_path.read_text()

@@ -1,10 +1,12 @@
-"""Compatibility shim for legacy trigger classes.
+"""Backward-compatible re-exports from automation_triggers_legacy.
 
-Gateway scheduling now lives in ``gateway.py``.
+All trigger implementations live in automation_triggers_legacy.py.
+This module provides ``from automation_triggers import ...`` compatibility.
 """
 
-import importlib
-import sys
-
-_legacy = importlib.import_module("automation_triggers_legacy")
-sys.modules[__name__] = _legacy
+from automation_triggers_legacy import *  # noqa: F401,F403
+from automation_triggers_legacy import (  # noqa: F401
+    BaseTrigger,
+    EmailTrigger,
+    create_trigger,
+)
