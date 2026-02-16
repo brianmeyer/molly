@@ -399,6 +399,12 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
             nonlocal weekly_due, weekly_result
             from monitoring.jobs.self_improve_jobs import run_weekly_assessment
             now_local = datetime.now(ZoneInfo(config.TIMEZONE))
+            # Assume due before the fallible await.  If run_weekly_assessment
+            # returns ran=False ("not due"), we reset.  If it raises, the
+            # step is recorded as failed *and* weekly_due stays True so
+            # contract audits correctly see "was due but execution failed"
+            # rather than silently treating it as "not due".
+            weekly_due = True
             ran, desc = await run_weekly_assessment(await _ensure_improver(), now_local)
             weekly_due = ran
             weekly_result = desc
