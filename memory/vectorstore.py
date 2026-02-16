@@ -10,6 +10,7 @@ import threading
 
 import sqlite_vec
 
+import db_pool
 from memory.issue_registry import ensure_issue_registry_tables
 
 log = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ class VectorStore:
 
     def initialize(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(
+        self.conn = db_pool.sqlite_connect(
             str(self.db_path),
             check_same_thread=False,
         )

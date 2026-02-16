@@ -3,7 +3,7 @@
 Tools:
   tasks_list       (AUTO)    — List task lists
   tasks_list_tasks (AUTO)    — List tasks in a task list
-  tasks_create     (CONFIRM) — Create a new task
+  tasks_create     (AUTO)    — Create a new task
   tasks_complete   (CONFIRM) — Mark task as completed
   tasks_delete     (CONFIRM) — Delete a task
 """

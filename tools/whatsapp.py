@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
+import db_pool
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ log = logging.getLogger(__name__)
 def _connect() -> sqlite3.Connection:
     """Open a read-only connection to the WhatsApp message database."""
     uri = f"file:{config.DATABASE_PATH}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    conn = db_pool.sqlite_connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 

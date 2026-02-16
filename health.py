@@ -13,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config
+import db_pool
 from health_remediation import route_health_signal
 from memory.issue_registry import (
     append_issue_event,
@@ -20,6 +21,7 @@ from memory.issue_registry import (
     should_notify,
     upsert_issue,
 )
+from utils import normalize_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +47,6 @@ _STATUS_SEVERITY = {
     "yellow": 1,
     "red": 2,
 }
-_NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 HEALTH_NOTIFY_COOLDOWN_HOURS = max(
     1,
     int(os.getenv("MOLLY_HEALTH_NOTIFY_COOLDOWN_HOURS", "24")),
@@ -77,29 +78,14 @@ def _now_local() -> datetime:
 
 
 def _parse_iso(value: str) -> datetime | None:
-    if not value:
+    raw = str(value or "").strip()
+    if not raw:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        normalized = normalize_timestamp(raw)
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError:
-        raw = value.strip()
-        if not _NUMERIC_TS_RE.fullmatch(raw):
-            return None
-        try:
-            numeric = float(raw)
-        except ValueError:
-            return None
-        abs_value = abs(numeric)
-        if abs_value >= 1e17:
-            numeric /= 1_000_000_000  # nanoseconds -> seconds
-        elif abs_value >= 1e14:
-            numeric /= 1_000_000  # microseconds -> seconds
-        elif abs_value >= 1e11:
-            numeric /= 1_000  # milliseconds -> seconds
-        try:
-            return datetime.fromtimestamp(numeric, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
+        return None
 
 
 def _short_ts(value: str) -> str:
@@ -294,8 +280,6 @@ class HealthDoctor:
         )
 
     def _track_f_parser_compatibility_check(self) -> HealthCheck:
-        from database import normalize_timestamp
-
         base = 1770598413
         variants = {
             "seconds": str(base),
@@ -341,7 +325,7 @@ class HealthDoctor:
             "created_at",
         }
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             try:
                 if not self._sqlite_table_exists(conn, "skill_executions"):
                     return self._track_f_check_result(
@@ -401,7 +385,7 @@ class HealthDoctor:
         required_columns = {"id", "event_type", "category", "title", "status", "created_at"}
         categories = ("skill", "tool", "core")
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             try:
                 if not self._sqlite_table_exists(conn, "self_improvement_events"):
                     return self._track_f_check_result(
@@ -506,7 +490,7 @@ class HealthDoctor:
     def _track_f_promotion_drift_status_check(self) -> HealthCheck:
         categories = ("skill", "tool", "core")
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             try:
                 if not self._sqlite_table_exists(conn, "self_improvement_events"):
                     return self._track_f_check_result(
@@ -802,7 +786,7 @@ class HealthDoctor:
 
         conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             ensure_issue_registry_tables(conn)
             observed_at = datetime.now(timezone.utc).isoformat()
 
@@ -1770,7 +1754,7 @@ class HealthDoctor:
 
     def _source_distribution(self, cutoff: str) -> tuple[str, str]:
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             cur = conn.execute(
                 """
                 SELECT source, COUNT(*) AS c
@@ -1796,7 +1780,7 @@ class HealthDoctor:
 
     def _timestamp_format_check(self) -> tuple[str, str]:
         try:
-            conn = sqlite3.connect(str(config.DATABASE_PATH))
+            conn = db_pool.sqlite_connect(str(config.DATABASE_PATH))
             cur = conn.execute(
                 "SELECT timestamp FROM messages ORDER BY timestamp DESC LIMIT 5"
             )
@@ -1822,7 +1806,7 @@ class HealthDoctor:
         )
 
     def _preference_table_writable(self) -> tuple[str, str]:
-        conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+        conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
         try:
             conn.execute("BEGIN")
             signal_id = str(uuid.uuid4())
@@ -1942,7 +1926,7 @@ class HealthDoctor:
 
     def _chunk_retention_check(self) -> tuple[str, str]:
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             row = conn.execute(
                 "SELECT MIN(created_at), MAX(created_at), COUNT(*) FROM conversation_chunks"
             ).fetchone()
@@ -2134,7 +2118,7 @@ class HealthDoctor:
 
     def _rejected_resubmission_check(self) -> tuple[str, str]:
         try:
-            conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+            conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             rows = conn.execute(
                 """
                 SELECT title, status, created_at
@@ -2165,7 +2149,7 @@ class HealthDoctor:
 
     def _count_rows(self, db_path: Path, sql: str, params: tuple[Any, ...] = ()) -> int:
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = db_pool.sqlite_connect(str(db_path))
             value = conn.execute(sql, params).fetchone()[0]
             conn.close()
             return int(value or 0)

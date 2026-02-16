@@ -14,6 +14,7 @@ class TestHeartbeatSkillHotReload(unittest.IsolatedAsyncioTestCase):
     async def test_run_heartbeat_checks_hot_reload_each_cycle(self):
         heartbeat._skill_reload_count = 0
         molly = MagicMock()
+        molly.cancel_event = None
         molly._get_owner_dm_jid.return_value = None
 
         with patch("heartbeat._check_imessages", new=AsyncMock()) as mock_imessages, patch(

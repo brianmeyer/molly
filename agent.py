@@ -5,7 +5,8 @@ import logging
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from claude_agent_sdk import (
     AgentDefinition,
@@ -44,6 +45,7 @@ _MCP_SERVER_SPECS = {
     "whatsapp-history": ("tools.whatsapp", "whatsapp_server"),
     "kimi": ("tools.kimi", "kimi_server"),
     "grok": ("tools.grok", "grok_server"),
+    "groq": ("tools.groq", "groq_server"),
 }
 
 _MCP_SERVER_TOOL_NAMES = {
@@ -63,6 +65,7 @@ _MCP_SERVER_TOOL_NAMES = {
     "whatsapp-history": {"whatsapp_search"},
     "kimi": {"kimi_research"},
     "grok": {"grok_reason"},
+    "groq": {"groq_reason"},
 }
 
 _CHAT_RUNTIME_LOCK = asyncio.Lock()
@@ -77,6 +80,7 @@ _SKILL_GAP_BASELINE_SUFFIXES = (
     ":memory_search",
     ".memory_search",
 )
+_AUTO_CREATE_NOTIFY_TOOLS = {"calendar_create", "tasks_create"}
 
 
 @dataclass
@@ -303,6 +307,18 @@ def _record_turn_tool_call(
     request_state.turn_tool_calls.append(name)
 
 
+def _record_executed_tool_call(
+    request_state: RequestApprovalState | None,
+    tool_name: str,
+):
+    if request_state is None:
+        return
+    name = str(tool_name or "").strip()
+    if not name:
+        return
+    request_state.executed_tool_calls.append(name)
+
+
 def _is_excluded_skill_gap_tool(tool_name: str) -> bool:
     name = str(tool_name or "").strip().lower()
     if not name:
@@ -456,6 +472,16 @@ def _build_turn_prompt(
     response_guidance: str | None,
 ) -> str:
     sections: list[str] = []
+
+    # Always inject current date/time in Brian's timezone so the agent never
+    # has to guess "today" from UTC message timestamps.  (BUG-27 root cause fix)
+    try:
+        now_local = datetime.now(ZoneInfo(config.TIMEZONE))
+        date_line = now_local.strftime("Current date/time: %A, %B %d, %Y %I:%M %p %Z")
+        sections.append(date_line)
+    except Exception:
+        pass  # degrade gracefully — don't block the turn
+
     if memory_context:
         sections.append(f"Relevant memory:\n{memory_context}")
     if skill_context:
@@ -535,12 +561,74 @@ def _handle_sdk_stderr(line: str):
     log.warning("Claude CLI stderr: %s", msg[:500])
 
 
+def _is_cross_task_cancel_scope_error(exc: BaseException) -> bool:
+    """AnyIO raises this when query.close() runs in a different asyncio task."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return "cancel scope" in message and "different task" in message
+
+
 async def _disconnect_runtime(runtime: _ChatRuntime):
     if runtime.client is None:
         return
-    with suppress(Exception):
-        await runtime.client.disconnect()
-    runtime.client = None
+    client = runtime.client
+    runtime.client = None  # clear ref first so retries don't reuse a broken client
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=5.0)
+    except asyncio.TimeoutError:
+        log.warning("Claude SDK disconnect timed out — killing subprocess")
+        _force_kill_sdk_client(client)
+    except RuntimeError as exc:
+        if _is_cross_task_cancel_scope_error(exc):
+            # Expected when rotating a runtime across handler tasks.
+            log.info("Claude SDK disconnect crossed task boundary; forcing transport shutdown")
+            await _force_close_sdk_transport(client)
+            _force_kill_sdk_client(client)
+            return
+        log.warning("Claude SDK disconnect failed — killing subprocess", exc_info=True)
+        _force_kill_sdk_client(client)
+    except Exception:
+        log.warning("Claude SDK disconnect failed — killing subprocess", exc_info=True)
+        _force_kill_sdk_client(client)
+
+
+async def _force_close_sdk_transport(client: ClaudeSDKClient):
+    """Best-effort close for SDK transport when query.close() can't run safely."""
+    transport = getattr(client, "_transport", None)
+    if transport is None:
+        query = getattr(client, "_query", None)
+        transport = getattr(query, "transport", None) if query is not None else None
+    if transport is None:
+        return
+
+    try:
+        await asyncio.wait_for(transport.close(), timeout=2.0)
+    except Exception:
+        log.debug("Could not close Claude SDK transport in fallback path", exc_info=True)
+    finally:
+        with suppress(Exception):
+            setattr(client, "_query", None)
+        with suppress(Exception):
+            setattr(client, "_transport", None)
+
+
+def _force_kill_sdk_client(client: ClaudeSDKClient):
+    """Best-effort kill of the underlying SDK subprocess to prevent zombies."""
+    try:
+        proc = getattr(client, "_process", None) or getattr(client, "process", None)
+        if proc is None:
+            transport = getattr(client, "_transport", None)
+            proc = getattr(transport, "_process", None) if transport is not None else None
+        if proc is None:
+            query = getattr(client, "_query", None)
+            transport = getattr(query, "transport", None) if query is not None else None
+            proc = getattr(transport, "_process", None) if transport is not None else None
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            proc.kill()
+            log.info("Force-killed lingering Claude SDK subprocess (pid=%s)", getattr(proc, "pid", "?"))
+    except Exception:
+        log.debug("Could not force-kill SDK subprocess", exc_info=True)
 
 
 async def _ensure_connected_runtime(
@@ -566,6 +654,23 @@ async def _ensure_connected_runtime(
         )
         return await checker(tool_name, tool_input, context)
 
+    async def _on_post_tool_use(input, tool_use_id, context):
+        if not isinstance(input, dict):
+            return {"continue_": True}
+        tool_name = _normalize_tool_name(str(input.get("tool_name", "")))
+        tool_input = input.get("tool_input", {})
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        _record_executed_tool_call(runtime.request_state, tool_name)
+        _maybe_notify_auto_created(
+            runtime=runtime,
+            chat_id=chat_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_response=input.get("tool_response"),
+        )
+        return {"continue_": True}
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=config.CLAUDE_MODEL,
@@ -574,6 +679,7 @@ async def _ensure_connected_runtime(
         hooks={
             "SubagentStart": [HookMatcher(hooks=[_on_subagent_start])],
             "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],
+            "PostToolUse": [HookMatcher(hooks=[_on_post_tool_use])],
         },
         mcp_servers=_load_mcp_servers(),
         cwd=str(config.WORKSPACE),
@@ -731,6 +837,27 @@ async def _on_subagent_stop(input, tool_use_id, context):
     return {"continue_": True}
 
 
+def _maybe_notify_auto_created(
+    runtime: _ChatRuntime,
+    chat_id: str,
+    tool_name: str,
+    tool_input: dict,
+    tool_response,
+):
+    if tool_name not in _AUTO_CREATE_NOTIFY_TOOLS:
+        return
+    molly = runtime.molly_instance
+    if not molly:
+        return
+    notifier = getattr(molly, "notify_auto_created_tool_result", None)
+    if not callable(notifier):
+        return
+    try:
+        notifier(chat_id, tool_name, tool_input, tool_response)
+    except Exception:
+        log.warning("Auto-create notification failed for %s", tool_name, exc_info=True)
+
+
 async def handle_message(
     user_message: str,
     chat_id: str,
@@ -870,12 +997,18 @@ async def handle_message(
         trigger = f"{source}:{user_message}"
         _schedule_skill_execution_logs(matched_skills, trigger=trigger, outcome=outcome, detail=detail)
 
-    # Best-effort: write foundry observation for multi-step tool sequences
-    if request_state and len(request_state.turn_tool_calls) >= 3:
+    # Best-effort: write foundry observation for multi-step executed tool sequences
+    executed_calls: list[str] = []
+    if request_state:
+        executed_calls = list(request_state.executed_tool_calls)
+        if not executed_calls:
+            executed_calls = list(request_state.turn_tool_calls)
+
+    if len(executed_calls) >= 3:
         try:
             from foundry_adapter import write_observation
             write_observation(
-                tool_sequence=request_state.turn_tool_calls,
+                tool_sequence=executed_calls,
                 outcome="success" if query_succeeded else "failure",
                 context=user_message[:200],
             )

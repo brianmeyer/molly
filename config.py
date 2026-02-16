@@ -95,6 +95,11 @@ AUTOMATION_PROPOSAL_COOLDOWN = int(os.getenv("MOLLY_AUTOMATION_PROPOSAL_COOLDOWN
 AUTOMATION_MIN_PATTERN_COUNT = int(os.getenv("MOLLY_AUTOMATION_MIN_PATTERN_COUNT", "3"))
 EMAIL_TRIAGE_INTERVAL = int(os.getenv("MOLLY_EMAIL_TRIAGE_INTERVAL", "600"))
 
+# Feature flags — kill switches for proactive automation (V3 safety).
+# Keep OFF by default until dedup + undo are verified in production-like tests.
+AUTO_CALENDAR_EXTRACTION_ENABLED = False
+AUTO_TASK_EXTRACTION_ENABLED = False
+
 # Paths
 PROJECT_ROOT = Path(__file__).parent
 STORE_DIR = PROJECT_ROOT / "store"
@@ -103,6 +108,7 @@ WORKSPACE = Path(os.getenv("MOLLY_WORKSPACE", Path.home() / ".molly" / "workspac
 LOG_DIR = Path.home() / ".molly" / "logs"
 AUTOMATIONS_DIR = WORKSPACE / "automations"
 SANDBOX_DIR = WORKSPACE / "sandbox"
+WORKSPACE_STORE_DIR = WORKSPACE / "store"
 
 # Files
 DATABASE_PATH = STORE_DIR / "messages.db"
@@ -112,6 +118,10 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 REGISTERED_CHATS_FILE = DATA_DIR / "registered_chats.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTOMATIONS_STATE_FILE = AUTOMATIONS_DIR / "state.json"
+UNDO_MAP_FILE = DATA_DIR / "undo_map.json"
+MAINTENANCE_STATE_FILE = WORKSPACE_STORE_DIR / "maintenance_state.json"
+HEARTBEAT_CHECKPOINT_FILE = WORKSPACE_STORE_DIR / "heartbeat_checkpoint.json"
+RELATION_SCHEMA_FILE = WORKSPACE / "config" / "relation_schema.yaml"
 
 # Identity files (loaded every turn)
 IDENTITY_FILES = [
@@ -204,12 +214,12 @@ ACTION_TIERS = {
         # Read-only, local, safe — execute immediately
         "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
         # Google read-only (Phase 3B)
-        "calendar_list", "calendar_get", "calendar_search",
+        "calendar_list", "calendar_get", "calendar_search", "calendar_create",
         "gmail_search", "gmail_read",
         # Google People (read-only)
         "people_search", "people_get", "people_list",
-        # Google Tasks (read-only)
-        "tasks_list", "tasks_list_tasks",
+        # Google Tasks (read + create)
+        "tasks_list", "tasks_list_tasks", "tasks_create",
         # Google Drive (read-only)
         "drive_search", "drive_get", "drive_read",
         # Google Meet (read-only)
@@ -220,7 +230,7 @@ ACTION_TIERS = {
         # WhatsApp history (Phase 4)
         "whatsapp_search",
         # External models (Phase 5)
-        "kimi_research", "grok_reason",
+        "kimi_research", "grok_reason", "groq_reason",
     },
     "CONFIRM": {
         # Shell access — requires Brian's approval
@@ -229,9 +239,9 @@ ACTION_TIERS = {
         "Write", "Edit",
         # Google writes (Phase 3B)
         "gmail_send", "gmail_draft", "gmail_reply",
-        "calendar_create", "calendar_update", "calendar_delete",
+        "calendar_update", "calendar_delete",
         # Google Tasks writes
-        "tasks_create", "tasks_complete", "tasks_delete",
+        "tasks_complete", "tasks_delete",
         # Apple MCP tools (mixed read/write operations)
         "reminders", "notes", "messages", "mail", "calendar", "maps",
     },
@@ -276,6 +286,8 @@ MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
 MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 XAI_BASE_URL = "https://api.x.ai/v1"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv(
     "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"

@@ -6,11 +6,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import config
+import db_pool
 import health
 
 
 def _seed_operational_tables(db_path: Path):
-    conn = sqlite3.connect(str(db_path))
+    conn = db_pool.sqlite_connect(str(db_path))
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS skill_executions (
@@ -43,7 +44,7 @@ def _seed_operational_tables(db_path: Path):
 
 
 def _insert_skill_execution(db_path: Path, created_at: str):
-    conn = sqlite3.connect(str(db_path))
+    conn = db_pool.sqlite_connect(str(db_path))
     conn.execute(
         """
         INSERT INTO skill_executions
@@ -57,7 +58,7 @@ def _insert_skill_execution(db_path: Path, created_at: str):
 
 
 def _insert_self_improvement_events(db_path: Path, rows: list[tuple[str, str]]):
-    conn = sqlite3.connect(str(db_path))
+    conn = db_pool.sqlite_connect(str(db_path))
     now = datetime.now(timezone.utc).isoformat()
     for idx, (category, status) in enumerate(rows, start=1):
         conn.execute(

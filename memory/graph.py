@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import threading
@@ -14,6 +15,8 @@ log = logging.getLogger(__name__)
 
 _driver = None
 _driver_lock = threading.Lock()
+_GRAPH_WRITE_LOCK: asyncio.Lock | None = None
+_GRAPH_WRITE_LOCK_LOOP_ID: int | None = None
 
 VALID_REL_TYPES = {
     "WORKS_ON", "WORKS_AT", "KNOWS", "USES", "LOCATED_IN",
@@ -24,6 +27,16 @@ VALID_REL_TYPES = {
     "CONTACT_OF",
     "CUSTOMER_OF", "ATTENDS", "PARENT_OF", "CHILD_OF", "RECEIVED_FROM",
 }
+
+
+def _get_graph_write_lock() -> asyncio.Lock:
+    global _GRAPH_WRITE_LOCK, _GRAPH_WRITE_LOCK_LOOP_ID
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    if _GRAPH_WRITE_LOCK is None or _GRAPH_WRITE_LOCK_LOOP_ID != loop_id:
+        _GRAPH_WRITE_LOCK = asyncio.Lock()
+        _GRAPH_WRITE_LOCK_LOOP_ID = loop_id
+    return _GRAPH_WRITE_LOCK
 
 
 # --- Driver management ---
@@ -137,7 +150,7 @@ def find_matching_entity(
 # --- Entity CRUD ---
 
 
-def upsert_entity(
+def _upsert_entity_sync(
     name: str,
     entity_type: str,
     confidence: float,
@@ -192,6 +205,23 @@ def upsert_entity(
             return name.strip()
 
 
+def upsert_entity_sync(
+    name: str,
+    entity_type: str,
+    confidence: float,
+) -> str:
+    return _upsert_entity_sync(name, entity_type, confidence)
+
+
+async def upsert_entity(
+    name: str,
+    entity_type: str,
+    confidence: float,
+) -> str:
+    async with _get_graph_write_lock():
+        return await asyncio.to_thread(_upsert_entity_sync, name, entity_type, confidence)
+
+
 def set_entity_properties(name: str, properties: dict) -> None:
     """Set properties on an existing entity node."""
     if not properties:
@@ -207,7 +237,7 @@ def set_entity_properties(name: str, properties: dict) -> None:
         )
 
 
-def upsert_relationship(
+def _upsert_relationship_sync(
     head_name: str,
     tail_name: str,
     rel_type: str,
@@ -283,7 +313,41 @@ def upsert_relationship(
                 log.debug("graph suggestion hotspot logging failed", exc_info=True)
 
 
-def create_episode(
+def upsert_relationship_sync(
+    head_name: str,
+    tail_name: str,
+    rel_type: str,
+    confidence: float,
+    context_snippet: str = "",
+) -> None:
+    _upsert_relationship_sync(
+        head_name=head_name,
+        tail_name=tail_name,
+        rel_type=rel_type,
+        confidence=confidence,
+        context_snippet=context_snippet,
+    )
+
+
+async def upsert_relationship(
+    head_name: str,
+    tail_name: str,
+    rel_type: str,
+    confidence: float,
+    context_snippet: str = "",
+) -> None:
+    async with _get_graph_write_lock():
+        await asyncio.to_thread(
+            _upsert_relationship_sync,
+            head_name,
+            tail_name,
+            rel_type,
+            confidence,
+            context_snippet,
+        )
+
+
+def _create_episode_sync(
     content_preview: str,
     source: str,
     entity_names: list[str],
@@ -320,6 +384,23 @@ def create_episode(
             )
 
     return episode_id
+
+
+def create_episode_sync(
+    content_preview: str,
+    source: str,
+    entity_names: list[str],
+) -> str:
+    return _create_episode_sync(content_preview, source, entity_names)
+
+
+async def create_episode(
+    content_preview: str,
+    source: str,
+    entity_names: list[str],
+) -> str:
+    async with _get_graph_write_lock():
+        return await asyncio.to_thread(_create_episode_sync, content_preview, source, entity_names)
 
 
 # --- Retrieval ---
@@ -508,7 +589,7 @@ def delete_entity(name: str) -> bool:
 # --- Maintenance ---
 
 
-def run_strength_decay() -> int:
+def _run_strength_decay_sync() -> int:
     """Recalculate strength for all entities based on mentions * recency decay.
 
     Returns the number of entities updated.
@@ -531,7 +612,16 @@ def run_strength_decay() -> int:
         return updated
 
 
-def delete_orphan_entities() -> int:
+def run_strength_decay_sync() -> int:
+    return _run_strength_decay_sync()
+
+
+async def run_strength_decay() -> int:
+    async with _get_graph_write_lock():
+        return await asyncio.to_thread(_run_strength_decay_sync)
+
+
+def _delete_orphan_entities_sync() -> int:
     """Delete entities with zero relationships (no MENTIONS from episodes either counts).
 
     Returns the number of entities deleted.
@@ -549,6 +639,15 @@ def delete_orphan_entities() -> int:
         deleted = result.single()["deleted"]
         log.info("Deleted %d orphan entities", deleted)
         return deleted
+
+
+def delete_orphan_entities_sync() -> int:
+    return _delete_orphan_entities_sync()
+
+
+async def delete_orphan_entities() -> int:
+    async with _get_graph_write_lock():
+        return await asyncio.to_thread(_delete_orphan_entities_sync)
 
 
 def delete_self_referencing_rels() -> int:

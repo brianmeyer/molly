@@ -13,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config
+import db_pool
 from contract_audit import run_contract_audits
 from health_remediation import route_health_signal
 from memory.issue_registry import (
@@ -21,6 +22,7 @@ from memory.issue_registry import (
     should_notify,
     upsert_issue,
 )
+from utils import atomic_write, atomic_write_json, load_json, normalize_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +60,60 @@ class MaintenanceRunState:
 _MAINTENANCE_LOCK: asyncio.Lock | None = None
 _MAINTENANCE_LOCK_LOOP_ID: int | None = None
 _RUN_STATE = MaintenanceRunState()
+
+
+def _maintenance_checkpoint_scope() -> str:
+    """Stable scope key so checkpoints don't leak across different maintenance dirs."""
+    try:
+        return str(MAINTENANCE_DIR.resolve())
+    except Exception:
+        return str(MAINTENANCE_DIR)
+
+
+def _load_maintenance_checkpoint(run_date: str) -> set[int]:
+    payload = load_json(config.MAINTENANCE_STATE_FILE, {})
+    if not isinstance(payload, dict):
+        return set()
+    if str(payload.get("run_date", "")) != run_date:
+        return set()
+    if str(payload.get("maintenance_dir", "")) != _maintenance_checkpoint_scope():
+        return set()
+    completed: set[int] = set()
+    for value in payload.get("completed_steps", []):
+        try:
+            completed.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return completed
+
+
+def _save_maintenance_checkpoint(run_date: str, completed_steps: set[int]) -> None:
+    atomic_write_json(
+        config.MAINTENANCE_STATE_FILE,
+        {
+            "run_date": run_date,
+            "completed_steps": sorted(completed_steps),
+            "maintenance_dir": _maintenance_checkpoint_scope(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _mark_maintenance_step_completed(run_date: str, completed_steps: set[int], step_no: int) -> None:
+    completed_steps.add(int(step_no))
+    _save_maintenance_checkpoint(run_date, completed_steps)
+
+
+def _clear_maintenance_checkpoint() -> None:
+    atomic_write_json(
+        config.MAINTENANCE_STATE_FILE,
+        {
+            "run_date": "",
+            "completed_steps": [],
+            "maintenance_dir": _maintenance_checkpoint_scope(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def get_maintenance_run_state() -> dict[str, Any]:
@@ -277,7 +333,7 @@ def _prune_health_log():
 
     new_content = "\n".join(kept)
     if new_content != content:
-        HEALTH_LOG_PATH.write_text(new_content)
+        atomic_write(HEALTH_LOG_PATH, new_content)
         log.debug("Pruned health log entries older than %s", cutoff)
 
 
@@ -319,9 +375,13 @@ def write_health_check():
 
     report = run_health_check()
 
-    # Append to rolling log
-    with open(HEALTH_LOG_PATH, "a") as f:
-        f.write(report)
+    existing = ""
+    if HEALTH_LOG_PATH.exists():
+        try:
+            existing = HEALTH_LOG_PATH.read_text()
+        except Exception:
+            existing = ""
+    atomic_write(HEALTH_LOG_PATH, existing + report)
 
     # Prune entries older than 7 days
     _prune_health_log()
@@ -382,10 +442,10 @@ def _compute_operational_insights() -> dict:
     }
 
 
-def _run_strength_decay() -> int:
+async def _run_strength_decay() -> int:
     """Task 1: Recalculate strength for all entities."""
     from memory.graph import run_strength_decay
-    return run_strength_decay()
+    return await run_strength_decay()
 
 
 def _run_dedup_sweep() -> int:
@@ -574,7 +634,8 @@ def _parse_iso_date(value: str) -> date | None:
     if not text:
         return None
     try:
-        return date.fromisoformat(text[:10])
+        normalized = normalize_timestamp(text)
+        return date.fromisoformat(normalized[:10])
     except ValueError:
         return None
 
@@ -625,7 +686,7 @@ def _record_maintenance_issues(
     synced = 0
     notified = 0
     try:
-        conn = sqlite3.connect(str(config.MOLLYGRAPH_PATH))
+        conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
         try:
             ensure_issue_registry_tables(conn)
             now = datetime.now(timezone.utc).isoformat()
@@ -700,21 +761,54 @@ def _build_maintenance_report(
     return "\n".join(lines)
 
 
+def _send_summary_to_owner(molly, summary_text: str) -> bool:
+    """Best-effort immediate WhatsApp send for manual daytime maintenance runs."""
+    if not molly:
+        return False
+    wa = getattr(molly, "wa", None)
+    if wa is None:
+        return False
+    owner_getter = getattr(molly, "_get_owner_dm_jid", None)
+    if not callable(owner_getter):
+        return False
+    owner_jid = owner_getter()
+    if not owner_jid:
+        return False
+    try:
+        send_result = wa.send_message(owner_jid, summary_text)
+        tracker = getattr(molly, "_track_send", None)
+        if callable(tracker):
+            tracker(send_result)
+        return bool(send_result)
+    except Exception:
+        log.debug("Failed sending immediate maintenance summary to owner", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Opus analysis pass (text-only, no tools)
 # ---------------------------------------------------------------------------
 
 ANALYSIS_SYSTEM_PROMPT = """\
 You are Molly's maintenance analyst. Review the maintenance report and graph data below.
-Produce a brief analysis with:
+Produce TWO sections separated by the exact marker `---WHATSAPP---`:
 
-1. **Summary**: Key observations about the knowledge graph health.
-2. **New insights**: Any patterns, clusters, or notable entities from today.
-3. **MEMORY.md update**: A dated section to append to MEMORY.md with the most important
-   facts learned today. Format: `## {date}` followed by bullet points. Only include
-   genuinely important, durable facts — skip noise and ephemeral details.
+SECTION 1 — MEMORY.md update:
+A dated section to append to MEMORY.md. Format: `## {date}` followed by bullet points.
+Only include genuinely important, durable facts — skip noise and ephemeral details.
 
-Be concise. Output ONLY the MEMORY.md section (starting with ## {date}).
+---WHATSAPP---
+
+SECTION 2 — WhatsApp maintenance summary:
+A comprehensive but concise summary of tonight's maintenance for Brian.
+Use WhatsApp formatting (*bold*, bullets with -).
+Include: graph health (entity/relationship counts and deltas), dedup merges,
+relationship audit results (Tier 1 flags, Tier 2 Kimi outcomes),
+GLiNER training progress, any failures or anomalies, and key insights.
+Keep it under 500 words. Make it scannable — Brian reads this on his phone.
+Do NOT include raw task results or status codes. Synthesize.
+
+Output both sections with the ---WHATSAPP--- marker between them.
 """
 
 
@@ -777,11 +871,13 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
 
     async with lock:
         today = date.today().isoformat()
+        completed_steps = _load_maintenance_checkpoint(today)
         run_id = uuid.uuid4().hex
         report_path = MAINTENANCE_DIR / f"{today}.md"
         results: dict[str, str] = {}
         failed_steps: list[str] = []
         analysis_text = ""
+        whatsapp_summary = ""
         improver = None
         weekly_due = False
         weekly_result = "not evaluated"
@@ -814,6 +910,15 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 await improver.initialize()
             return improver
 
+        def _step_is_done(step_no: int, step_name: str) -> bool:
+            if step_no in completed_steps:
+                _record_step(step_name, "skipped (checkpoint resume)")
+                return True
+            return False
+
+        def _finalize_step(step_no: int) -> None:
+            _mark_maintenance_step_completed(today, completed_steps, step_no)
+
         _RUN_STATE.status = "running"
         _RUN_STATE.run_id = run_id
         _RUN_STATE.started_at = datetime.now(timezone.utc).isoformat()
@@ -825,421 +930,517 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
         MAINTENANCE_DIR.mkdir(parents=True, exist_ok=True)
 
         log.info("Starting nightly maintenance run_id=%s for %s", run_id, today)
+        if completed_steps:
+            log.info(
+                "Resuming maintenance from checkpoint for %s (completed steps=%s)",
+                today,
+                sorted(completed_steps),
+            )
 
         try:
             # Step 1: Programmatic health check
-            try:
-                write_health_check()
-                _record_step("Health check", "completed")
-            except Exception:
-                log.error("Health check failed", exc_info=True)
-                _record_step("Health check", "failed", failed=True)
+            if not _step_is_done(1, "Health check"):
+                try:
+                    write_health_check()
+                    _record_step("Health check", "completed")
+                except Exception:
+                    log.error("Health check failed", exc_info=True)
+                    _record_step("Health check", "failed", failed=True)
+                finally:
+                    _finalize_step(1)
 
             # Step 2: Strength decay
-            try:
-                updated = _run_strength_decay()
-                _record_step("Strength decay", f"{updated} entities updated")
-            except Exception:
-                log.error("Strength decay failed", exc_info=True)
-                _record_step("Strength decay", "failed", failed=True)
+            if not _step_is_done(2, "Strength decay"):
+                try:
+                    updated = await _run_strength_decay()
+                    _record_step("Strength decay", f"{updated} entities updated")
+                except Exception:
+                    log.error("Strength decay failed", exc_info=True)
+                    _record_step("Strength decay", "failed", failed=True)
+                finally:
+                    _finalize_step(2)
 
             # Step 3: Deduplication sweep
-            try:
-                merged = _run_dedup_sweep()
-                _record_step("Deduplication", f"{merged} entities merged")
-            except Exception:
-                log.error("Dedup sweep failed", exc_info=True)
-                _record_step("Deduplication", "failed", failed=True)
+            if not _step_is_done(3, "Deduplication"):
+                try:
+                    merged = _run_dedup_sweep()
+                    _record_step("Deduplication", f"{merged} entities merged")
+                except Exception:
+                    log.error("Dedup sweep failed", exc_info=True)
+                    _record_step("Deduplication", "failed", failed=True)
+                finally:
+                    _finalize_step(3)
 
             # Step 4: Orphan cleanup
-            try:
-                deleted = _run_orphan_cleanup()
-                self_refs = _run_self_ref_cleanup()
-                blocked = _run_blocklist_cleanup()
-                _record_step(
-                    "Orphan cleanup",
-                    f"{deleted} orphans, {self_refs} self-refs, {blocked} blocklisted",
-                )
-            except Exception:
-                log.error("Orphan cleanup failed", exc_info=True)
-                _record_step("Orphan cleanup", "failed", failed=True)
+            if not _step_is_done(4, "Orphan cleanup"):
+                try:
+                    deleted = _run_orphan_cleanup()
+                    self_refs = _run_self_ref_cleanup()
+                    blocked = _run_blocklist_cleanup()
+                    _record_step(
+                        "Orphan cleanup",
+                        f"{deleted} orphans, {self_refs} self-refs, {blocked} blocklisted",
+                    )
+                except Exception:
+                    log.error("Orphan cleanup failed", exc_info=True)
+                    _record_step("Orphan cleanup", "failed", failed=True)
+                finally:
+                    _finalize_step(4)
 
             # Step 4b: Relationship quality audit
-            try:
-                from memory.relationship_audit import run_relationship_audit
-                rel_audit = await run_relationship_audit(
-                    model_enabled=config.REL_AUDIT_MODEL_ENABLED,
-                    molly=molly,
-                )
-                ra_auto = rel_audit.get("auto_fixes_applied", 0)
-                ra_quar = rel_audit.get("quarantined_count", 0)
-                ra_status = rel_audit.get("deterministic_result", {}).get("status", "pass")
-                _record_step(
-                    "Relationship audit",
-                    f"{ra_auto} auto-fixed, {ra_quar} quarantined ({ra_status})",
-                    failed=ra_status == "fail",
-                )
-            except Exception:
-                log.error("Relationship quality audit failed", exc_info=True)
-                _record_step("Relationship audit", "failed", failed=True)
+            if not _step_is_done(5, "Relationship audit"):
+                try:
+                    from memory.relationship_audit import run_relationship_audit
+                    rel_audit = await run_relationship_audit(
+                        model_enabled=config.REL_AUDIT_MODEL_ENABLED,
+                        molly=molly,
+                    )
+                    ra_auto = rel_audit.get("auto_fixes_applied", 0)
+                    ra_quar = rel_audit.get("quarantined_count", 0)
+                    ra_status = rel_audit.get("deterministic_result", {}).get("status", "pass")
+                    _record_step(
+                        "Relationship audit",
+                        f"{ra_auto} auto-fixed, {ra_quar} quarantined ({ra_status})",
+                        failed=ra_status == "fail",
+                    )
+                except Exception:
+                    log.error("Relationship quality audit failed", exc_info=True)
+                    _record_step("Relationship audit", "failed", failed=True)
+                finally:
+                    _finalize_step(5)
 
             # Step 4.5: Neo4j transaction log checkpoint
-            try:
-                from memory.graph import get_driver
+            if not _step_is_done(6, "Neo4j checkpoint"):
+                try:
+                    from memory.graph import get_driver
 
-                driver = get_driver()
-                with driver.session() as neo_session:
-                    # Detect edition — db.checkpoint() is Enterprise-only
-                    # Try modern syntax first (Neo4j 5.x+), fall back to legacy
-                    try:
-                        comp = neo_session.run("SHOW SERVER INFO YIELD edition")
-                        comp_record = comp.single()
-                        edition = str(comp_record.get("edition", "")).lower() if comp_record else ""
-                    except Exception:
-                        comp = neo_session.run("CALL dbms.components()")
-                        comp_record = comp.single()
-                        edition = str(comp_record.get("edition", "")).lower() if comp_record else ""
-                    if "enterprise" in edition:
-                        neo_session.run("CALL db.checkpoint()")
-                        _record_step("Neo4j checkpoint", "completed")
-                    else:
-                        _record_step("Neo4j checkpoint", f"skipped ({edition or 'unknown'} edition)")
-            except Exception:
-                log.error("Neo4j checkpoint failed", exc_info=True)
-                _record_step("Neo4j checkpoint", "failed", failed=True)
+                    driver = get_driver()
+                    with driver.session() as neo_session:
+                        # Detect edition — db.checkpoint() is Enterprise-only
+                        # Try modern syntax first (Neo4j 5.x+), fall back to legacy
+                        try:
+                            comp = neo_session.run("SHOW SERVER INFO YIELD edition")
+                            comp_record = comp.single()
+                            edition = str(comp_record.get("edition", "")).lower() if comp_record else ""
+                        except Exception:
+                            comp = neo_session.run("CALL dbms.components()")
+                            comp_record = comp.single()
+                            edition = str(comp_record.get("edition", "")).lower() if comp_record else ""
+                        if "enterprise" in edition:
+                            neo_session.run("CALL db.checkpoint()")
+                            _record_step("Neo4j checkpoint", "completed")
+                        else:
+                            _record_step("Neo4j checkpoint", f"skipped ({edition or 'unknown'} edition)")
+                except Exception:
+                    log.error("Neo4j checkpoint failed", exc_info=True)
+                    _record_step("Neo4j checkpoint", "failed", failed=True)
+                finally:
+                    _finalize_step(6)
 
             # Step 5: Phase 7 memory optimization loop
-            try:
-                improver = await _ensure_improver()
-                mem_opt = await improver.run_memory_optimization()
-                _record_step(
-                    "Memory optimization",
-                    (
-                        f"consolidated={mem_opt.get('entity_consolidations', 0)}, "
-                        f"stale={mem_opt.get('stale_entities', 0)}, "
-                        f"contradictions={mem_opt.get('contradictions', 0)}"
-                    ),
-                )
-            except Exception:
-                log.error("Memory optimization failed", exc_info=True)
-                _record_step("Memory optimization", "failed", failed=True)
-
-            # Step 6: Prune stale daily logs
-            try:
-                moved = _prune_daily_logs()
-                _record_step("Daily log pruning", f"{moved} logs archived")
-            except Exception:
-                log.error("Daily log pruning failed", exc_info=True)
-                _record_step("Daily log pruning", "failed", failed=True)
-
-            # Step 7: GLiNER training accumulation + conditional fine-tune trigger
-            try:
-                improver = await _ensure_improver()
-                gliner_cycle = await improver.run_gliner_nightly_cycle()
-                loop_status = str(gliner_cycle.get("status", "unknown"))
-                if loop_status in {"insufficient_examples", "cooldown_active"}:
-                    _record_step("GLiNER loop", str(gliner_cycle.get("message", loop_status)))
-                else:
-                    pipeline = (
-                        gliner_cycle.get("pipeline", {})
-                        if isinstance(gliner_cycle, dict)
-                        else {}
-                    )
-                    pipeline_status = str(pipeline.get("status", loop_status))
-                    if pipeline_status == "deployed":
-                        improvement = float(
-                            pipeline.get("benchmark", {}).get("improvement", 0.0) or 0.0
-                        )
-                        _record_step("GLiNER loop", f"deployed ({improvement:+.2%} F1)")
-                    elif pipeline_status:
-                        _record_step("GLiNER loop", pipeline_status)
-                    else:
-                        _record_step("GLiNER loop", loop_status)
-            except Exception:
-                log.error("GLiNER closed-loop run failed", exc_info=True)
-                _record_step("GLiNER loop", "failed", failed=True)
-
-            # Step 7.5: Operational insights (24h tool success rates, unused skills)
-            try:
-                insights = _compute_operational_insights()
-                parts = [f"{insights['tool_count_24h']} tools active"]
-                if insights["failing_tools"]:
-                    parts.append(f"failing: {', '.join(insights['failing_tools'][:5])}")
-                if insights["unused_skills"]:
-                    parts.append(f"unused skills (7d): {', '.join(insights['unused_skills'][:5])}")
-                _record_step("Operational insights", "; ".join(parts))
-            except Exception:
-                log.error("Operational insights failed", exc_info=True)
-                _record_step("Operational insights", "failed", failed=True)
-
-            # Step 7.6: Foundry skill scan (nightly pattern detection)
-            try:
-                improver = await _ensure_improver()
-                from foundry_adapter import load_foundry_sequence_signals
-
-                signals = load_foundry_sequence_signals(days=7)
-                patterns = [
-                    {
-                        "steps": list(sig.steps),
-                        "count": sig.count,
-                        "confidence": sig.success_rate,
-                        "name": key,
-                        "steps_text": key,
-                    }
-                    for key, sig in signals.items()
-                    if sig.count >= 3
-                ]
-                if patterns:
-                    skill_result = await improver.propose_skill_updates(patterns)
-                    _record_step("Foundry skill scan", str(skill_result.get("status", "no candidates")))
-                else:
-                    _record_step("Foundry skill scan", "no qualifying patterns")
-            except Exception:
-                log.error("Foundry skill scan failed", exc_info=True)
-                _record_step("Foundry skill scan", "failed", failed=True)
-
-            # Step 7.7: Tool gap scan (nightly failure analysis)
-            try:
-                improver = await _ensure_improver()
-                gap_result = await improver.propose_tool_updates(
-                    days=7, min_failures=5,
-                )
-                _record_step("Tool gap scan", str(gap_result.get("status", "no gaps")))
-            except Exception:
-                log.error("Tool gap scan failed", exc_info=True)
-                _record_step("Tool gap scan", "failed", failed=True)
-
-            # Step 7.8: Correction pattern analysis
-            try:
-                from memory.retriever import get_vectorstore
-                vs = get_vectorstore()
-                cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-
-                cursor = vs.conn.execute(
-                    "SELECT pattern, COUNT(*) as cnt FROM corrections "
-                    "WHERE created_at > ? GROUP BY pattern ORDER BY cnt DESC LIMIT 10",
-                    (cutoff_24h,),
-                )
-                pattern_rows = cursor.fetchall()
-
-                cursor = vs.conn.execute(
-                    "SELECT molly_output, user_correction, pattern FROM corrections "
-                    "WHERE created_at > ? ORDER BY created_at DESC LIMIT 5",
-                    (cutoff_24h,),
-                )
-                example_rows = cursor.fetchall()
-
-                total_corrections = sum(row[1] for row in pattern_rows)
-                if total_corrections == 0:
-                    _record_step("Correction patterns", "0 corrections in last 24h")
-                else:
-                    parts = [f"{total_corrections} correction(s) in last 24h"]
-                    for row in pattern_rows[:5]:
-                        parts.append(f"  '{row[0]}': {row[1]}x")
-                    if example_rows:
-                        parts.append("Recent examples:")
-                        for ex in example_rows[:3]:
-                            molly_out = (ex[0] or "")[:80]
-                            user_corr = (ex[1] or "")[:80]
-                            parts.append(f"  Molly: {molly_out}... -> User: {user_corr}...")
-                    _record_step("Correction patterns", "\n".join(parts))
-            except Exception:
-                log.error("Correction pattern analysis failed", exc_info=True)
-                _record_step("Correction patterns", "failed", failed=True)
-
-            # Step 8: Weekly assessment catch-up if due/overdue.
-            try:
-                improver = await _ensure_improver()
+            if not _step_is_done(7, "Memory optimization"):
                 try:
-                    now_local = datetime.now(ZoneInfo(config.TIMEZONE))
-                except Exception:
-                    now_local = datetime.now(timezone.utc)
-                weekly_due = _weekly_assessment_due_or_overdue(improver, now_local)
-                if weekly_due:
-                    weekly_path = await improver.run_weekly_assessment()
-                    weekly_name = Path(str(weekly_path)).name
-                    weekly_result = f"generated {weekly_name}"
-                    _record_step("Weekly assessment", weekly_result)
-                else:
-                    weekly_result = "not due"
-                    _record_step("Weekly assessment", weekly_result)
-            except Exception:
-                log.error("Weekly assessment catch-up failed", exc_info=True)
-                weekly_result = "failed"
-                _record_step("Weekly assessment", "failed", failed=True)
-
-            # Step 9: Health Doctor daily run (after maintenance completes)
-            try:
-                from health import get_health_doctor
-
-                doctor = get_health_doctor(molly=molly)
-                doctor.run_daily()
-                _record_step("Health Doctor", "completed")
-            except Exception:
-                log.error("Health Doctor run failed", exc_info=True)
-                _record_step("Health Doctor", "failed", failed=True)
-
-            # Step 9.5: Graph suggestions digest
-            try:
-                from memory.graph_suggestions import build_suggestion_digest
-
-                digest = build_suggestion_digest()
-                if digest:
-                    _record_step("Graph suggestions", digest[:500])
-                else:
-                    _record_step("Graph suggestions", "no suggestions today")
-            except Exception:
-                log.error("Graph suggestions digest failed", exc_info=True)
-                _record_step("Graph suggestions", "failed", failed=True)
-
-            # Step 10: Contract audits (deterministic first, model second)
-            try:
-                audit_bundle = await run_contract_audits(
-                    today=today,
-                    task_results=results,
-                    weekly_due=weekly_due,
-                    weekly_result=weekly_result,
-                    maintenance_dir=MAINTENANCE_DIR,
-                    health_dir=config.HEALTH_REPORT_DIR,
-                )
-
-                nightly_det = dict(audit_bundle.get("nightly_deterministic", {}))
-                weekly_det = dict(audit_bundle.get("weekly_deterministic", {}))
-                nightly_model = dict(audit_bundle.get("nightly_model", {}))
-                weekly_model = dict(audit_bundle.get("weekly_model", {}))
-                artifacts = dict(audit_bundle.get("artifacts", {}))
-
-                nightly_det_status = str(nightly_det.get("status", "pass"))
-                weekly_det_status = str(weekly_det.get("status", "pass"))
-                _record_step(
-                    "Contract audit nightly (deterministic)",
-                    str(nightly_det.get("summary", "pass")),
-                    failed=nightly_det_status == "fail",
-                )
-                _record_step(
-                    "Contract audit weekly (deterministic)",
-                    str(weekly_det.get("summary", "pass")),
-                    failed=weekly_det_status == "fail",
-                )
-
-                nightly_model_status = str(nightly_model.get("status", "disabled")).strip().lower()
-                weekly_model_status = str(weekly_model.get("status", "disabled")).strip().lower()
-                model_blocking = bool(config.CONTRACT_AUDIT_LLM_BLOCKING)
-
-                _record_step(
-                    "Contract audit nightly (model)",
-                    str(nightly_model.get("summary", "disabled by config")),
-                    failed=model_blocking and nightly_model_status in {"error", "unavailable"},
-                )
-                _record_step(
-                    "Contract audit weekly (model)",
-                    str(weekly_model.get("summary", "disabled by config")),
-                    failed=model_blocking and weekly_model_status in {"error", "unavailable"},
-                )
-
-                artifact_error = str(artifacts.get("error", "")).strip()
-                if artifact_error:
-                    _record_step("Contract audit artifacts", f"write error: {artifact_error}")
-                else:
+                    improver = await _ensure_improver()
+                    mem_opt = await improver.run_memory_optimization()
                     _record_step(
-                        "Contract audit artifacts",
+                        "Memory optimization",
                         (
-                            f"maintenance={Path(str(artifacts.get('maintenance', '-'))).name}, "
-                            f"health={Path(str(artifacts.get('health', '-'))).name}"
+                            f"consolidated={mem_opt.get('entity_consolidations', 0)}, "
+                            f"stale={mem_opt.get('stale_entities', 0)}, "
+                            f"contradictions={mem_opt.get('contradictions', 0)}"
                         ),
                     )
-            except Exception:
-                log.error("Contract audit pass failed", exc_info=True)
-                _record_step("Contract audit nightly (deterministic)", "failed", failed=True)
-                _record_step("Contract audit weekly (deterministic)", "failed", failed=True)
-                if config.CONTRACT_AUDIT_LLM_BLOCKING:
-                    _record_step("Contract audit nightly (model)", "failed", failed=True)
-                    _record_step("Contract audit weekly (model)", "failed", failed=True)
-                else:
-                    _record_step("Contract audit nightly (model)", "error (report-only)")
-                    _record_step("Contract audit weekly (model)", "error (report-only)")
-                _record_step("Contract audit artifacts", "unavailable")
+                except Exception:
+                    log.error("Memory optimization failed", exc_info=True)
+                    _record_step("Memory optimization", "failed", failed=True)
+                finally:
+                    _finalize_step(7)
+
+            # Step 6: Prune stale daily logs
+            if not _step_is_done(8, "Daily log pruning"):
+                try:
+                    moved = _prune_daily_logs()
+                    _record_step("Daily log pruning", f"{moved} logs archived")
+                except Exception:
+                    log.error("Daily log pruning failed", exc_info=True)
+                    _record_step("Daily log pruning", "failed", failed=True)
+                finally:
+                    _finalize_step(8)
+
+            # Step 7: GLiNER training accumulation + conditional fine-tune trigger
+            if not _step_is_done(9, "GLiNER loop"):
+                try:
+                    improver = await _ensure_improver()
+                    gliner_cycle = await improver.run_gliner_nightly_cycle()
+                    loop_status = str(gliner_cycle.get("status", "unknown"))
+                    if loop_status in {"insufficient_examples", "cooldown_active"}:
+                        _record_step("GLiNER loop", str(gliner_cycle.get("message", loop_status)))
+                    else:
+                        pipeline = (
+                            gliner_cycle.get("pipeline", {})
+                            if isinstance(gliner_cycle, dict)
+                            else {}
+                        )
+                        pipeline_status = str(pipeline.get("status", loop_status))
+                        if pipeline_status == "deployed":
+                            improvement = float(
+                                pipeline.get("benchmark", {}).get("improvement", 0.0) or 0.0
+                            )
+                            _record_step("GLiNER loop", f"deployed ({improvement:+.2%} F1)")
+                        elif pipeline_status:
+                            _record_step("GLiNER loop", pipeline_status)
+                        else:
+                            _record_step("GLiNER loop", loop_status)
+                except Exception:
+                    log.error("GLiNER closed-loop run failed", exc_info=True)
+                    _record_step("GLiNER loop", "failed", failed=True)
+                finally:
+                    _finalize_step(9)
+
+            # Step 7.5: Operational insights (24h tool success rates, unused skills)
+            if not _step_is_done(10, "Operational insights"):
+                try:
+                    insights = _compute_operational_insights()
+                    parts = [f"{insights['tool_count_24h']} tools active"]
+                    if insights["failing_tools"]:
+                        parts.append(f"failing: {', '.join(insights['failing_tools'][:5])}")
+                    if insights["unused_skills"]:
+                        parts.append(f"unused skills (7d): {', '.join(insights['unused_skills'][:5])}")
+                    _record_step("Operational insights", "; ".join(parts))
+                except Exception:
+                    log.error("Operational insights failed", exc_info=True)
+                    _record_step("Operational insights", "failed", failed=True)
+                finally:
+                    _finalize_step(10)
+
+            # Step 7.6: Foundry skill scan (nightly pattern detection)
+            if not _step_is_done(11, "Foundry skill scan"):
+                try:
+                    improver = await _ensure_improver()
+                    from foundry_adapter import load_foundry_sequence_signals
+
+                    signals = load_foundry_sequence_signals(days=7)
+                    patterns = [
+                        {
+                            "steps": list(sig.steps),
+                            "count": sig.count,
+                            "confidence": sig.success_rate,
+                            "name": key,
+                            "steps_text": key,
+                        }
+                        for key, sig in signals.items()
+                        if sig.count >= 3
+                    ]
+                    if patterns:
+                        skill_result = await improver.propose_skill_updates(patterns)
+                        _record_step("Foundry skill scan", str(skill_result.get("status", "no candidates")))
+                    else:
+                        _record_step("Foundry skill scan", "no qualifying patterns")
+                except Exception:
+                    log.error("Foundry skill scan failed", exc_info=True)
+                    _record_step("Foundry skill scan", "failed", failed=True)
+                finally:
+                    _finalize_step(11)
+
+            # Step 7.7: Tool gap scan (nightly failure analysis)
+            if not _step_is_done(12, "Tool gap scan"):
+                try:
+                    improver = await _ensure_improver()
+                    gap_result = await improver.propose_tool_updates(
+                        days=7, min_failures=5,
+                    )
+                    _record_step("Tool gap scan", str(gap_result.get("status", "no gaps")))
+                except Exception:
+                    log.error("Tool gap scan failed", exc_info=True)
+                    _record_step("Tool gap scan", "failed", failed=True)
+                finally:
+                    _finalize_step(12)
+
+            # Step 7.8: Correction pattern analysis
+            if not _step_is_done(13, "Correction patterns"):
+                try:
+                    from memory.retriever import get_vectorstore
+                    vs = get_vectorstore()
+                    cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+                    cursor = vs.conn.execute(
+                        "SELECT pattern, COUNT(*) as cnt FROM corrections "
+                        "WHERE created_at > ? GROUP BY pattern ORDER BY cnt DESC LIMIT 10",
+                        (cutoff_24h,),
+                    )
+                    pattern_rows = cursor.fetchall()
+
+                    cursor = vs.conn.execute(
+                        "SELECT molly_output, user_correction, pattern FROM corrections "
+                        "WHERE created_at > ? ORDER BY created_at DESC LIMIT 5",
+                        (cutoff_24h,),
+                    )
+                    example_rows = cursor.fetchall()
+
+                    total_corrections = sum(row[1] for row in pattern_rows)
+                    if total_corrections == 0:
+                        _record_step("Correction patterns", "0 corrections in last 24h")
+                    else:
+                        parts = [f"{total_corrections} correction(s) in last 24h"]
+                        for row in pattern_rows[:5]:
+                            parts.append(f"  '{row[0]}': {row[1]}x")
+                        if example_rows:
+                            parts.append("Recent examples:")
+                            for ex in example_rows[:3]:
+                                molly_out = (ex[0] or "")[:80]
+                                user_corr = (ex[1] or "")[:80]
+                                parts.append(f"  Molly: {molly_out}... -> User: {user_corr}...")
+                        _record_step("Correction patterns", "\n".join(parts))
+                except Exception:
+                    log.error("Correction pattern analysis failed", exc_info=True)
+                    _record_step("Correction patterns", "failed", failed=True)
+                finally:
+                    _finalize_step(13)
+
+            # Step 8: Weekly assessment catch-up if due/overdue.
+            if not _step_is_done(14, "Weekly assessment"):
+                try:
+                    improver = await _ensure_improver()
+                    try:
+                        now_local = datetime.now(ZoneInfo(config.TIMEZONE))
+                    except Exception:
+                        now_local = datetime.now(timezone.utc)
+                    weekly_due = _weekly_assessment_due_or_overdue(improver, now_local)
+                    if weekly_due:
+                        weekly_path = await improver.run_weekly_assessment()
+                        weekly_name = Path(str(weekly_path)).name
+                        weekly_result = f"generated {weekly_name}"
+                        _record_step("Weekly assessment", weekly_result)
+                    else:
+                        weekly_result = "not due"
+                        _record_step("Weekly assessment", weekly_result)
+                except Exception:
+                    log.error("Weekly assessment catch-up failed", exc_info=True)
+                    weekly_result = "failed"
+                    _record_step("Weekly assessment", "failed", failed=True)
+                finally:
+                    _finalize_step(14)
+
+            # Step 9: Health Doctor daily run (after maintenance completes)
+            if not _step_is_done(15, "Health Doctor"):
+                try:
+                    from health import get_health_doctor
+
+                    doctor = get_health_doctor(molly=molly)
+                    doctor.run_daily()
+                    _record_step("Health Doctor", "completed")
+                except Exception:
+                    log.error("Health Doctor run failed", exc_info=True)
+                    _record_step("Health Doctor", "failed", failed=True)
+                finally:
+                    _finalize_step(15)
+
+            # Step 9.5: Graph suggestions digest
+            if not _step_is_done(16, "Graph suggestions"):
+                try:
+                    from memory.graph_suggestions import build_suggestion_digest
+
+                    digest = build_suggestion_digest()
+                    if digest:
+                        _record_step("Graph suggestions", digest[:500])
+                    else:
+                        _record_step("Graph suggestions", "no suggestions today")
+                except Exception:
+                    log.error("Graph suggestions digest failed", exc_info=True)
+                    _record_step("Graph suggestions", "failed", failed=True)
+                finally:
+                    _finalize_step(16)
+
+            # Step 10: Contract audits (deterministic first, model second)
+            if _step_is_done(17, "Contract audit nightly (deterministic)"):
+                _record_step("Contract audit weekly (deterministic)", "skipped (checkpoint resume)")
+                _record_step("Contract audit nightly (model)", "skipped (checkpoint resume)")
+                _record_step("Contract audit weekly (model)", "skipped (checkpoint resume)")
+                _record_step("Contract audit artifacts", "skipped (checkpoint resume)")
+            else:
+                try:
+                    audit_bundle = await run_contract_audits(
+                        today=today,
+                        task_results=results,
+                        weekly_due=weekly_due,
+                        weekly_result=weekly_result,
+                        maintenance_dir=MAINTENANCE_DIR,
+                        health_dir=config.HEALTH_REPORT_DIR,
+                    )
+
+                    nightly_det = dict(audit_bundle.get("nightly_deterministic", {}))
+                    weekly_det = dict(audit_bundle.get("weekly_deterministic", {}))
+                    nightly_model = dict(audit_bundle.get("nightly_model", {}))
+                    weekly_model = dict(audit_bundle.get("weekly_model", {}))
+                    artifacts = dict(audit_bundle.get("artifacts", {}))
+
+                    nightly_det_status = str(nightly_det.get("status", "pass"))
+                    weekly_det_status = str(weekly_det.get("status", "pass"))
+                    _record_step(
+                        "Contract audit nightly (deterministic)",
+                        str(nightly_det.get("summary", "pass")),
+                        failed=nightly_det_status == "fail",
+                    )
+                    _record_step(
+                        "Contract audit weekly (deterministic)",
+                        str(weekly_det.get("summary", "pass")),
+                        failed=weekly_det_status == "fail",
+                    )
+
+                    nightly_model_status = str(nightly_model.get("status", "disabled")).strip().lower()
+                    weekly_model_status = str(weekly_model.get("status", "disabled")).strip().lower()
+                    model_blocking = bool(config.CONTRACT_AUDIT_LLM_BLOCKING)
+
+                    _record_step(
+                        "Contract audit nightly (model)",
+                        str(nightly_model.get("summary", "disabled by config")),
+                        failed=model_blocking and nightly_model_status in {"error", "unavailable"},
+                    )
+                    _record_step(
+                        "Contract audit weekly (model)",
+                        str(weekly_model.get("summary", "disabled by config")),
+                        failed=model_blocking and weekly_model_status in {"error", "unavailable"},
+                    )
+
+                    artifact_error = str(artifacts.get("error", "")).strip()
+                    if artifact_error:
+                        _record_step("Contract audit artifacts", f"write error: {artifact_error}")
+                    else:
+                        _record_step(
+                            "Contract audit artifacts",
+                            (
+                                f"maintenance={Path(str(artifacts.get('maintenance', '-'))).name}, "
+                                f"health={Path(str(artifacts.get('health', '-'))).name}"
+                            ),
+                        )
+                except Exception:
+                    log.error("Contract audit pass failed", exc_info=True)
+                    _record_step("Contract audit nightly (deterministic)", "failed", failed=True)
+                    _record_step("Contract audit weekly (deterministic)", "failed", failed=True)
+                    if config.CONTRACT_AUDIT_LLM_BLOCKING:
+                        _record_step("Contract audit nightly (model)", "failed", failed=True)
+                        _record_step("Contract audit weekly (model)", "failed", failed=True)
+                    else:
+                        _record_step("Contract audit nightly (model)", "error (report-only)")
+                        _record_step("Contract audit weekly (model)", "error (report-only)")
+                    _record_step("Contract audit artifacts", "unavailable")
+                finally:
+                    _finalize_step(17)
 
             # Step 11: Opus analysis pass (text-only, no tools)
-            try:
-                from memory.graph import get_graph_summary
+            if not _step_is_done(18, "Analysis"):
+                try:
+                    from memory.graph import get_graph_summary
 
-                summary = get_graph_summary()
-                graph_text = (
-                    f"Entities: {summary['entity_count']}, "
-                    f"Relationships: {summary['relationship_count']}\n"
-                    f"Top connected: {summary['top_connected']}\n"
-                    f"Recent: {summary['recent']}"
-                )
-                pre_analysis_report = _build_maintenance_report(
+                    summary = get_graph_summary()
+                    graph_text = (
+                        f"Entities: {summary['entity_count']}, "
+                        f"Relationships: {summary['relationship_count']}\n"
+                        f"Top connected: {summary['top_connected']}\n"
+                        f"Recent: {summary['recent']}"
+                    )
+                    pre_analysis_report = _build_maintenance_report(
+                        results,
+                        run_status=_derive_run_status(),
+                        failed_steps=failed_steps,
+                    )
+                    raw_analysis = await _run_opus_analysis(
+                        pre_analysis_report,
+                        graph_text,
+                        today,
+                    )
+                    # Split into MEMORY.md section and WhatsApp summary
+                    if "---WHATSAPP---" in raw_analysis:
+                        parts = raw_analysis.split("---WHATSAPP---", 1)
+                        analysis_text = parts[0].strip()
+                        whatsapp_summary = parts[1].strip()
+                    else:
+                        # Fallback if marker missing — use full text for both
+                        analysis_text = raw_analysis.strip()
+                        whatsapp_summary = raw_analysis.strip()
+
+                    if analysis_text:
+                        memory_path = config.WORKSPACE / "MEMORY.md"
+                        if memory_path.exists():
+                            existing = memory_path.read_text()
+                            atomic_write(
+                                memory_path,
+                                existing.rstrip() + "\n\n" + analysis_text + "\n",
+                            )
+                        else:
+                            atomic_write(memory_path, analysis_text + "\n")
+                        _record_step("Analysis", "MEMORY.md updated")
+                    else:
+                        whatsapp_summary = ""
+                        _record_step("Analysis", "empty response")
+                except Exception:
+                    log.error("Opus analysis pass failed", exc_info=True)
+                    _record_step("Analysis", "failed", failed=True)
+                finally:
+                    _finalize_step(18)
+
+            run_status = _derive_run_status()
+            if not _step_is_done(19, "Issue registry"):
+                synced, notified = _record_maintenance_issues(results, run_status)
+                _record_step("Issue registry", f"{synced} synced, {notified} notified")
+                _finalize_step(19)
+            run_status = _derive_run_status()
+
+            if not _step_is_done(20, "Report"):
+                report = _build_maintenance_report(
                     results,
-                    run_status=_derive_run_status(),
+                    run_status=run_status,
                     failed_steps=failed_steps,
                 )
-                analysis_text = await _run_opus_analysis(
-                    pre_analysis_report,
-                    graph_text,
-                    today,
-                )
                 if analysis_text.strip():
-                    memory_path = config.WORKSPACE / "MEMORY.md"
-                    if memory_path.exists():
-                        existing = memory_path.read_text()
-                        memory_path.write_text(
-                            existing.rstrip() + "\n\n" + analysis_text.strip() + "\n"
+                    report = report.rstrip() + f"\n\n## Analysis\n\n{analysis_text.strip()}\n"
+                atomic_write(report_path, report)
+                log.info("Maintenance report written to %s", report_path)
+                _record_step("Report", "written")
+                _finalize_step(20)
+
+            # Step 12: Save maintenance summary for morning delivery
+            # (Maintenance runs during quiet hours — don't send at 11 PM)
+            pending_summary_path = MAINTENANCE_DIR / "pending_summary.txt"
+            if not _step_is_done(21, "Summary"):
+                try:
+                    from memory.graph import entity_count, relationship_count
+
+                    e_count = entity_count()
+                    r_count = relationship_count()
+
+                    if whatsapp_summary:
+                        maint_msg = (
+                            f"*🧠 Nightly Maintenance — {today}*\n\n"
+                            f"{whatsapp_summary}"
                         )
                     else:
-                        memory_path.write_text(analysis_text.strip() + "\n")
-                    _record_step("Analysis", "MEMORY.md updated")
-                else:
-                    _record_step("Analysis", "empty response")
-            except Exception:
-                log.error("Opus analysis pass failed", exc_info=True)
-                _record_step("Analysis", "failed", failed=True)
-
-            run_status = _derive_run_status()
-            synced, notified = _record_maintenance_issues(results, run_status)
-            _record_step("Issue registry", f"{synced} synced, {notified} notified")
-            run_status = _derive_run_status()
-
-            report = _build_maintenance_report(
-                results,
-                run_status=run_status,
-                failed_steps=failed_steps,
-            )
-            if analysis_text.strip():
-                report = report.rstrip() + f"\n\n## Analysis\n\n{analysis_text.strip()}\n"
-            report_path.write_text(report)
-            log.info("Maintenance report written to %s", report_path)
-
-            # Step 12: Send brief summary to owner DM
-            if molly and molly.wa:
-                try:
-                    owner_jid = molly._get_owner_dm_jid()
-                    if owner_jid:
-                        from memory.graph import entity_count, relationship_count
-
-                        e_count = entity_count()
-                        r_count = relationship_count()
-
-                        summary_parts = [f"Nightly maintenance done ({today})."]
-                        for task_name, result in results.items():
-                            summary_parts.append(f"{task_name}: {result}")
-                        summary_parts.append(
+                        # Fallback if analysis didn't produce a summary
+                        maint_msg = (
+                            f"*⚙️ Maintenance complete — {today}*\n"
                             f"Graph: {e_count} entities, {r_count} relationships."
                         )
+                        if failed_steps:
+                            maint_msg += (
+                                f"\n⚠️ {len(failed_steps)} step(s) failed: "
+                                + ", ".join(failed_steps)
+                            )
 
-                        summary_msg = "\n".join(summary_parts)
-                        words = summary_msg.split()
-                        if len(words) > 100:
-                            summary_msg = " ".join(words[:100]) + "..."
+                    # Cap at 2000 chars for WhatsApp readability
+                    if len(maint_msg) > 2000:
+                        maint_msg = maint_msg[:1997] + "..."
 
-                        molly._track_send(molly.wa.send_message(owner_jid, summary_msg))
+                    atomic_write(pending_summary_path, maint_msg)
+                    log.info("Maintenance summary saved for morning delivery: %s", pending_summary_path)
+                    _record_step("Summary", "saved for morning delivery")
                 except Exception:
-                    log.error("Failed to send maintenance summary", exc_info=True)
+                    log.error("Failed to save maintenance summary", exc_info=True)
+                finally:
+                    _finalize_step(21)
 
             _RUN_STATE.status = run_status
             _RUN_STATE.last_error = ""
+            _clear_maintenance_checkpoint()
             log.info(
                 "Nightly maintenance completed run_id=%s status=%s",
                 run_id,

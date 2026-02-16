@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import db_pool
 from memory.issue_registry import (
     build_issue_fingerprint,
     ensure_issue_registry_tables,
@@ -18,7 +19,7 @@ from memory.issue_registry import (
 
 class TestIssueRegistrySchema(unittest.TestCase):
     def test_tables_and_indexes_created(self):
-        conn = sqlite3.connect(":memory:")
+        conn = db_pool.sqlite_connect(":memory:")
         ensure_issue_registry_tables(conn)
 
         issue_cols = {
@@ -72,7 +73,7 @@ class TestIssueRegistrySchema(unittest.TestCase):
         conn.close()
 
     def test_schema_backfill_adds_missing_columns(self):
-        conn = sqlite3.connect(":memory:")
+        conn = db_pool.sqlite_connect(":memory:")
         conn.executescript(
             """
             CREATE TABLE maintenance_issues (
@@ -132,7 +133,7 @@ class TestIssueFingerprint(unittest.TestCase):
 
 class TestIssueLifecycle(unittest.TestCase):
     def test_upsert_tracks_failures_and_events(self):
-        conn = sqlite3.connect(":memory:")
+        conn = db_pool.sqlite_connect(":memory:")
         ensure_issue_registry_tables(conn)
 
         t1 = datetime(2026, 2, 9, 10, 0, tzinfo=timezone.utc)

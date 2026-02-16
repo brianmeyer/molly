@@ -28,6 +28,7 @@ if "sqlite_vec" not in sys.modules:
 
 import agent
 import config
+import db_pool
 from skill_analytics import (
     get_skill_gap_clusters,
     get_skill_stats,
@@ -52,7 +53,7 @@ class _GapStore:
 
 
 def _create_analytics_tables(db_path: Path):
-    conn = sqlite3.connect(str(db_path))
+    conn = db_pool.sqlite_connect(str(db_path))
     conn.execute(
         """
         CREATE TABLE skill_executions (
@@ -186,7 +187,7 @@ class TestSkillAnalytics(unittest.TestCase):
 
     def test_underperforming_and_skill_stats(self):
         now = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         conn.executemany(
             """
             INSERT INTO skill_executions (id, skill_name, trigger, outcome, user_approval, edits_made, created_at)
@@ -224,7 +225,7 @@ class TestSkillAnalytics(unittest.TestCase):
     def test_gap_clusters_are_deterministic(self):
         now = datetime.now(timezone.utc)
         old = (now - timedelta(days=40)).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         conn.executemany(
             """
             INSERT INTO skill_gaps (user_message, tools_used, session_id, created_at, addressed)

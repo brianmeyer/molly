@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config
 import contract_audit
+import db_pool
 
 
 def _baseline_results() -> dict[str, str]:
@@ -30,7 +31,7 @@ def _baseline_results() -> dict[str, str]:
 
 
 def _seed_skill_executions(db_path: Path, skill_name: str, outcomes: list[str]):
-    conn = sqlite3.connect(str(db_path))
+    conn = db_pool.sqlite_connect(str(db_path))
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS skill_executions (

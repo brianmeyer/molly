@@ -480,14 +480,38 @@ async def run_model_audit(flagged: list[dict]) -> dict:
     verdicts = []
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                f"{config.MOONSHOT_BASE_URL}/chat/completions",
-                headers=headers,
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        import asyncio as _asyncio
+
+        data = None
+        last_exc = None
+        for _attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    resp = await client.post(
+                        f"{config.MOONSHOT_BASE_URL}/chat/completions",
+                        headers=headers,
+                        json=body,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as exc:
+                last_exc = exc
+                wait = 5 * (2 ** _attempt)  # 5s, 10s, 20s
+                log.warning("Kimi Tier 2 timeout (attempt %d/3), retrying in %ds: %s",
+                            _attempt + 1, wait, exc)
+                await _asyncio.sleep(wait)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (429, 502, 503):
+                    last_exc = exc
+                    wait = 10 * (2 ** _attempt)
+                    log.warning("Kimi Tier 2 HTTP %d (attempt %d/3), retrying in %ds",
+                                exc.response.status_code, _attempt + 1, wait)
+                    await _asyncio.sleep(wait)
+                else:
+                    raise
+        if data is None:
+            raise last_exc or RuntimeError("Kimi Tier 2 failed after 3 attempts")
 
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         if isinstance(content, list):

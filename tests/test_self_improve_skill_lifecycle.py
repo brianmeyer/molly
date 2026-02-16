@@ -12,13 +12,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
+import db_pool
 from self_improve import SelfImprovementEngine
 
 
 class _RecordingVectorStore:
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS self_improvement_events (
@@ -59,7 +60,7 @@ class _RecordingVectorStore:
     ) -> str:
         event_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         conn.execute(
             """INSERT INTO self_improvement_events
                (id, event_type, category, title, payload, status, created_at, updated_at)
@@ -72,7 +73,7 @@ class _RecordingVectorStore:
 
     def update_self_improvement_event_status(self, event_id: str, status: str):
         now = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         conn.execute(
             "UPDATE self_improvement_events SET status = ?, updated_at = ? WHERE id = ?",
             (status, now, event_id),
@@ -120,7 +121,7 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
         }
 
     def _read_events(self) -> list[tuple[str, str, str, str]]:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         rows = conn.execute(
             "SELECT event_type, category, title, status FROM self_improvement_events ORDER BY created_at"
         ).fetchall()
@@ -128,7 +129,7 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
         return [(str(a), str(b), str(c), str(d)) for a, b, c, d in rows]
 
     def _skill_executions_count(self) -> int:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = db_pool.sqlite_connect(str(self.db_path))
         value = int(conn.execute("SELECT COUNT(*) FROM skill_executions").fetchone()[0])
         conn.close()
         return value

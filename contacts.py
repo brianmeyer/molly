@@ -87,9 +87,13 @@ class ContactResolver:
     def enrich_graph(self, name: str, phone: str, source: str, email: str = ""):
         """Fire-and-forget: upsert a Person entity with phone/email and CONTACT_OF → owner."""
         try:
-            from memory.graph import upsert_entity, upsert_relationship, set_entity_properties
+            from memory.graph import (
+                set_entity_properties,
+                upsert_entity_sync,
+                upsert_relationship_sync,
+            )
 
-            canonical = upsert_entity(name, "Person", 0.9)
+            canonical = upsert_entity_sync(name, "Person", 0.9)
 
             # Set phone and email properties via graph API
             props: dict = {}
@@ -101,8 +105,8 @@ class ContactResolver:
                 set_entity_properties(canonical, props)
 
             # Create CONTACT_OF → owner relationship
-            owner = upsert_entity(config.OWNER_NAME, "Person", 1.0)
-            upsert_relationship(canonical, owner, "CONTACT_OF", 0.9, f"from {source}")
+            owner = upsert_entity_sync(config.OWNER_NAME, "Person", 1.0)
+            upsert_relationship_sync(canonical, owner, "CONTACT_OF", 0.9, f"from {source}")
         except Exception:
             log.warning("Contact graph enrichment failed for %s", name, exc_info=True)
 

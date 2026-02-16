@@ -67,14 +67,39 @@ async def kimi_research(args: dict) -> dict:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                f"{config.MOONSHOT_BASE_URL}/chat/completions",
-                headers=headers,
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        import asyncio as _asyncio
+
+        data = None
+        last_exc = None
+        for _attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    resp = await client.post(
+                        f"{config.MOONSHOT_BASE_URL}/chat/completions",
+                        headers=headers,
+                        json=body,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as exc:
+                last_exc = exc
+                wait = 5 * (2 ** _attempt)  # 5s, 10s, 20s
+                log.warning("Kimi timeout (attempt %d/3), retrying in %ds: %s",
+                            _attempt + 1, wait, exc)
+                await _asyncio.sleep(wait)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (429, 502, 503):
+                    last_exc = exc
+                    wait = 10 * (2 ** _attempt)
+                    log.warning("Kimi HTTP %d (attempt %d/3), retrying in %ds",
+                                exc.response.status_code, _attempt + 1, wait)
+                    await _asyncio.sleep(wait)
+                else:
+                    raise
+
+        if data is None:
+            return _error_result(f"Kimi request failed after 3 attempts: {last_exc}")
 
         choice = data.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content", "")
@@ -86,7 +111,7 @@ async def kimi_research(args: dict) -> dict:
         return _text_result(content + meta)
 
     except httpx.TimeoutException:
-        return _error_result("Kimi request timed out after 120s.")
+        return _error_result("Kimi request timed out after 300s (all retries exhausted).")
     except httpx.HTTPStatusError as e:
         return _error_result(f"Kimi API error: {e.response.status_code} {e.response.text[:200]}")
     except Exception as e:
