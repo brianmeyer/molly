@@ -535,7 +535,7 @@ class Molly:
         self._recent_surfaces: list[dict] = []  # recent surfaced notifications for feedback linking
         self._auto_create_undo_map: dict[str, dict] = {}  # notification msg_id -> created resource metadata
         self._auto_calendar_seen: dict[tuple[str, str], float] = {}
-        self._auto_calendar_lock: asyncio.Lock | None = None
+        self._auto_calendar_lock = asyncio.Lock()
         self.approvals = ApprovalManager()
         self.automations = AutomationEngine(self)
         self.self_improvement = SelfImprovementEngine(self)
@@ -1477,9 +1477,6 @@ class Molly:
         if not title or not isinstance(event_dt, datetime):
             return False
 
-        if self._auto_calendar_lock is None:
-            self._auto_calendar_lock = asyncio.Lock()
-
         async with self._auto_calendar_lock:
             self._prune_auto_calendar_seen()
             dedup_key = calendar_event_dedup_key(title, event_dt)
@@ -1710,6 +1707,8 @@ class Molly:
                     f"Approved. Proceed with: {description}",
                     chat_jid,
                     session_id,
+                    approval_manager=self.approvals,
+                    molly_instance=self,
                     source="whatsapp",
                     chat_context=chat_context,
                 )
@@ -1902,6 +1901,12 @@ class Molly:
         try:
             from memory.graph import close as close_graph
             close_graph()
+        except Exception:
+            pass
+        try:
+            from db_pool import close_sync_connections, close_async_connections
+            close_sync_connections()
+            await close_async_connections()
         except Exception:
             pass
         log.info("Molly shut down.")

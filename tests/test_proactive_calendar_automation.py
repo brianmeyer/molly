@@ -26,7 +26,7 @@ CHAT_JID = "15850000000@s.whatsapp.net"
 def _new_molly() -> Molly:
     """Create a bare Molly instance for testing (no __init__ side effects)."""
     molly = object.__new__(Molly)
-    molly._auto_calendar_lock = None
+    molly._auto_calendar_lock = asyncio.Lock()
     molly._auto_calendar_seen = {}
     molly._auto_create_undo_map = {}
     molly._sent_ids = {}

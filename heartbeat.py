@@ -1,6 +1,6 @@
 import logging
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import config
 from utils import atomic_write_json, load_json
@@ -10,82 +10,6 @@ log = logging.getLogger(__name__)
 HEARTBEAT_SENTINEL = "HEARTBEAT_OK"
 _HEARTBEAT_CHECKPOINT_MAX_IDS = 100
 
-# --------------- Calendar event auto-creation from triage ---------------
-
-async def _maybe_create_calendar_event(
-    triage_result,
-    molly,
-    owner_jid: str,
-    source_label: str = "",
-) -> bool:
-    """If triage_result has a calendar_event, route it through Claude to create.
-
-    Uses handle_message so the agent can use calendar_search (dedup) and
-    calendar_create (MCP tool) properly.  Returns True if dispatched.
-    """
-    cal = getattr(triage_result, "calendar_event", None)
-    if not cal or not isinstance(cal, dict):
-        return False
-
-    title = cal.get("title", "").strip()
-    start = cal.get("start", "").strip()
-    if not title or not start:
-        log.debug("calendar_event missing title or start, skipping: %s", cal)
-        return False
-
-    try:
-        from agent import handle_message
-
-        end = cal.get("end") or start
-        location = cal.get("location") or ""
-        notes = cal.get("notes") or ""
-        if source_label:
-            notes = f"{notes}\n(Auto-detected from {source_label})".strip()
-
-        prompt = (
-            f"Auto-detected calendar event from triage. "
-            f"First search Google Calendar to check if this event already exists. "
-            f"If it does NOT exist, create it. If it DOES exist, skip silently.\n\n"
-            f"Event details:\n"
-            f"- Title: {title}\n"
-            f"- Start: {start}\n"
-            f"- End: {end}\n"
-            f"- Location: {location}\n"
-            f"- Notes: {notes}\n\n"
-            f"If you create the event, respond with: CALENDAR_CREATED: {{title}}\n"
-            f"If it already exists, respond with: CALENDAR_EXISTS: {{title}}\n"
-            f"Keep your response to one line."
-        )
-
-        response, _ = await handle_message(
-            user_message=prompt,
-            chat_id=owner_jid,
-            session_id=None,
-            approval_manager=getattr(molly, "approvals", None),
-            molly_instance=molly,
-            source="calendar-auto",
-        )
-
-        if response and "CALENDAR_CREATED" in response:
-            msg = f"\U0001f4c5 *Auto-added to calendar:* {title}"
-            if location:
-                msg += f"\n\U0001f4cd {location}"
-            msg += f"\n\u23f0 {start}"
-            _send_surface(
-                molly, owner_jid, msg,
-                source="calendar-auto",
-                surfaced_summary=f"Auto-calendar: {title}",
-                sender_pattern="calendar:auto",
-            )
-            log.info("Auto-created calendar event: %s at %s", title, start)
-            return True
-        else:
-            log.info("Calendar event skipped (exists or failed): %s", title)
-            return False
-
-    except Exception:
-        log.warning("Failed to auto-create calendar event: %s", title, exc_info=True)
-        return False
 _skill_reload_count = 0
 
 # Morning digest window: first heartbeat between 7:00-7:59
@@ -170,7 +94,7 @@ def _checkpoint_email_processed(checkpoint: dict, msg_id: str) -> dict:
     if msg_id not in ids:
         ids.append(msg_id)
     checkpoint["processed_email_ids"] = ids[-_HEARTBEAT_CHECKPOINT_MAX_IDS :]
-    checkpoint["last_run_ts"] = datetime.utcnow().replace(microsecond=0).isoformat()
+    checkpoint["last_run_ts"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     _write_heartbeat_checkpoint(checkpoint)
     return checkpoint
 
@@ -682,7 +606,7 @@ async def _check_imessages(molly):
         state_data["imessage_heartbeat_hw"] = time.time()
         _save_state_data(state_data)
         checkpoint = _load_heartbeat_checkpoint()
-        checkpoint["last_imessage_ts"] = datetime.utcnow().replace(microsecond=0).isoformat()
+        checkpoint["last_imessage_ts"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         _write_heartbeat_checkpoint(checkpoint)
 
     except Exception:
@@ -1117,7 +1041,7 @@ async def _check_email(molly):
         state_data["email_heartbeat_hw"] = now
         _save_state_data(state_data)
 
-        checkpoint["last_run_ts"] = datetime.utcnow().replace(microsecond=0).isoformat()
+        checkpoint["last_run_ts"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         _write_heartbeat_checkpoint(checkpoint)
 
     except Exception:
