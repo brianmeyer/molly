@@ -72,7 +72,9 @@ async def embed_and_store(
     """
     try:
         loop = asyncio.get_running_loop()
-        vec = await loop.run_in_executor(None, embed, content)
+        vec = await asyncio.wait_for(
+            loop.run_in_executor(None, embed, content), timeout=30.0,
+        )
         vs = get_vectorstore()
         chunk_id = vs.store_chunk(
             content=content,
@@ -99,7 +101,9 @@ async def batch_embed_and_store(
         return 0
     try:
         loop = asyncio.get_running_loop()
-        vecs = await loop.run_in_executor(None, embed_batch, texts)
+        vecs = await asyncio.wait_for(
+            loop.run_in_executor(None, embed_batch, texts), timeout=60.0,
+        )
         vs = get_vectorstore()
         chunks = [
             {"content": text, "embedding": vec, "source": source, "chat_jid": chat_jid}
@@ -124,7 +128,9 @@ async def extract_to_graph(
         from memory import graph
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, extract, content)
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, extract, content), timeout=30.0,
+        )
         entities = _filter_entities(result["entities"])
         relations = _filter_relations(result["relations"])
 

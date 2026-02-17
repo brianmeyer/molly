@@ -18,7 +18,7 @@ YES_WORDS = frozenset({"yes", "y", "approve", "approved", "go", "proceed", "ok",
 NO_WORDS = frozenset({"no", "n", "deny", "denied", "cancel", "stop", "don't", "dont", "nope", "nah"})
 APPROVE_ALL_WORDS = frozenset({"all", "yes all", "approve all", "approved all", "go all", "proceed all", "all yes"})
 
-OWNER_PRIMARY_WHATSAPP_JID = os.getenv("MOLLY_OWNER_WHATSAPP_JID", "15550001234@s.whatsapp.net")
+OWNER_PRIMARY_WHATSAPP_JID = os.getenv("MOLLY_OWNER_WHATSAPP_JID", "")
 OWNER_APPROVAL_JID_FALLBACKS: tuple[str, ...] = (OWNER_PRIMARY_WHATSAPP_JID,)
 WHATSAPP_JID_SERVER_SUFFIX = ".whatsapp.net"
 WHATSAPP_JID_ALLOWED_SERVERS = {"lid", "g.us", "broadcast"}
@@ -570,6 +570,7 @@ class ApprovalManager:
             result = await asyncio.wait_for(future, timeout=timeout_s if timeout_s is not None else config.APPROVAL_TIMEOUT)
             return True, result
         except asyncio.TimeoutError:
+            log.warning("Approval wait timed out for action_id=%s category=%s", approval.id, category)
             self._remove_pending(approval)
             if not future.done():
                 future.set_result(False)

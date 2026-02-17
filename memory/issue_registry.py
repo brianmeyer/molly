@@ -1,9 +1,12 @@
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 _WS_RE = re.compile(r"\s+")
 _NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")

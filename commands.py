@@ -423,7 +423,7 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
                 return await asyncio.to_thread(doctor.history_markdown, days=7)
             if arg in {"fresh", "now", "run"}:
                 return await asyncio.to_thread(doctor.generate_report, abbreviated=False, trigger="manual")
-            return await asyncio.to_thread(doctor.get_or_generate_latest_report, fresh=False)
+            return await asyncio.to_thread(doctor.get_or_generate_latest_report)
         except Exception as e:
             log.error("/health failed", exc_info=True)
             return f"Health check failed: {e}"
@@ -435,6 +435,16 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             from memory.retriever import get_vectorstore
             vs = get_vectorstore()
             vs.upsert_sender_tier(args.strip(), "upgraded")
+            # Log training label for triage fine-tuning
+            try:
+                from memory.triage import log_triage_label
+                log_triage_label(
+                    sender=args.strip(),
+                    corrected_classification="relevant",
+                    feedback_source="upgrade_command",
+                )
+            except Exception:
+                pass
             return f"Upgraded '{args.strip()}' — messages will bias toward relevant."
         except Exception as e:
             log.error("/upgrade failed", exc_info=True)
@@ -447,6 +457,16 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             from memory.retriever import get_vectorstore
             vs = get_vectorstore()
             vs.upsert_sender_tier(args.strip(), "downgraded")
+            # Log training label for triage fine-tuning
+            try:
+                from memory.triage import log_triage_label
+                log_triage_label(
+                    sender=args.strip(),
+                    corrected_classification="background",
+                    feedback_source="downgrade_command",
+                )
+            except Exception:
+                pass
             return f"Downgraded '{args.strip()}' — messages will bias toward background."
         except Exception as e:
             log.error("/downgrade failed", exc_info=True)
@@ -459,6 +479,16 @@ async def handle_command(text: str, chat_jid: str, molly) -> str | None:
             from memory.retriever import get_vectorstore
             vs = get_vectorstore()
             vs.upsert_sender_tier(args.strip(), "muted")
+            # Log training label for triage fine-tuning
+            try:
+                from memory.triage import log_triage_label
+                log_triage_label(
+                    sender=args.strip(),
+                    corrected_classification="noise",
+                    feedback_source="mute_command",
+                )
+            except Exception:
+                pass
             return f"Muted '{args.strip()}' — messages will always be classified as noise."
         except Exception as e:
             log.error("/mute failed", exc_info=True)

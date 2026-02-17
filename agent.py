@@ -48,6 +48,16 @@ _MCP_SERVER_SPECS = {
     "groq": ("tools.groq", "groq_server"),
 }
 
+# Conditionally add browser MCP server when enabled
+if config.BROWSER_MCP_ENABLED:
+    _MCP_SERVER_SPECS["browser-mcp"] = {
+        "command": "npx",
+        "args": ["-y", "@anthropic-ai/browser-mcp@latest"],
+        "env": {
+            "BROWSER_PROFILE_DIR": str(config.BROWSER_PROFILE_DIR),
+        },
+    }
+
 _MCP_SERVER_TOOL_NAMES = {
     "google-calendar": {
         "calendar_list", "calendar_get", "calendar_search",
@@ -66,6 +76,10 @@ _MCP_SERVER_TOOL_NAMES = {
     "kimi": {"kimi_research"},
     "grok": {"grok_reason"},
     "groq": {"groq_reason"},
+    "browser-mcp": {
+        "browser_navigate", "browser_click", "browser_type",
+        "browser_screenshot", "browser_extract_text",
+    },
 }
 
 _CHAT_RUNTIME_LOCK = asyncio.Lock()
@@ -134,8 +148,9 @@ def _load_mcp_servers() -> dict[str, object]:
             disabled_servers.add(server_name)
             disabled_tools.update(_MCP_SERVER_TOOL_NAMES.get(server_name, set()))
 
-    config.DISABLED_MCP_SERVERS = disabled_servers
-    config.DISABLED_TOOL_NAMES = disabled_tools
+    with config._runtime_lock:
+        config.DISABLED_MCP_SERVERS = disabled_servers
+        config.DISABLED_TOOL_NAMES = disabled_tools
     return servers
 
 
@@ -876,9 +891,9 @@ async def handle_message(
     # return_exceptions=True lets us degrade gracefully if retrieval fails.
     loop = asyncio.get_running_loop()
     results = await asyncio.gather(
-        loop.run_in_executor(None, load_identity_stack),
+        asyncio.wait_for(loop.run_in_executor(None, load_identity_stack), timeout=15.0),
         retrieve_context(user_message),
-        loop.run_in_executor(None, match_skills, user_message),
+        asyncio.wait_for(loop.run_in_executor(None, match_skills, user_message), timeout=15.0),
         return_exceptions=True,
     )
     # Unpack with graceful degradation: system_prompt is required,
@@ -915,70 +930,101 @@ async def handle_message(
     query_succeeded = False
     failure_detail = ""
 
-    async with runtime.lock:
-        runtime.last_used_monotonic = time.monotonic()
-
-        if session_id and session_id != runtime.session_id:
-            runtime.session_id = session_id
-            await _disconnect_runtime(runtime)
-        elif session_id and runtime.session_id is None:
-            runtime.session_id = session_id
-
-        runtime.approval_manager = approval_manager
-        runtime.molly_instance = molly_instance
-        runtime.request_state = request_state
-
+    # --- Orchestrator path (Phase 5A) ---
+    # When enabled, route through Kimi K2.5 triage + parallel workers.
+    # Falls back to serial Claude SDK path on ANY failure.
+    orchestrator_handled = False
+    if getattr(config, "ORCHESTRATOR_ENABLED", False):
         try:
-            for attempt in range(2):
-                try:
-                    await _ensure_connected_runtime(runtime, chat_id, system_prompt)
-                    response_text, new_session_id = await _query_with_client(runtime, turn_prompt)
+            from orchestrator import classify_message
+            from workers import run_workers
+
+            triage = await classify_message(user_message)
+            if triage.classification in ("simple", "complex") and triage.subtasks:
+                response_text = await run_workers(triage, original_message=user_message)
+                if response_text:
+                    orchestrator_handled = True
                     query_succeeded = True
-                    failure_detail = ""
-                    break
-                except Exception as exc:
-                    failure_detail = type(exc).__name__
-                    recoverable = _is_recoverable_transport_error(exc)
-                    if recoverable:
-                        # If buffer overflow, the session itself is too large — reset it
-                        is_overflow = any(
-                            "buffer size" in str(e).lower()
-                            for e in _iter_exceptions(exc)
-                        )
-                        if is_overflow:
-                            log.warning(
-                                "Session buffer overflow in %s — resetting session (attempt %d/2)",
-                                chat_id,
-                                attempt + 1,
-                            )
-                            runtime.session_id = None
-                        else:
-                            log.warning(
-                                "Recoverable Claude transport error in %s (attempt %d/2): %s",
-                                chat_id,
-                                attempt + 1,
-                                exc,
-                            )
-                        await _disconnect_runtime(runtime)
-                        if approval_manager and hasattr(approval_manager, "cancel_pending"):
-                            with suppress(Exception):
-                                approval_manager.cancel_pending(chat_id)
-                        request_state.reset_for_retry()
-                        if attempt == 0:
-                            continue
+                    # Orchestrator uses its own worker sessions; don't carry
+                    # forward a stale session_id from a previous serial call.
+                    new_session_id = session_id or None
+                    log.info(
+                        "Orchestrator handled message: %s (%s, %.0fms, %d workers)",
+                        triage.classification, triage.model_used,
+                        triage.latency_ms, len(triage.subtasks),
+                    )
+        except Exception as exc:
+            log.warning(
+                "Orchestrator path failed, falling back to serial: %s", exc,
+                exc_info=True,
+            )
+            orchestrator_handled = False
 
-                    log.error("Claude query failed for chat %s", chat_id, exc_info=True)
-                    if not response_text:
-                        response_text = "Something went wrong on my end. Try again in a moment."
-                    break
-        finally:
-            runtime.request_state = None
+    if not orchestrator_handled:
+        async with runtime.lock:
+            runtime.last_used_monotonic = time.monotonic()
 
-        if new_session_id:
-            runtime.session_id = new_session_id
-        else:
-            new_session_id = runtime.session_id
-        runtime.last_used_monotonic = time.monotonic()
+            if session_id and session_id != runtime.session_id:
+                runtime.session_id = session_id
+                await _disconnect_runtime(runtime)
+            elif session_id and runtime.session_id is None:
+                runtime.session_id = session_id
+
+            runtime.approval_manager = approval_manager
+            runtime.molly_instance = molly_instance
+            runtime.request_state = request_state
+
+            try:
+                for attempt in range(2):
+                    try:
+                        await _ensure_connected_runtime(runtime, chat_id, system_prompt)
+                        response_text, new_session_id = await _query_with_client(runtime, turn_prompt)
+                        query_succeeded = True
+                        failure_detail = ""
+                        break
+                    except Exception as exc:
+                        failure_detail = type(exc).__name__
+                        recoverable = _is_recoverable_transport_error(exc)
+                        if recoverable:
+                            # If buffer overflow, the session itself is too large — reset it
+                            is_overflow = any(
+                                "buffer size" in str(e).lower()
+                                for e in _iter_exceptions(exc)
+                            )
+                            if is_overflow:
+                                log.warning(
+                                    "Session buffer overflow in %s — resetting session (attempt %d/2)",
+                                    chat_id,
+                                    attempt + 1,
+                                )
+                                runtime.session_id = None
+                            else:
+                                log.warning(
+                                    "Recoverable Claude transport error in %s (attempt %d/2): %s",
+                                    chat_id,
+                                    attempt + 1,
+                                    exc,
+                                )
+                            await _disconnect_runtime(runtime)
+                            if approval_manager and hasattr(approval_manager, "cancel_pending"):
+                                with suppress(Exception):
+                                    approval_manager.cancel_pending(chat_id)
+                            request_state.reset_for_retry()
+                            if attempt == 0:
+                                continue
+
+                        log.error("Claude query failed for chat %s", chat_id, exc_info=True)
+                        if not response_text:
+                            response_text = "Something went wrong on my end. Try again in a moment."
+                        break
+            finally:
+                runtime.request_state = None
+
+            if new_session_id:
+                runtime.session_id = new_session_id
+            else:
+                new_session_id = runtime.session_id
+            runtime.last_used_monotonic = time.monotonic()
 
     _emit_approval_metrics(request_state)
     _maybe_log_skill_gap(

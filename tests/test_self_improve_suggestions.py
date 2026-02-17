@@ -15,7 +15,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 import db_pool
 from foundry_adapter import FoundrySequenceSignal
-from self_improve import SelfImprovementEngine
+from evolution.pattern_helpers import pattern_steps
+from evolution.skills import SelfImprovementEngine
 
 
 class TestSelfImproveSuggestions(unittest.TestCase):
@@ -23,11 +24,11 @@ class TestSelfImproveSuggestions(unittest.TestCase):
         self.engine = SelfImprovementEngine()
 
     def test_pattern_steps_parses_string_sequence(self):
-        steps = self.engine._pattern_steps({"steps": "alpha -> beta -> gamma"})
+        steps = pattern_steps({"steps": "alpha -> beta -> gamma"})
         self.assertEqual(steps, ["alpha", "beta", "gamma"])
 
     def test_build_failure_diagnostic_tool_generates_valid_python(self):
-        tool_name, tool_code, test_code = self.engine._build_failure_diagnostic_tool(
+        tool_name, tool_code, test_code = self.engine.tool_gaps.build_failure_diagnostic_tool(
             source_tool_name="mcp__grok__grok_reason",
             failures=4,
             sample_error="dependency missing",
@@ -68,7 +69,7 @@ class TestSelfImproveSuggestions(unittest.TestCase):
         old_path = config.MOLLYGRAPH_PATH
         config.MOLLYGRAPH_PATH = db_path
         try:
-            candidates = self.engine._detect_tool_gap_candidates(days=30, min_failures=3)
+            candidates = self.engine.tool_gaps.detect_tool_gap_candidates(days=30, min_failures=3)
         finally:
             config.MOLLYGRAPH_PATH = old_path
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -111,7 +112,7 @@ class TestSelfImproveSuggestions(unittest.TestCase):
         config.MOLLYGRAPH_PATH = db_path
         try:
             # Default threshold/window is 5 failures in 7 days; this should not trigger.
-            candidates = self.engine._detect_tool_gap_candidates()
+            candidates = self.engine.tool_gaps.detect_tool_gap_candidates()
         finally:
             config.MOLLYGRAPH_PATH = old_path
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -129,10 +130,10 @@ class TestSelfImproveSuggestions(unittest.TestCase):
             {"tool_name": "kimi_research", "created_at": "2026-02-09T10:06:00+00:00"},
             {"tool_name": "worker_agent", "created_at": "2026-02-09T10:07:00+00:00"},
         ]
-        with patch.object(self.engine, "_rows", return_value=rows), \
-                patch.object(self.engine, "_load_foundry_sequence_signals", return_value={}), \
-                patch.object(self.engine, "_existing_automation_ids", return_value=set()):
-            patterns = self.engine._detect_workflow_patterns(days=30, min_occurrences=2)
+        with patch.object(self.engine.infra, "rows", return_value=rows), \
+                patch.object(self.engine.auto_patterns, "load_foundry_sequence_signals", return_value={}), \
+                patch.object(self.engine.auto_patterns, "existing_automation_ids", return_value=set()):
+            patterns = self.engine.auto_patterns.detect_workflow_patterns(days=30, min_occurrences=2)
 
         target = next(
             (item for item in patterns if item.get("steps_text") == "WebSearch -> kimi_research -> worker_agent"),
@@ -166,10 +167,10 @@ class TestSelfImproveSuggestions(unittest.TestCase):
                 latest_at="2026-02-09T13:49:27+00:00",
             )
         }
-        with patch.object(self.engine, "_rows", return_value=rows), \
-                patch.object(self.engine, "_load_foundry_sequence_signals", return_value=foundry), \
-                patch.object(self.engine, "_existing_automation_ids", return_value=set()):
-            patterns = self.engine._detect_workflow_patterns(days=30, min_occurrences=3)
+        with patch.object(self.engine.infra, "rows", return_value=rows), \
+                patch.object(self.engine.auto_patterns, "load_foundry_sequence_signals", return_value=foundry), \
+                patch.object(self.engine.auto_patterns, "existing_automation_ids", return_value=set()):
+            patterns = self.engine.auto_patterns.detect_workflow_patterns(days=30, min_occurrences=3)
 
         target = next((item for item in patterns if item.get("steps_text") == key), None)
         self.assertIsNotNone(target)
@@ -190,12 +191,12 @@ class TestSelfImproveSuggestionFlow(unittest.IsolatedAsyncioTestCase):
             "sample_error": "transient failure",
         }
 
-        with patch.object(engine, "_detect_tool_gap_candidates", return_value=[candidate]), \
-                patch.object(engine, "_has_recent_event", return_value=False), \
-                patch.object(engine, "_request_owner_decision", new=AsyncMock(return_value=False)) as ask_mock, \
-                patch.object(engine, "propose_tool", new=AsyncMock()) as propose_mock, \
-                patch.object(engine, "_log_negative_preference_signal") as neg_pref_mock:
-            result = await engine._propose_tool_updates_from_failures()
+        with patch.object(engine.tool_gaps, "detect_tool_gap_candidates", return_value=[candidate]), \
+                patch.object(engine.skill_gaps, "has_recent_event", return_value=False), \
+                patch.object(engine.comms, "request_owner_decision", new=AsyncMock(return_value=False)) as ask_mock, \
+                patch.object(engine.tool_gaps, "propose_tool", new=AsyncMock()) as propose_mock, \
+                patch.object(engine.tool_gaps, "log_negative_preference_signal") as neg_pref_mock:
+            result = await engine.tool_gaps.propose_tool_updates_from_failures()
 
         self.assertEqual(result["status"], "skipped")
         self.assertTrue(ask_mock.await_count >= 1)
@@ -264,7 +265,7 @@ class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
         rows = []
         events = 0
         try:
-            result = await engine._propose_skill_updates_from_gap_clusters(min_cluster_size=3)
+            result = await engine.skill_gaps.propose_skill_updates_from_gap_clusters(min_cluster_size=3)
             conn = db_pool.sqlite_connect(str(db_path))
             rows = conn.execute(
                 "SELECT status, addressed, proposal_id, cooldown_until FROM skill_gaps WHERE cluster_key = ?",
@@ -345,7 +346,7 @@ class TestSelfImproveSkillGapWiring(unittest.IsolatedAsyncioTestCase):
         old_path = config.MOLLYGRAPH_PATH
         config.MOLLYGRAPH_PATH = db_path
         try:
-            result = await engine._propose_skill_updates_from_gap_clusters(min_cluster_size=3)
+            result = await engine.skill_gaps.propose_skill_updates_from_gap_clusters(min_cluster_size=3)
         finally:
             config.MOLLYGRAPH_PATH = old_path
             shutil.rmtree(tmpdir, ignore_errors=True)

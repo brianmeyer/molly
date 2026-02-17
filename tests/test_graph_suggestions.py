@@ -571,7 +571,7 @@ class TestSourceAssertions(unittest.TestCase):
         self.assertIn("config.WORKSPACE", content)
 
     def test_self_improve_has_public_wrappers(self):
-        content = self._read_source("self_improve.py")
+        content = self._read_source("evolution", "skills.py")
         self.assertIn("async def propose_skill_updates(self", content)
         self.assertIn("async def propose_tool_updates(self", content)
 

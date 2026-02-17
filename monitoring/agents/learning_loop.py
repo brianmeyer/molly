@@ -145,6 +145,9 @@ def run_learning_loop(molly=None) -> list[HealthCheck]:
         )
     )
 
+    # 9–11. Evolution engine health (evolution.db)
+    checks.extend(_evolution_health_checks())
+
     return checks
 
 
@@ -264,6 +267,127 @@ def _weekly_assessment_check() -> tuple[str, str]:
     if days_since <= 14:
         return "yellow", f"stale {days_since} days (latest {latest.stem})"
     return "red", f"stale {days_since} days (latest {latest.stem})"
+
+
+def _evolution_health_checks() -> list[HealthCheck]:
+    """Query evolution.db for bandit, shadow eval, and guard violation health."""
+    checks: list[HealthCheck] = []
+
+    try:
+        from evolution.db import get_connection
+        conn = get_connection()
+    except Exception as exc:
+        checks.append(HealthCheck(
+            check_id="learning.evolution_db",
+            layer="Learning Loop",
+            label="Evolution DB accessible",
+            status="red",
+            detail=f"cannot open evolution.db: {exc}",
+            action_required=True,
+        ))
+        return checks
+
+    try:
+        cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).timestamp()
+
+        # 9. Bandit arm convergence — are arms being pulled and rewarded?
+        arm_row = conn.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(pulls), 0) as total_pulls, "
+            "COALESCE(AVG(CASE WHEN pulls > 0 THEN 1.0 * successes / pulls END), 0) as avg_rate "
+            "FROM bandit_arms"
+        ).fetchone()
+        arm_count = arm_row["cnt"] if arm_row else 0
+        total_pulls = arm_row["total_pulls"] if arm_row else 0
+        avg_rate = arm_row["avg_rate"] if arm_row else 0
+
+        if arm_count == 0:
+            bandit_status, bandit_detail = "yellow", "no bandit arms registered"
+        elif total_pulls == 0:
+            bandit_status, bandit_detail = "yellow", f"{arm_count} arms, 0 pulls"
+        else:
+            bandit_status = "green"
+            bandit_detail = f"{arm_count} arms, {total_pulls} pulls, avg success rate {avg_rate:.1%}"
+        checks.append(HealthCheck(
+            check_id="learning.bandit_convergence",
+            layer="Learning Loop",
+            label="Bandit arm convergence",
+            status=bandit_status,
+            detail=bandit_detail,
+            watch_item=(bandit_status == "yellow"),
+        ))
+
+        # 10. Shadow evaluation pass rate — are proposed changes improving?
+        shadow_row = conn.execute(
+            "SELECT COUNT(*) as cnt, "
+            "COALESCE(SUM(is_improvement), 0) as improved, "
+            "COALESCE(SUM(guard_passed), 0) as guard_ok "
+            "FROM shadow_results WHERE timestamp > ?",
+            (cutoff_7d,),
+        ).fetchone()
+        shadow_cnt = shadow_row["cnt"] if shadow_row else 0
+
+        if shadow_cnt == 0:
+            shadow_status, shadow_detail = "yellow", "no shadow evaluations in last 7 days"
+        else:
+            improved = shadow_row["improved"]
+            guard_ok = shadow_row["guard_ok"]
+            pass_rate = improved / shadow_cnt
+            shadow_status = "green" if pass_rate >= 0.3 else "yellow" if pass_rate > 0 else "red"
+            shadow_detail = (
+                f"{shadow_cnt} evals, {improved} improved ({pass_rate:.0%}), "
+                f"{guard_ok} guard-passed (last 7d)"
+            )
+        checks.append(HealthCheck(
+            check_id="learning.shadow_eval_pass_rate",
+            layer="Learning Loop",
+            label="Shadow eval pass rate",
+            status=shadow_status,
+            detail=shadow_detail,
+            watch_item=(shadow_status == "yellow"),
+            action_required=(shadow_status == "red"),
+        ))
+
+        # 11. Guard violations — are we hitting safety limits?
+        violation_row = conn.execute(
+            "SELECT COUNT(*) as cnt, "
+            "COALESCE(SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END), 0) as critical "
+            "FROM guard_violations WHERE timestamp > ?",
+            (cutoff_7d,),
+        ).fetchone()
+        v_cnt = violation_row["cnt"] if violation_row else 0
+        v_critical = violation_row["critical"] if violation_row else 0
+
+        if v_critical > 0:
+            guard_status = "red"
+        elif v_cnt > 5:
+            guard_status = "yellow"
+        else:
+            guard_status = "green"
+        guard_detail = f"{v_cnt} violations ({v_critical} critical) in last 7 days"
+        checks.append(HealthCheck(
+            check_id="learning.guard_violations",
+            layer="Learning Loop",
+            label="Guard violations",
+            status=guard_status,
+            detail=guard_detail,
+            watch_item=(guard_status == "yellow"),
+            action_required=(guard_status == "red"),
+        ))
+
+    except Exception as exc:
+        log.debug("Evolution health checks failed: %s", exc, exc_info=True)
+        checks.append(HealthCheck(
+            check_id="learning.evolution_health",
+            layer="Learning Loop",
+            label="Evolution engine health",
+            status="yellow",
+            detail=f"checks failed: {exc}",
+            watch_item=True,
+        ))
+    finally:
+        conn.close()
+
+    return checks
 
 
 def _rejected_resubmission_check() -> tuple[str, str]:

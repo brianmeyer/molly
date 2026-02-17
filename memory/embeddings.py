@@ -4,6 +4,8 @@ from typing import Optional
 
 import numpy as np
 
+from utils import track_latency
+
 log = logging.getLogger(__name__)
 
 _model = None
@@ -25,6 +27,7 @@ def _get_model():
     return _model
 
 
+@track_latency("embedding")
 def embed(text: str) -> list[float]:
     """Embed a single text string. Returns 768-dim float vector."""
     model = _get_model()
@@ -32,6 +35,7 @@ def embed(text: str) -> list[float]:
     return vec.tolist()
 
 
+@track_latency("embedding")
 def embed_batch(texts: list[str]) -> list[list[float]]:
     """Embed multiple texts. Returns list of 768-dim float vectors."""
     if not texts:

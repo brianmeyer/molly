@@ -30,3 +30,16 @@ gliner2
 neo4j
 neo4j-rust-ext
 llama-cpp-python
+
+# Phase 5C: Voice loop (Porcupine wakeword + Gemini Live)
+pvporcupine>=4.0
+pvrecorder>=1.2
+google-genai>=1.0
+pyaudio>=0.2.13
+
+# Phase 5C: Qwen3 LoRA fine-tuning
+peft
+datasets
+
+# System monitoring (used by monitoring agents)
+psutil
