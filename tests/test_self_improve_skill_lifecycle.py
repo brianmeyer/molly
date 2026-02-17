@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config
 import db_pool
-from self_improve import SelfImprovementEngine
+from evolution.skills import SelfImprovementEngine
 
 
 class _RecordingVectorStore:
@@ -141,7 +141,7 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
         pending_path = self.skills_dir / "workflow-review-skill.md.pending"
 
         with patch.object(engine, "initialize", new=AsyncMock()), \
-                patch.object(engine, "_request_owner_decision", new=AsyncMock(return_value=True)):
+                patch.object(engine.comms, "request_owner_decision", new=AsyncMock(return_value=True)):
             result = await engine.propose_skill_lifecycle(proposal)
 
         self.assertEqual(result["status"], "approved")
@@ -162,8 +162,8 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(engine, "initialize", new=AsyncMock()), \
                 patch.object(
-                    engine,
-                    "_request_owner_decision",
+                    engine.comms,
+                    "request_owner_decision",
                     new=AsyncMock(return_value=("deny", "too broad")),
                 ):
             result = await engine.propose_skill_lifecycle(proposal)
@@ -184,7 +184,7 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
 
         decision_mock = AsyncMock(side_effect=["steps: Gather data -> Validate results -> Share summary", True])
         with patch.object(engine, "initialize", new=AsyncMock()), \
-                patch.object(engine, "_request_owner_decision", new=decision_mock):
+                patch.object(engine.comms, "request_owner_decision", new=decision_mock):
             result = await engine.propose_skill_lifecycle(proposal)
 
         self.assertEqual(result["status"], "approved")
@@ -198,14 +198,14 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
         engine = SelfImprovementEngine()
         base = self._proposal(name="Release Review skill")
         live_path = self.skills_dir / "release-review-skill.md"
-        live_path.write_text(engine._render_skill_markdown(base))
+        live_path.write_text(engine.skill_lifecycle.render_skill_markdown(base))
 
         updated = dict(base)
         updated["steps"] = ["Collect release notes", "Validate dependencies", "Publish rollout summary"]
         pending_edit_path = self.skills_dir / "release-review-skill.md.pending-edit"
 
         with patch.object(engine, "initialize", new=AsyncMock()), \
-                patch.object(engine, "_request_owner_decision", new=AsyncMock(return_value=True)):
+                patch.object(engine.comms, "request_owner_decision", new=AsyncMock(return_value=True)):
             result = await engine.propose_skill_lifecycle(updated)
 
         self.assertEqual(result["status"], "approved")
@@ -220,7 +220,7 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
         engine = SelfImprovementEngine()
         base = self._proposal(name="Incident Triage skill")
         live_path = self.skills_dir / "incident-triage-skill.md"
-        original_text = engine._render_skill_markdown(base)
+        original_text = engine.skill_lifecycle.render_skill_markdown(base)
         live_path.write_text(original_text)
 
         updated = dict(base)
@@ -229,8 +229,8 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(engine, "initialize", new=AsyncMock()), \
                 patch.object(
-                    engine,
-                    "_request_owner_decision",
+                    engine.comms,
+                    "request_owner_decision",
                     new=AsyncMock(return_value=("deny", "keep current wording")),
                 ):
             result = await engine.propose_skill_lifecycle(updated)
@@ -245,14 +245,14 @@ class TestSelfImproveSkillLifecycle(unittest.IsolatedAsyncioTestCase):
         engine_a = SelfImprovementEngine()
         decision_mock_a = AsyncMock(return_value=("deny", "not needed"))
         with patch.object(engine_a, "initialize", new=AsyncMock()), \
-                patch.object(engine_a, "_request_owner_decision", new=decision_mock_a):
+                patch.object(engine_a.comms, "request_owner_decision", new=decision_mock_a):
             first = await engine_a.propose_skill_lifecycle(proposal)
         self.assertEqual(first["status"], "rejected")
 
         engine_b = SelfImprovementEngine()
         decision_mock_b = AsyncMock(return_value=True)
         with patch.object(engine_b, "initialize", new=AsyncMock()), \
-                patch.object(engine_b, "_request_owner_decision", new=decision_mock_b):
+                patch.object(engine_b.comms, "request_owner_decision", new=decision_mock_b):
             second = await engine_b.propose_skill_lifecycle(proposal)
 
         self.assertEqual(second["status"], "skipped")

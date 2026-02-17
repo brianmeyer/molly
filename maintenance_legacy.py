@@ -902,7 +902,7 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
             nonlocal improver
             if improver is not None:
                 return improver
-            from self_improve import SelfImprovementEngine
+            from evolution.skills import SelfImprovementEngine
 
             improver = getattr(molly, "self_improvement", None) if molly else None
             if improver is None:

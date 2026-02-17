@@ -79,6 +79,7 @@ class GatewayEngine:
         self._state_path = config.AUTOMATIONS_STATE_FILE
         self._state_lock = asyncio.Lock()
         self._tick_lock = asyncio.Lock()
+        self._tick_in_progress = False
         self._initialized = False
         self._last_tick_at: datetime | None = None
         self._running: set[str] = set()
@@ -146,19 +147,22 @@ class GatewayEngine:
             if elapsed < config.AUTOMATION_TICK_INTERVAL:
                 return
 
-        if self._tick_lock.locked():
-            return
-
         async with self._tick_lock:
-            self._last_tick_at = now_utc
-            for job_id, job in self._jobs.items():
-                if job_id in self._running:
-                    continue
-                if not await self._is_job_enabled(job_id, job):
-                    continue
-                if not await self._job_due(job_id, job, now_utc):
-                    continue
-                self._schedule_job(job_id, job, now_utc)
+            if self._tick_in_progress:
+                return
+            self._tick_in_progress = True
+            try:
+                self._last_tick_at = now_utc
+                for job_id, job in self._jobs.items():
+                    if job_id in self._running:
+                        continue
+                    if not await self._is_job_enabled(job_id, job):
+                        continue
+                    if not await self._job_due(job_id, job, now_utc):
+                        continue
+                    self._schedule_job(job_id, job, now_utc)
+            finally:
+                self._tick_in_progress = False
 
     async def on_message(self, message_data: dict):
         """Delegate message-triggered commitment extraction to legacy engine."""
@@ -371,7 +375,7 @@ class GatewayEngine:
         async with self._state_lock:
             counts = self._state.setdefault("daily_message_counts", {})
             count = int(counts.get(local_day, 0) or 0)
-            return count < 5
+            return count < getattr(config, "GATEWAY_DAILY_MESSAGE_CAP", 5)
 
     async def _mark_daily_message_sent(self, now_utc: datetime):
         local_day = now_utc.astimezone(ZoneInfo(config.TIMEZONE)).date().isoformat()
@@ -482,24 +486,69 @@ def propose_automation(operational_logs: list[dict]) -> str | None:
 
 
 def attach_gateway_routes(app, molly) -> None:
-    """Attach gateway webhook/status endpoints to FastAPI app."""
+    """Attach gateway webhook/status endpoints to FastAPI app.
+
+    Phase 5B additions:
+    - Webhook auth via GATEWAY_WEBHOOK_TOKEN (shared secret)
+    - /gateway/status shows job schedule, last run times, orchestrator state
+    """
 
     try:
-        from fastapi import Body
+        from fastapi import Body, Header, HTTPException
+        from fastapi.responses import JSONResponse
     except Exception:  # pragma: no cover - FastAPI optional in some contexts
         return
 
+    import hmac
+
+    def _check_webhook_auth(authorization: str | None) -> bool:
+        """Validate webhook auth token if configured."""
+        token = getattr(config, "GATEWAY_WEBHOOK_TOKEN", "")
+        if not token:
+            return True  # No token = no auth required
+        if not authorization:
+            return False
+        # Accept "Bearer <token>" or raw token
+        provided = authorization.replace("Bearer ", "").strip()
+        return hmac.compare_digest(provided, token)
+
     @app.get("/gateway/status")
-    async def gateway_status_endpoint():
+    async def gateway_status_endpoint(
+        authorization: str | None = Header(default=None),
+    ):
+        # Reuse webhook auth for status endpoint (Security audit finding)
+        if not _check_webhook_auth(authorization):
+            raise HTTPException(status_code=401, detail="Invalid or missing auth token")
+
         engine = getattr(molly, "automations", None)
         if engine is None:
             return {"ok": False, "error": "gateway not initialized"}
+
+        result: dict[str, Any] = {}
+
+        # Gateway job status
         if hasattr(engine, "gateway_status"):
-            return {"ok": True, "status": await engine.gateway_status()}
-        return {"ok": False, "error": "gateway status unavailable"}
+            result["gateway"] = await engine.gateway_status()
+
+        # Phase 5A: Orchestrator stats
+        try:
+            from orchestrator import get_orchestrator_stats
+            result["orchestrator"] = get_orchestrator_stats(hours=24)
+        except Exception:
+            result["orchestrator"] = {"available": False}
+
+        return {"ok": True, "status": result}
 
     @app.post("/webhook/{job_id}")
-    async def gateway_webhook_endpoint(job_id: str, payload: dict[str, Any] = Body(default={})):  # type: ignore[misc]
+    async def gateway_webhook_endpoint(
+        job_id: str,
+        payload: dict[str, Any] = Body(default={}),  # type: ignore[misc]
+        authorization: str | None = Header(default=None),
+    ):
+        # Phase 5B: webhook auth
+        if not _check_webhook_auth(authorization):
+            raise HTTPException(status_code=401, detail="Invalid or missing webhook token")
+
         engine = getattr(molly, "automations", None)
         if engine is None:
             return {"ok": False, "error": "gateway not initialized"}

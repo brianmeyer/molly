@@ -775,7 +775,7 @@ class TestRelationshipAuditSourceAssertions(unittest.TestCase):
         self.assertIn("run_relationship_audit", content)
 
     def test_self_improve_has_quarantine_filter(self):
-        content = self._read_source("self_improve.py")
+        content = self._read_source("evolution", "gliner_training.py")
         self.assertIn("audit_status", content)
         self.assertIn("quarantined", content)
 

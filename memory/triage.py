@@ -467,7 +467,7 @@ def _build_context(
         try:
             import sqlite3 as _sql
             db_path = config.DATABASE_PATH
-            with _sql.connect(str(db_path)) as conn:
+            with _sql.connect(str(db_path), timeout=5) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     """SELECT sender_name, content
@@ -636,11 +636,14 @@ async def classify_local_async(prompt: str, text: str) -> str:
     import asyncio
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _TRIAGE_EXECUTOR,
-        classify_local,
-        prompt,
-        text,
+    return await asyncio.wait_for(
+        loop.run_in_executor(
+            _TRIAGE_EXECUTOR,
+            classify_local,
+            prompt,
+            text,
+        ),
+        timeout=20.0,
     )
 
 
@@ -807,11 +810,14 @@ async def parse_time_local_async(text: str, now_local=None) -> "datetime | None"
         now_local = datetime.now(ZoneInfo(config.TIMEZONE))
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _TRIAGE_EXECUTOR,
-        parse_time_local,
-        text,
-        now_local,
+    return await asyncio.wait_for(
+        loop.run_in_executor(
+            _TRIAGE_EXECUTOR,
+            parse_time_local,
+            text,
+            now_local,
+        ),
+        timeout=20.0,
     )
 
 
@@ -1092,9 +1098,12 @@ async def triage_message(
     loop = asyncio.get_running_loop()
 
     try:
-        result = await loop.run_in_executor(
-            _TRIAGE_EXECUTOR,
-            _sync_triage, message, sender_name, group_name, use_think, chat_jid,
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                _TRIAGE_EXECUTOR,
+                _sync_triage, message, sender_name, group_name, use_think, chat_jid,
+            ),
+            timeout=45.0,
         )
         return result
     except Exception:
@@ -1132,13 +1141,42 @@ def _sync_triage(
     return _parse_response(raw)
 
 
+def _get_logit_bias(model: object) -> dict[str, float] | None:
+    """Build logit_bias dict constraining the classification token to one of 4 categories.
+
+    Returns None if tokenization is unavailable; callers should fall back to
+    unconstrained generation.
+    """
+    try:
+        tokenize = getattr(model, "tokenize", None)
+        if tokenize is None:
+            return None
+
+        bias: dict[str, float] = {}
+        for label in ("urgent", "relevant", "background", "noise"):
+            # Tokenize each label and boost the first token.
+            # llama-cpp-python tokenize() returns list[int].
+            tokens = tokenize(label.encode("utf-8"), add_bos=False)
+            if tokens:
+                bias[str(tokens[0])] = 10.0
+        return bias if bias else None
+    except Exception:
+        log.debug("Failed to build logit_bias for triage", exc_info=True)
+        return None
+
+
 def _run_model(
     model: object, user_prompt: str, max_tokens: int,
     system_prompt: str = "",
 ) -> str:
-    """Run the local model and return raw text output."""
+    """Run the local model and return raw text output.
+
+    Uses logit bias when available to constrain the classification token
+    to one of the 4 valid categories (urgent/relevant/background/noise),
+    improving speed and reliability.
+    """
     prompt_text = system_prompt or SYSTEM_PROMPT
-    kwargs = {
+    kwargs: dict = {
         "messages": [
             {"role": "system", "content": prompt_text},
             {"role": "user", "content": user_prompt},
@@ -1146,6 +1184,11 @@ def _run_model(
         "temperature": 0.1,
         "max_tokens": max_tokens,
     }
+
+    # Build logit bias to constrain classification token
+    logit_bias = _get_logit_bias(model)
+    if logit_bias:
+        kwargs["logit_bias"] = logit_bias
 
     # First try strict JSON output via chat completion.
     try:
@@ -1155,12 +1198,24 @@ def _run_model(
         )
         return resp.get("choices", [{}])[0].get("message", {}).get("content", "")
     except TypeError:
-        # Older llama-cpp builds may not support response_format.
-        pass
+        # Older llama-cpp builds may not support response_format or logit_bias.
+        # Retry without logit_bias.
+        kwargs.pop("logit_bias", None)
+        try:
+            resp = model.create_chat_completion(
+                **kwargs,
+                response_format={"type": "json_object"},
+            )
+            return resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except TypeError:
+            pass
+        except Exception:
+            log.debug("Triage chat completion (json mode, no bias) failed", exc_info=True)
     except Exception:
         log.debug("Triage chat completion (json mode) failed", exc_info=True)
 
-    # Fallback: regular chat completion.
+    # Fallback: regular chat completion (no logit_bias — already tried).
+    kwargs.pop("logit_bias", None)
     try:
         resp = model.create_chat_completion(**kwargs)
         return resp.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -1238,3 +1293,75 @@ def _parse_response(raw: str) -> TriageResult:
         classification="background", score=0.5,
         reason="Unparseable triage response — defaulting to background",
     )
+
+
+# ---------- Triage Training Data Accumulation (Task 4.18) ----------
+
+_TRIAGE_LABELS_PATH = config.WORKSPACE / "training" / "triage_labels.jsonl"
+
+
+def log_triage_label(
+    *,
+    sender: str,
+    message_snippet: str = "",
+    group_name: str = "",
+    model_classification: str = "",
+    model_score: float = 0.0,
+    corrected_classification: str = "",
+    feedback_source: str = "manual",
+) -> bool:
+    """Log a labeled triage example for future fine-tuning.
+
+    Called when:
+    - ``/upgrade``, ``/downgrade``, ``/mute`` commands override triage output
+    - A user dismisses a proactive notification (implicit feedback)
+    - Triage completes with high confidence (self-labeled)
+
+    Returns True if the label was written successfully.
+    """
+    try:
+        _TRIAGE_LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "sender": sender[:200],
+            "message_snippet": message_snippet[:500],
+            "group_name": group_name[:100],
+            "model_classification": model_classification,
+            "model_score": round(model_score, 3),
+            "corrected_classification": corrected_classification,
+            "feedback_source": feedback_source,
+        }
+        with open(_TRIAGE_LABELS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        log.debug("Failed to log triage label", exc_info=True)
+        return False
+
+
+def get_triage_training_stats() -> dict:
+    """Return basic statistics about accumulated triage training data."""
+    if not _TRIAGE_LABELS_PATH.exists():
+        return {"total": 0, "by_source": {}, "by_corrected": {}}
+    try:
+        by_source: dict[str, int] = {}
+        by_corrected: dict[str, int] = {}
+        total = 0
+        with open(_TRIAGE_LABELS_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    total += 1
+                    src = rec.get("feedback_source", "unknown")
+                    by_source[src] = by_source.get(src, 0) + 1
+                    corr = rec.get("corrected_classification", "")
+                    if corr:
+                        by_corrected[corr] = by_corrected.get(corr, 0) + 1
+                except json.JSONDecodeError:
+                    continue
+        return {"total": total, "by_source": by_source, "by_corrected": by_corrected}
+    except Exception:
+        return {"total": 0, "by_source": {}, "by_corrected": {}}

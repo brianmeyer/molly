@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from tools.google_auth import get_gmail_service
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ def _error_result(msg: str) -> dict:
     "'is:unread', 'newer_than:7d'). Returns message summaries.",
     {"query": str, "max_results": int},
 )
+@track_latency("gmail")
 async def gmail_search(args: dict) -> dict:
     try:
         query = args["query"]
@@ -129,6 +131,7 @@ async def gmail_search(args: dict) -> dict:
     "Returns headers, body text, and metadata.",
     {"message_id": str},
 )
+@track_latency("gmail")
 async def gmail_read(args: dict) -> dict:
     try:
         message_id = args["message_id"]
@@ -152,6 +155,7 @@ async def gmail_read(args: dict) -> dict:
     "Provide recipient, subject, and body text.",
     {"to": str, "subject": str, "body": str},
 )
+@track_latency("gmail")
 async def gmail_draft(args: dict) -> dict:
     try:
         service = get_gmail_service()
@@ -185,6 +189,7 @@ async def gmail_draft(args: dict) -> dict:
     "This sends the email right away (requires approval).",
     {"to": str, "subject": str, "body": str},
 )
+@track_latency("gmail")
 async def gmail_send(args: dict) -> dict:
     try:
         service = get_gmail_service()
@@ -218,6 +223,7 @@ async def gmail_send(args: dict) -> dict:
     "thread_id, and your reply body text.",
     {"message_id": str, "thread_id": str, "body": str},
 )
+@track_latency("gmail")
 async def gmail_reply(args: dict) -> dict:
     try:
         service = get_gmail_service()

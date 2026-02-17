@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -10,6 +11,11 @@ from typing import Any
 from neo4j import GraphDatabase
 
 import config
+from utils import track_latency
+
+
+class GraphUnavailableError(RuntimeError):
+    """Raised when Neo4j is not reachable — callers should degrade gracefully."""
 
 log = logging.getLogger(__name__)
 
@@ -47,31 +53,39 @@ def _get_graph_write_lock() -> asyncio.Lock:
 
 
 def get_driver():
-    """Lazy-initialize the Neo4j driver and create indexes (thread-safe)."""
+    """Lazy-initialize the Neo4j driver and create indexes (thread-safe).
+
+    Raises GraphUnavailableError if Neo4j is unreachable, allowing callers
+    to degrade gracefully via their existing except-Exception handlers.
+    """
     global _driver
     if _driver is not None:
         return _driver
     with _driver_lock:
         if _driver is None:
-            drv = GraphDatabase.driver(
-                config.NEO4J_URI,
-                auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
-            )
-            with drv.session() as session:
-                session.run(
-                    "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
+            try:
+                drv = GraphDatabase.driver(
+                    config.NEO4J_URI,
+                    auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
                 )
-                session.run(
-                    "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)"
-                )
-                session.run(
-                    "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
-                )
-                session.run(
-                    "CREATE INDEX entity_phone IF NOT EXISTS FOR (e:Entity) ON (e.phone)"
-                )
-            _driver = drv
-            log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
+                with drv.session() as session:
+                    session.run(
+                        "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
+                    )
+                    session.run(
+                        "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)"
+                    )
+                    session.run(
+                        "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
+                    )
+                    session.run(
+                        "CREATE INDEX entity_phone IF NOT EXISTS FOR (e:Entity) ON (e.phone)"
+                    )
+                _driver = drv
+                log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
+            except Exception:
+                log.warning("Neo4j unavailable — graph layer disabled", exc_info=True)
+                raise GraphUnavailableError("Neo4j is not reachable")
     return _driver
 
 
@@ -108,6 +122,7 @@ def _fuzzy_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
+@track_latency("neo4j")
 def find_matching_entity(
     name: str,
     entity_type: str,
@@ -209,6 +224,7 @@ def _upsert_entity_sync(
             return name.strip()
 
 
+@track_latency("neo4j")
 def upsert_entity_sync(
     name: str,
     entity_type: str,
@@ -217,6 +233,7 @@ def upsert_entity_sync(
     return _upsert_entity_sync(name, entity_type, confidence)
 
 
+@track_latency("neo4j")
 async def upsert_entity(
     name: str,
     entity_type: str,
@@ -226,12 +243,18 @@ async def upsert_entity(
         return await asyncio.to_thread(_upsert_entity_sync, name, entity_type, confidence)
 
 
+_SAFE_PROPERTY_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
 def set_entity_properties(name: str, properties: dict) -> None:
     """Set properties on an existing entity node."""
     if not properties:
         return
     driver = get_driver()
-    # Keys are validated by caller; values are parameterized.
+    # Validate property keys to prevent Cypher injection.
+    for k in properties:
+        if not _SAFE_PROPERTY_KEY.match(k):
+            raise ValueError(f"Unsafe Cypher property key: {k!r}")
     set_clauses = ", ".join(f"e.{k} = ${k}" for k in properties)
     with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         session.run(
@@ -317,6 +340,7 @@ def _upsert_relationship_sync(
                 log.debug("graph suggestion hotspot logging failed", exc_info=True)
 
 
+@track_latency("neo4j")
 def upsert_relationship_sync(
     head_name: str,
     tail_name: str,
@@ -333,6 +357,7 @@ def upsert_relationship_sync(
     )
 
 
+@track_latency("neo4j")
 async def upsert_relationship(
     head_name: str,
     tail_name: str,
@@ -390,6 +415,7 @@ def _create_episode_sync(
     return episode_id
 
 
+@track_latency("neo4j")
 def create_episode_sync(
     content_preview: str,
     source: str,
@@ -398,6 +424,7 @@ def create_episode_sync(
     return _create_episode_sync(content_preview, source, entity_names)
 
 
+@track_latency("neo4j")
 async def create_episode(
     content_preview: str,
     source: str,
@@ -410,6 +437,7 @@ async def create_episode(
 # --- Retrieval ---
 
 
+@track_latency("neo4j")
 def query_entity(name: str) -> dict[str, Any] | None:
     """Look up an entity and its relationships for system prompt injection."""
     driver = get_driver()
@@ -470,6 +498,7 @@ def query_entity(name: str) -> dict[str, Any] | None:
         return entity
 
 
+@track_latency("neo4j")
 def query_entities_for_context(entity_names: list[str]) -> str:
     """Query Neo4j for multiple entities and format for system prompt injection.
 
@@ -572,6 +601,7 @@ def query_entities_for_context(entity_names: list[str]) -> str:
 # --- Deletion (for /forget) ---
 
 
+@track_latency("neo4j")
 def delete_entity(name: str) -> bool:
     """Delete an entity and all its relationships. Returns True if found."""
     driver = get_driver()
@@ -853,6 +883,7 @@ def relationship_count() -> int:
         return result.single()["c"]
 
 
+@track_latency("neo4j")
 def get_graph_summary() -> dict[str, Any]:
     """Return overall graph stats: counts, top entities by connections, most recent."""
     driver = get_driver()
@@ -891,6 +922,7 @@ def get_graph_summary() -> dict[str, Any]:
     }
 
 
+@track_latency("neo4j")
 def get_top_entities(limit: int = 20) -> list[dict[str, Any]]:
     """Return top entities ordered by strength (mentions * recency).
 

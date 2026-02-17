@@ -4,6 +4,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
 
+from utils import atomic_write
+
 import config
 import db_pool
 
@@ -778,8 +780,8 @@ async def run_contract_audits(
     try:
         maintenance_path.parent.mkdir(parents=True, exist_ok=True)
         health_path.parent.mkdir(parents=True, exist_ok=True)
-        maintenance_path.write_text(report_text)
-        health_path.write_text(report_text)
+        atomic_write(maintenance_path, report_text)
+        atomic_write(health_path, report_text)
     except Exception as exc:
         artifact_error = str(exc)
         log.error("Failed to persist contract audit artifacts", exc_info=True)

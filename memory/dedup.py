@@ -6,12 +6,15 @@ when ready. The API is deterministic and pure so it is straightforward to test.
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Iterable, Mapping
+
+log = logging.getLogger(__name__)
 
 AliasMap = Mapping[str, Iterable[str]]
 

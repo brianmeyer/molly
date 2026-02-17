@@ -12,6 +12,7 @@ import logging
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from tools.google_auth import get_people_service
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ def _error_result(msg: str) -> dict:
     "with names, emails, phones, and organizations.",
     {"query": str},
 )
+@track_latency("google_people")
 async def people_search(args: dict) -> dict:
     try:
         query = args["query"]
@@ -84,6 +86,7 @@ async def people_search(args: dict) -> dict:
     "(e.g. 'people/c1234567890').",
     {"resource_name": str},
 )
+@track_latency("google_people")
 async def people_get(args: dict) -> dict:
     try:
         resource_name = args["resource_name"]
@@ -106,6 +109,7 @@ async def people_get(args: dict) -> dict:
     "All parameters are optional.",
     {"page_size": int},
 )
+@track_latency("google_people")
 async def people_list(args: dict) -> dict:
     try:
         page_size = args.get("page_size", 20)

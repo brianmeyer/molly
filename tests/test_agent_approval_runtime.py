@@ -34,6 +34,9 @@ if "memory.retriever" not in sys.modules:
     retriever_stub.get_vectorstore = lambda: _NoopVectorStore()
     sys.modules["memory.retriever"] = retriever_stub
 
+import os as _os
+_os.environ.setdefault("MOLLY_OWNER_WHATSAPP_JID", "15551234567@s.whatsapp.net")
+
 import agent
 from approval import ApprovalManager, OWNER_PRIMARY_WHATSAPP_JID, RequestApprovalState
 from claude_agent_sdk import CLIConnectionError, PermissionResultAllow, PermissionResultDeny
@@ -340,7 +343,7 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await approval_task)
 
     async def test_whatsapp_request_stays_on_origin_chat(self):
-        wa_chat = "15857332025@s.whatsapp.net"
+        wa_chat = "15551234567@s.whatsapp.net"
         state = RequestApprovalState()
 
         approval_task = asyncio.create_task(
@@ -363,7 +366,7 @@ class TestRequestScopedApproval(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await approval_task)
 
     async def test_send_failure_retries_owner_fallback_before_timeout(self):
-        fallback_owner = "52660963176533@lid"
+        fallback_owner = "99900000000000@lid"
         failing_wa = _FakeWA(fail_jids={OWNER_PRIMARY_WHATSAPP_JID})
         self.molly = _FakeMolly(owner_jid=fallback_owner, wa=failing_wa)
         self.chat = "web:8d94e06e"

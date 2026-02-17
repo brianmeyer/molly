@@ -134,7 +134,7 @@ def compute_operational_insights() -> dict:
             "unused_skills": unused,
         }
     except Exception as exc:
-        log.error("Operational insights failed: %s", exc)
+        log.error("Operational insights failed: %s", exc, exc_info=True)
         return {
             "tool_count_24h": 0,
             "failing_tools": [],

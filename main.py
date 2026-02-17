@@ -6,6 +6,7 @@ except ImportError:
     pass
 
 import fcntl
+import hashlib
 import importlib
 import json
 import logging
@@ -29,9 +30,17 @@ from commands import handle_command
 from database import Database
 from heartbeat import run_heartbeat, should_heartbeat
 from monitoring import run_maintenance, should_run_maintenance
-from self_improve import SelfImprovementEngine
+from evolution.skills import SelfImprovementEngine
 from utils import atomic_write_json
 from whatsapp import WhatsAppClient
+
+# Phase 5B: Channel abstraction — import to trigger auto-registration
+from channels.base import registry as channel_registry  # noqa: F401
+import channels.whatsapp   # noqa: F401 — registers WhatsAppChannel
+import channels.imessage   # noqa: F401 — registers IMessageChannel
+import channels.email      # noqa: F401 — registers EmailChannel
+import channels.gateway    # noqa: F401 — registers GatewayChannel
+import channels.web        # noqa: F401 — registers WebChannel
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -215,6 +224,7 @@ def _task_done_callback(task: asyncio.Task):
 # Service startup checks
 # ---------------------------------------------------------------------------
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    kwargs.setdefault("timeout", 30)
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
@@ -276,7 +286,7 @@ def _wait_for_neo4j(timeout: int = 30):
         except OSError:
             time.sleep(1)
 
-    log.error("Neo4j did not become ready within %ds", timeout)
+    log.error("Neo4j did not become ready within %ds", timeout, exc_info=True)
     sys.exit(1)
 
 
@@ -359,8 +369,9 @@ def ensure_tool_dependencies():
             disabled_servers.add(spec["server"])
             disabled_tools.update(spec["tools"])
 
-    config.DISABLED_MCP_SERVERS = disabled_servers
-    config.DISABLED_TOOL_NAMES = disabled_tools
+    with config._runtime_lock:
+        config.DISABLED_MCP_SERVERS = disabled_servers
+        config.DISABLED_TOOL_NAMES = disabled_tools
 
     if disabled_servers:
         log.warning(
@@ -539,6 +550,7 @@ class Molly:
         self.approvals = ApprovalManager()
         self.automations = GatewayEngine(self)
         self.self_improvement = SelfImprovementEngine(self)
+        self.channels = channel_registry  # Phase 5B: channel abstraction
         self._automation_tick_task: asyncio.Task | None = None
         self._self_improve_tick_task: asyncio.Task | None = None
         self._imessage_mention_task: asyncio.Task | None = None
@@ -1375,6 +1387,19 @@ class Molly:
         # --- Molly is going to respond ---
         self.wa.send_typing(chat_jid)
 
+        # Pre-execution hook: select bandit arm, retrieve memories/guidelines
+        hook_ctx: dict = {}
+        try:
+            from evolution.hooks import pre_execution_hook
+            hook_ctx = pre_execution_hook(
+                task_hash=hashlib.md5(clean_content[:200].encode()).hexdigest()[:16],
+                task_class="whatsapp_message",
+                context={"chat_jid": chat_jid, "source": "whatsapp"},
+            )
+        except Exception:
+            log.debug("pre_execution_hook failed", exc_info=True)
+
+        msg_success = False
         try:
             session_id = self.sessions.get(chat_jid)
             chat_context = self.build_agent_chat_context(
@@ -1395,6 +1420,8 @@ class Molly:
 
             if not response:
                 return
+
+            msg_success = True
 
             # Track last response for correction detection
             self._last_responses[chat_jid] = (response, time.time())
@@ -1425,6 +1452,22 @@ class Molly:
             )
         finally:
             self.wa.send_typing_stopped(chat_jid)
+
+            # Post-execution hook: compute reward, update bandit, log trajectory
+            try:
+                from evolution.hooks import post_execution_hook
+                self._spawn_bg(
+                    post_execution_hook(
+                        task_hash=hook_ctx.get("task_hash", ""),
+                        task_class="whatsapp_message",
+                        arm_id=hook_ctx.get("arm_id", ""),
+                        start_time=hook_ctx.get("start_time", 0.0),
+                        outcome={"success": msg_success, "tool_calls": 0, "tokens_used": 0},
+                    ),
+                    name="post-execution-hook",
+                )
+            except Exception:
+                log.debug("post_execution_hook failed", exc_info=True)
 
     async def _auto_action_from_triage(
         self,
@@ -1777,6 +1820,26 @@ class Molly:
 
         await self.self_improvement.initialize()
 
+        # Phase 5C: Voice loop (Porcupine wakeword + Gemini Live)
+        if config.VOICE_ENABLED and config.PICOVOICE_ACCESS_KEY:
+            try:
+                from voice_loop import VoiceLoop
+                self.voice = VoiceLoop(self)
+                self._spawn_bg(self.voice.run(), name="voice_loop")
+                log.info("Voice loop started (Porcupine + Gemini Live)")
+            except Exception:
+                log.warning("Voice loop failed to start", exc_info=True)
+
+        # Phase 5C: Load plugins
+        if config.PLUGIN_ENABLED:
+            try:
+                from plugins.loader import load_plugins
+                loaded = load_plugins()
+                if loaded:
+                    log.info("Loaded %d plugin(s): %s", len(loaded), ", ".join(loaded))
+            except Exception:
+                log.warning("Plugin loading failed", exc_info=True)
+
         if not self.running:
             self.db.close()
             try:
@@ -1842,6 +1905,7 @@ class Molly:
                 task.add_done_callback(_task_done_callback)
             except asyncio.TimeoutError:
                 # No message in queue — check scheduled tasks (run in background)
+                log.debug("Queue poll timed out, checking scheduled tasks")
                 if self.wa and self.wa.connected:
                     if (
                         self._automation_tick_task is None

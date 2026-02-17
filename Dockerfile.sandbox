@@ -1,0 +1,29 @@
+# Molly Docker Sandbox (Phase 5C.5)
+# Minimal Python image for isolated code execution.
+#
+# Build: docker build -f Dockerfile.sandbox -t molly-sandbox .
+# Usage: DockerSandbox(image="molly-sandbox")
+#
+# The default sandbox uses python:3.12-slim directly.
+# This Dockerfile is for custom sandbox images with pre-installed packages.
+
+FROM python:3.12-slim
+
+# Security: non-root user
+RUN groupadd -r sandbox && useradd -r -g sandbox sandbox
+
+# Pre-install common packages (optional, speeds up sandbox runs)
+RUN pip install --no-cache-dir \
+    requests \
+    beautifulsoup4 \
+    pyyaml \
+    && rm -rf /root/.cache
+
+# Working directory
+WORKDIR /workspace
+
+# Switch to non-root user
+USER sandbox
+
+# Default command
+CMD ["python", "script.py"]

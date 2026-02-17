@@ -36,9 +36,16 @@ async def retrieve_context(message: str, top_k: int = 5) -> str:
     """
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
-    semantic_future = loop.run_in_executor(None, _retrieve_semantic, message, top_k)
-    graph_future = loop.run_in_executor(None, _retrieve_graph, message)
-    semantic_bundle, graph_result = await asyncio.gather(semantic_future, graph_future)
+    semantic_future = asyncio.wait_for(loop.run_in_executor(None, _retrieve_semantic, message, top_k), timeout=15.0)
+    graph_future = asyncio.wait_for(loop.run_in_executor(None, _retrieve_graph, message), timeout=15.0)
+    semantic_bundle, graph_result = await asyncio.gather(semantic_future, graph_future, return_exceptions=True)
+    # Graceful degradation on timeout
+    if isinstance(semantic_bundle, Exception):
+        log.warning("Semantic retrieval failed: %s", semantic_bundle)
+        semantic_bundle = {"context": "", "result_count": 0, "distances": [], "sources": []}
+    if isinstance(graph_result, Exception):
+        log.warning("Graph retrieval failed: %s", graph_result)
+        graph_result = ""
 
     semantic_result = semantic_bundle["context"]
     result_count = semantic_bundle["result_count"]
@@ -59,7 +66,12 @@ async def retrieve_context(message: str, top_k: int = 5) -> str:
 
 
 def _retrieve_semantic(message: str, top_k: int = 5) -> dict:
-    """Layer 2: sqlite-vec semantic search. Returns bundle with context + stats."""
+    """Layer 2+: Hybrid search combining vector similarity + BM25 keywords.
+
+    Uses hybrid_search() (Phase 5B) when available, falling back to
+    pure vector search if FTS5 is not yet set up.  Returns bundle with
+    context + stats.
+    """
     vs = get_vectorstore()
     empty = {"context": "", "result_count": 0, "distances": [], "sources": []}
 
@@ -68,16 +80,32 @@ def _retrieve_semantic(message: str, top_k: int = 5) -> dict:
 
     try:
         query_vec = embed(message)
-        results = vs.search(query_vec, top_k=top_k)
     except Exception:
-        log.error("Semantic memory retrieval failed", exc_info=True)
+        log.error("Embedding failed for retrieval", exc_info=True)
         return empty
+
+    # Phase 5B: prefer hybrid search (vector + BM25), fall back to vector-only
+    try:
+        results = vs.hybrid_search(
+            query_text=message,
+            query_embedding=query_vec,
+            top_k=top_k,
+            vector_weight=0.7,
+            bm25_weight=0.3,
+        )
+    except Exception:
+        log.warning("Hybrid search unavailable, falling back to vector-only", exc_info=True)
+        try:
+            results = vs.search(query_vec, top_k=top_k)
+        except Exception:
+            log.error("Semantic memory retrieval failed", exc_info=True)
+            return empty
 
     if not results:
         return empty
 
-    lines = ["<!-- Memory Context (semantic search) -->"]
-    lines.append("Relevant past conversations (most similar first):\n")
+    lines = ["<!-- Memory Context (hybrid search: semantic + BM25) -->"]
+    lines.append("Relevant past conversations (most relevant first):\n")
     distances = []
     sources = []
     for r in results:
@@ -88,7 +116,7 @@ def _retrieve_semantic(message: str, top_k: int = 5) -> dict:
         sources.append(source)
 
     context = "\n".join(lines)
-    log.debug("Retrieved %d semantic memory chunks", len(results))
+    log.debug("Retrieved %d memory chunks (hybrid)", len(results))
     return {
         "context": context,
         "result_count": len(results),
@@ -121,6 +149,10 @@ def _retrieve_graph(message: str) -> str:
 # Retrieval stats logging (for monitoring/agents/retrieval_quality.py)
 # ---------------------------------------------------------------------------
 
+_retrieval_stats_lock = threading.Lock()
+_retrieval_stats_table_ensured = False
+
+
 def _log_retrieval_stats(
     query_text: str,
     top_k: int,
@@ -130,26 +162,29 @@ def _log_retrieval_stats(
     latency_ms: int,
 ) -> None:
     """Best-effort log of retrieval metrics to retrieval_stats table."""
+    global _retrieval_stats_table_ensured
     conn = None
     try:
         import db_pool
 
         conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
-        if not _log_retrieval_stats._table_ensured:
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS retrieval_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    query_text TEXT,
-                    top_k INTEGER,
-                    result_count INTEGER,
-                    avg_similarity REAL,
-                    max_similarity REAL,
-                    latency_ms INTEGER,
-                    sources TEXT,
-                    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                )"""
-            )
-            _log_retrieval_stats._table_ensured = True
+        conn.execute("PRAGMA busy_timeout=5000")
+        with _retrieval_stats_lock:
+            if not _retrieval_stats_table_ensured:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS retrieval_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        query_text TEXT,
+                        top_k INTEGER,
+                        result_count INTEGER,
+                        avg_similarity REAL,
+                        max_similarity REAL,
+                        latency_ms INTEGER,
+                        sources TEXT,
+                        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    )"""
+                )
+                _retrieval_stats_table_ensured = True
 
         # Convert distances to similarity scores (1 - distance for cosine)
         similarities = [max(0.0, 1.0 - d) for d in distances] if distances else []
@@ -178,6 +213,3 @@ def _log_retrieval_stats(
     finally:
         if conn is not None:
             conn.close()
-
-
-_log_retrieval_stats._table_ensured = False  # type: ignore[attr-defined]

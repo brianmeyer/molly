@@ -13,6 +13,7 @@ import logging
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from tools.google_auth import get_meet_service
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ def _error_result(msg: str) -> dict:
     "start/end times, and space info. All parameters are optional.",
     {"page_size": int},
 )
+@track_latency("google_meet")
 async def meet_list(args: dict) -> dict:
     try:
         service = get_meet_service()
@@ -79,6 +81,7 @@ async def meet_list(args: dict) -> dict:
     "(e.g. 'conferenceRecords/abc123').",
     {"name": str},
 )
+@track_latency("google_meet")
 async def meet_get(args: dict) -> dict:
     try:
         name = args["name"]
@@ -98,6 +101,7 @@ async def meet_get(args: dict) -> dict:
     "(capped at 500 entries).",
     {"conference_name": str},
 )
+@track_latency("google_meet")
 async def meet_transcripts(args: dict) -> dict:
     try:
         conference_name = args["conference_name"]
@@ -163,6 +167,7 @@ async def meet_transcripts(args: dict) -> dict:
     "record name (e.g. 'conferenceRecords/abc123').",
     {"conference_name": str},
 )
+@track_latency("google_meet")
 async def meet_recordings(args: dict) -> dict:
     try:
         conference_name = args["conference_name"]

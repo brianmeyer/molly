@@ -21,6 +21,7 @@ import httpx
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ def _run_x_search(query_text: str, system_context: str, days_back: int) -> dict:
     return _text_result(content + meta)
 
 
+@track_latency("grok")
 @tool(
     "grok_reason",
     "Query Grok (xAI) for social intelligence, sentiment analysis, "
@@ -116,8 +118,11 @@ async def grok_reason(args: dict) -> dict:
     if search_x:
         try:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None, _run_x_search, query_text, system_context, days_back,
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, _run_x_search, query_text, system_context, days_back,
+                ),
+                timeout=60.0,
             )
             return result
         except Exception as e:

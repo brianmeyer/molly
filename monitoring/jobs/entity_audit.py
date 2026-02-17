@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from utils import atomic_write
 
 import config
 import db_pool
@@ -214,7 +217,7 @@ def _sample_entities_for_audit(batch_size: int = 50) -> list[dict]:
             )
             return [dict(r) for r in records]
     except Exception as exc:
-        log.error("Failed to sample entities for audit: %s", exc)
+        log.error("Failed to sample entities for audit: %s", exc, exc_info=True)
         return []
 
 
@@ -312,7 +315,7 @@ async def _kimi_audit_relationships(sample_size: int = 100) -> list[RelAuditVerd
             )
             rels = [dict(r) for r in records]
     except Exception as exc:
-        log.error("Failed to sample relationships: %s", exc)
+        log.error("Failed to sample relationships: %s", exc, exc_info=True)
         return []
 
     if not rels:
@@ -395,7 +398,7 @@ async def _kimi_discover_missing_entities(sample_size: int = 50) -> list[EntityP
         conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
         rows = conn.execute(
             """
-            SELECT c.chunk_text, c.source, c.created_at,
+            SELECT c.content, c.source, c.created_at,
                    (SELECT COUNT(*) FROM entity_mentions em WHERE em.chunk_id = c.id) AS entity_count
             FROM conversation_chunks c
             WHERE c.created_at > ?
@@ -413,7 +416,7 @@ async def _kimi_discover_missing_entities(sample_size: int = 50) -> list[EntityP
             conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
             rows = conn.execute(
                 """
-                SELECT chunk_text, source, created_at, 0 AS entity_count
+                SELECT content, source, created_at, 0 AS entity_count
                 FROM conversation_chunks
                 WHERE created_at > ?
                 ORDER BY created_at DESC
@@ -422,7 +425,7 @@ async def _kimi_discover_missing_entities(sample_size: int = 50) -> list[EntityP
                 ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), sample_size),
             ).fetchall()
         except Exception as exc:
-            log.error("Failed to sample chunks for discovery: %s", exc)
+            log.error("Failed to sample chunks for discovery: %s", exc, exc_info=True)
             return []
     finally:
         if conn is not None:
@@ -485,7 +488,7 @@ async def _kimi_discover_missing_relationships(sample_size: int = 50) -> list[Re
             )
             pairs = [dict(r) for r in records]
     except Exception as exc:
-        log.error("Failed to sample disconnected pairs: %s", exc)
+        log.error("Failed to sample disconnected pairs: %s", exc, exc_info=True)
         return []
 
     if not pairs:
@@ -601,7 +604,7 @@ def _tally_type_proposals(new_proposals: list[dict]) -> None:
 
         conn.commit()
     except Exception as exc:
-        log.error("Failed to tally type proposals: %s", exc)
+        log.error("Failed to tally type proposals: %s", exc, exc_info=True)
     finally:
         if conn is not None:
             conn.close()
@@ -637,11 +640,11 @@ async def _evaluate_type_adoption() -> dict[str, int]:
                 _log_schema_evolution(conn, category, name)
                 result["adopted"] += 1
             except Exception as exc:
-                log.error("Failed to adopt type %s/%s: %s", category, name, exc)
+                log.error("Failed to adopt type %s/%s: %s", category, name, exc, exc_info=True)
 
         conn.commit()
     except Exception as exc:
-        log.error("Type adoption evaluation failed: %s", exc)
+        log.error("Type adoption evaluation failed: %s", exc, exc_info=True)
     finally:
         if conn is not None:
             conn.close()
@@ -669,10 +672,10 @@ def _adopt_entity_type(type_name: str) -> None:
         }
         try:
             import yaml
-            schema_path.write_text(yaml.dump(existing, default_flow_style=False))
+            atomic_write(schema_path, yaml.dump(existing, default_flow_style=False))
         except ImportError:
             # Fall back to JSON if yaml not available
-            schema_path.with_suffix(".json").write_text(json.dumps(existing, indent=2))
+            atomic_write(schema_path.with_suffix(".json"), json.dumps(existing, indent=2))
 
     log.info("Adopted new entity type: %s", type_name)
 
@@ -698,14 +701,15 @@ def _adopt_relationship_type(type_name: str) -> int:
         }
         try:
             import yaml
-            schema_path.write_text(yaml.dump(existing, default_flow_style=False))
+            atomic_write(schema_path, yaml.dump(existing, default_flow_style=False))
         except ImportError:
-            schema_path.with_suffix(".json").write_text(json.dumps(existing, indent=2))
+            atomic_write(schema_path.with_suffix(".json"), json.dumps(existing, indent=2))
 
-    # Add to VALID_REL_TYPES at runtime
+    # Add to VALID_REL_TYPES at runtime (thread-safe via graph lock)
     try:
-        from memory.graph import VALID_REL_TYPES
-        VALID_REL_TYPES.add(type_name)
+        from memory.graph import VALID_REL_TYPES, _GRAPH_SYNC_WRITE_LOCK
+        with _GRAPH_SYNC_WRITE_LOCK:
+            VALID_REL_TYPES.add(type_name)
     except Exception:
         pass
 
@@ -831,8 +835,14 @@ def _write_gliner_training_labels(
         count += 1
 
     if lines:
-        with open(output_path, "a") as f:
-            f.write("\n".join(lines) + "\n")
+        import fcntl
+        fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, ("\n".join(lines) + "\n").encode())
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     return count
 
@@ -1014,7 +1024,7 @@ async def _invoke_kimi(prompt: str, thinking: bool = False) -> str:
         raise RuntimeError("MOONSHOT_API_KEY not configured")
 
     model = getattr(config, "CONTRACT_AUDIT_KIMI_MODEL", "kimi-k2-0711")
-    base_url = getattr(config, "MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1")
+    base_url = getattr(config, "MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
 
     messages = [
         {"role": "system", "content": "You are a knowledge graph auditor. Respond with valid JSON only."},
@@ -1240,7 +1250,7 @@ def _log_audit_event(
         )
         conn.commit()
     except Exception:
-        pass
+        log.debug("Failed to log audit event for %s", entity_name, exc_info=True)
     finally:
         if conn is not None:
             conn.close()
@@ -1268,7 +1278,7 @@ def _update_audit_metrics(result: dict[str, Any]) -> None:
         )
         conn.commit()
     except Exception:
-        pass
+        log.debug("Failed to write audit metrics summary", exc_info=True)
     finally:
         if conn is not None:
             conn.close()

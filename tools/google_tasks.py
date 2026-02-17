@@ -14,6 +14,7 @@ import logging
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from tools.google_auth import get_tasks_service
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ def _error_result(msg: str) -> dict:
     "List all Google Task lists. Returns list IDs and titles.",
     {},
 )
+@track_latency("google_tasks")
 async def tasks_list(args: dict) -> dict:
     try:
         service = get_tasks_service()
@@ -74,6 +76,7 @@ async def tasks_list(args: dict) -> dict:
     "Defaults to the primary task list if tasklist_id is omitted.",
     {"tasklist_id": str},
 )
+@track_latency("google_tasks")
 async def tasks_list_tasks(args: dict) -> dict:
     try:
         tasklist_id = args.get("tasklist_id", "@default")
@@ -104,6 +107,7 @@ async def tasks_list_tasks(args: dict) -> dict:
     "due date (RFC 3339), and tasklist_id (defaults to primary list).",
     {"title": str},
 )
+@track_latency("google_tasks")
 async def tasks_create(args: dict) -> dict:
     try:
         title = args["title"]
@@ -129,6 +133,7 @@ async def tasks_create(args: dict) -> dict:
     "the tasklist_id (defaults to primary list).",
     {"task_id": str},
 )
+@track_latency("google_tasks")
 async def tasks_complete(args: dict) -> dict:
     try:
         task_id = args["task_id"]
@@ -150,6 +155,7 @@ async def tasks_complete(args: dict) -> dict:
     "the tasklist_id (defaults to primary list).",
     {"task_id": str},
 )
+@track_latency("google_tasks")
 async def tasks_delete(args: dict) -> dict:
     try:
         task_id = args["task_id"]

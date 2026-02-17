@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Mapping, cast
+
+log = logging.getLogger(__name__)
 
 Severity = Literal["green", "yellow", "red"]
 RemediationAction = Literal[
@@ -20,7 +23,8 @@ ACTION_PROPOSE_CORE_PATCH: RemediationAction = "propose_core_patch"
 ACTION_ESCALATE_OWNER: RemediationAction = "escalate_owner"
 ACTION_OBSERVE_ONLY: RemediationAction = "observe_only"
 
-YELLOW_ESCALATION_DAYS = 3
+import config as _config  # noqa: E402
+YELLOW_ESCALATION_DAYS = getattr(_config, "HEALTH_YELLOW_ESCALATION_DAYS", 3)
 
 _DEFAULT_ACTION_BY_SEVERITY: dict[Severity, RemediationAction] = {
     "green": ACTION_OBSERVE_ONLY,

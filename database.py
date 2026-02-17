@@ -16,6 +16,8 @@ class Database:
     def initialize(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = db_pool.sqlite_connect(str(self.db_path))
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
         migrated = self._normalize_legacy_timestamps()
@@ -67,7 +69,7 @@ class Database:
             VALUES (?, ?, ?)
             ON CONFLICT(jid) DO UPDATE SET
                 name = COALESCE(excluded.name, chats.name),
-                last_message_time = excluded.last_message_time
+                last_message_time = MAX(COALESCE(chats.last_message_time, ''), excluded.last_message_time)
             """,
             (chat_jid, sender_name, normalized_timestamp),
         )

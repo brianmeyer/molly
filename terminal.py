@@ -14,6 +14,8 @@ import sys
 import config
 from agent import handle_message
 
+log = logging.getLogger(__name__)
+
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

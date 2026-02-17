@@ -65,7 +65,7 @@ class ContactResolver:
             self._contacts = valid
             log.info("Loaded %d contact entries from %s", len(valid), CONTACTS_FILE)
         except (json.JSONDecodeError, OSError) as e:
-            log.error("Failed to load contacts: %s", e)
+            log.error("Failed to load contacts: %s", e, exc_info=True)
 
     def resolve_phone(self, phone: str) -> str | None:
         """Look up a phone number and return the contact name, or None."""
