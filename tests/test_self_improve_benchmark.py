@@ -20,8 +20,8 @@ class TestSelfImproveBenchmark(unittest.TestCase):
             {"text": f"message {i}", "entities": [f"entity-{i}"]}
             for i in range(10)
         ]
-        train_a, eval_a = self.engine._split_holdout_rows(rows, eval_ratio=0.2, seed=1337)
-        train_b, eval_b = self.engine._split_holdout_rows(rows, eval_ratio=0.2, seed=1337)
+        train_a, eval_a = self.engine.gliner.split_holdout_rows(rows, eval_ratio=0.2, seed=1337)
+        train_b, eval_b = self.engine.gliner.split_holdout_rows(rows, eval_ratio=0.2, seed=1337)
 
         self.assertEqual([r["text"] for r in train_a], [r["text"] for r in train_b])
         self.assertEqual([r["text"] for r in eval_a], [r["text"] for r in eval_b])
@@ -29,7 +29,7 @@ class TestSelfImproveBenchmark(unittest.TestCase):
         self.assertEqual(len(train_a), 8)
 
     def test_compute_prf_metrics_math(self):
-        metrics = self.engine._compute_prf_metrics(tp=2, fp=1, fn=1)
+        metrics = self.engine.gliner.compute_prf_metrics(tp=2, fp=1, fn=1)
         self.assertEqual(metrics["precision"], 0.6667)
         self.assertEqual(metrics["recall"], 0.6667)
         self.assertEqual(metrics["f1"], 0.6667)
@@ -63,11 +63,11 @@ class TestSelfImproveBenchmark(unittest.TestCase):
         }
 
         with patch.object(
-            self.engine,
-            "_evaluate_model_on_rows",
+            self.engine.gliner,
+            "evaluate_model_on_rows",
             side_effect=[base_eval, candidate_eval],
         ):
-            result = self.engine._benchmark_finetune_candidate(
+            result = self.engine.gliner.benchmark_finetune_candidate(
                 rows,
                 candidate_model_ref="candidate-model-ref",
                 train_count=4,
@@ -82,16 +82,16 @@ class TestSelfImproveBenchmark(unittest.TestCase):
         self.assertEqual(result["failure"]["details"][0]["error"], "all_inference_failed")
 
     def test_select_gliner_training_strategy_uses_lora_when_examples_below_full_threshold(self):
-        self.engine._state["gliner_benchmark_history"] = []
+        self.engine.ctx.state["gliner_benchmark_history"] = []
         total_examples = max(1, int(config.GLINER_FULL_FINETUNE_MIN_EXAMPLES) - 1)
-        decision = self.engine._select_gliner_training_strategy(total_examples)
+        decision = self.engine.gliner.select_gliner_training_strategy(total_examples)
         self.assertEqual(decision["mode"], "lora")
         self.assertEqual(decision["reason"], "insufficient_examples_for_full_finetune")
 
     def test_select_gliner_training_strategy_switches_to_full_when_lora_plateaus(self):
         window = max(1, int(config.GLINER_LORA_PLATEAU_WINDOW))
         epsilon = float(config.GLINER_LORA_PLATEAU_EPSILON)
-        self.engine._state["gliner_benchmark_history"] = [
+        self.engine.ctx.state["gliner_benchmark_history"] = [
             {
                 "strategy": "lora",
                 "benchmark_ok": True,
@@ -100,14 +100,14 @@ class TestSelfImproveBenchmark(unittest.TestCase):
             for _ in range(window)
         ]
         total_examples = int(config.GLINER_FULL_FINETUNE_MIN_EXAMPLES)
-        decision = self.engine._select_gliner_training_strategy(total_examples)
+        decision = self.engine.gliner.select_gliner_training_strategy(total_examples)
         self.assertEqual(decision["mode"], "full")
         self.assertEqual(decision["reason"], "lora_plateau_detected")
 
     def test_select_gliner_training_strategy_keeps_lora_when_recent_improvements_are_strong(self):
         window = max(1, int(config.GLINER_LORA_PLATEAU_WINDOW))
         epsilon = float(config.GLINER_LORA_PLATEAU_EPSILON)
-        self.engine._state["gliner_benchmark_history"] = [
+        self.engine.ctx.state["gliner_benchmark_history"] = [
             {
                 "strategy": "lora",
                 "benchmark_ok": True,
@@ -116,7 +116,7 @@ class TestSelfImproveBenchmark(unittest.TestCase):
             for _ in range(window)
         ]
         total_examples = int(config.GLINER_FULL_FINETUNE_MIN_EXAMPLES) + 100
-        decision = self.engine._select_gliner_training_strategy(total_examples)
+        decision = self.engine.gliner.select_gliner_training_strategy(total_examples)
         self.assertEqual(decision["mode"], "lora")
         self.assertEqual(decision["reason"], "lora_still_improving")
 

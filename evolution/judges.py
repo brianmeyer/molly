@@ -39,7 +39,7 @@ def _available_judges() -> list[dict]:
     judges = []
     # Claude Haiku — always available (Anthropic key assumed present)
     judges.append({
-        "model": "claude-haiku-4-20250514",
+        "model": "claude-haiku-4-5",
         "provider": "anthropic",
         "api_key": getattr(config, "ANTHROPIC_API_KEY", ""),
     })
@@ -59,21 +59,113 @@ def _available_judges() -> list[dict]:
 
 
 async def _call_judge(judge: dict, prompt: str) -> JudgeScore:
-    """Call a single judge model and parse scores.
+    """Call a single judge model and parse functional + efficiency scores.
 
-    This is a stub — actual API calls will be wired during Batch 8.
-    Returns a placeholder score based on the model name for now.
+    Gracefully degrades: returns 0-scores if the API call or parsing fails.
     """
-    # Placeholder: in production this makes an API call to the judge
-    # and parses functional + efficiency scores from the response.
-    log.debug("Judge %s evaluating (stub)", judge["model"])
-    await asyncio.sleep(0.01)  # simulate async
-    return JudgeScore(
-        model=judge["model"],
-        functional=0.0,
-        efficiency=0.0,
-        final=0.0,
+    provider = judge.get("provider", "")
+    model = judge.get("model", "")
+    api_key = judge.get("api_key", "")
+    if not api_key:
+        log.debug("Judge %s skipped — no API key", model)
+        return JudgeScore(model=model, functional=0.0, efficiency=0.0, final=0.0)
+
+    system_msg = (
+        "You are a code review judge. Evaluate the proposed change.\n"
+        "Respond ONLY with a JSON object: {\"functional\": <0.0-1.0>, \"efficiency\": <0.0-1.0>}\n"
+        "functional = correctness and reliability of the change.\n"
+        "efficiency = performance, safety, and code quality.\n"
     )
+
+    try:
+        response_text = await _call_provider(provider, model, api_key, system_msg, prompt)
+        return _parse_judge_response(model, response_text)
+    except Exception:
+        log.debug("Judge %s evaluation failed", model, exc_info=True)
+        return JudgeScore(model=model, functional=0.0, efficiency=0.0, final=0.0)
+
+
+async def _call_provider(
+    provider: str, model: str, api_key: str, system_msg: str, user_msg: str,
+) -> str:
+    """Route to the correct provider API. Returns response text."""
+    if provider == "anthropic":
+        import anthropic
+
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        resp = await client.messages.create(
+            model=model, max_tokens=256,
+            system=system_msg,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return resp.content[0].text if resp.content else ""
+
+    if provider == "openai":
+        import openai
+
+        client = openai.AsyncOpenAI(api_key=api_key)
+        resp = await client.chat.completions.create(
+            model=model, max_tokens=256,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+        return resp.choices[0].message.content or "" if resp.choices else ""
+
+    if provider == "gemini":
+        import httpx
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {"contents": [{"parts": [{"text": f"{system_msg}\n\n{user_msg}"}]}]}
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        return parts[0].get("text", "") if parts else ""
+
+    if provider == "moonshot":
+        import httpx
+
+        import config as _cfg
+        url = f"{_cfg.MOONSHOT_BASE_URL}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        payload = {
+            "model": model, "max_tokens": 256,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        }
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    raise ValueError(f"Unknown judge provider: {provider}")
+
+
+def _parse_judge_response(model: str, text: str) -> JudgeScore:
+    """Extract functional/efficiency scores from judge response text."""
+    import json as _json
+    import re as _re
+
+    # Try to find JSON in the response
+    match = _re.search(r"\{[^}]*\"functional\"[^}]*\}", text, _re.DOTALL)
+    if match:
+        try:
+            data = _json.loads(match.group())
+            func = max(0.0, min(1.0, float(data.get("functional", 0))))
+            eff = max(0.0, min(1.0, float(data.get("efficiency", 0))))
+            final = func * 0.6 + eff * 0.4
+            return JudgeScore(model=model, functional=func, efficiency=eff, final=final)
+        except (ValueError, KeyError, TypeError):
+            pass
+
+    log.debug("Judge %s returned unparseable response: %s", model, text[:200])
+    return JudgeScore(model=model, functional=0.0, efficiency=0.0, final=0.0)
 
 
 async def evaluate(

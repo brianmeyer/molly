@@ -15,7 +15,7 @@ from evolution.skills import SelfImprovementEngine
 class TestWeeklyAssessmentContract(unittest.TestCase):
     def test_weekly_assessment_is_due_in_sunday_window_only(self):
         engine = SelfImprovementEngine()
-        engine._state = {}
+        engine.ctx.state = {}
 
         sunday_target = datetime(2026, 2, 8, 3, 0, 0)
         sunday_wrong_hour = datetime(2026, 2, 8, 2, 0, 0)
@@ -28,7 +28,7 @@ class TestWeeklyAssessmentContract(unittest.TestCase):
             self.assertFalse(engine._is_weekly_assessment_due(sunday_wrong_hour))
             self.assertFalse(engine._is_weekly_assessment_due(monday_target))
 
-            engine._state["last_weekly_assessment"] = "2026-02-08"
+            engine.ctx.state["last_weekly_assessment"] = "2026-02-08"
             self.assertFalse(engine._is_weekly_assessment_due(sunday_target))
 
 

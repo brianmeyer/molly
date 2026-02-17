@@ -44,6 +44,17 @@ __all__ = [
     "compute_reward",
     "estimate_risk",
     "generate_code",
+    # composed services
+    "EngineContext",
+    "InfraService",
+    "OwnerCommsService",
+    "GraphOpsService",
+    "StatsService",
+    "AutomationPatternsService",
+    "SkillLifecycleService",
+    "SkillGapsService",
+    "ToolGapsService",
+    "GLiNERTrainingService",
 ]
 
 
@@ -92,5 +103,37 @@ def __getattr__(name: str):  # noqa: C901
     if name == "generate_code":
         from evolution.codegen import generate_code
         return generate_code
+
+    # Composed services
+    if name == "EngineContext":
+        from evolution.context import EngineContext
+        return EngineContext
+    if name == "InfraService":
+        from evolution.infra import InfraService
+        return InfraService
+    if name == "OwnerCommsService":
+        from evolution.owner_comms import OwnerCommsService
+        return OwnerCommsService
+    if name == "GraphOpsService":
+        from evolution.graph_ops import GraphOpsService
+        return GraphOpsService
+    if name == "StatsService":
+        from evolution.stats import StatsService
+        return StatsService
+    if name == "AutomationPatternsService":
+        from evolution.automation_patterns import AutomationPatternsService
+        return AutomationPatternsService
+    if name == "SkillLifecycleService":
+        from evolution.skill_lifecycle import SkillLifecycleService
+        return SkillLifecycleService
+    if name == "SkillGapsService":
+        from evolution.skill_gaps import SkillGapsService
+        return SkillGapsService
+    if name == "ToolGapsService":
+        from evolution.tool_gaps import ToolGapsService
+        return ToolGapsService
+    if name == "GLiNERTrainingService":
+        from evolution.gliner_training import GLiNERTrainingService
+        return GLiNERTrainingService
 
     raise AttributeError(f"module 'evolution' has no attribute {name!r}")

@@ -1,6 +1,7 @@
 """Tests for contacts.py, scripts/import_contacts.py, and integration call sites."""
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
@@ -114,9 +115,9 @@ class TestContactResolver(unittest.TestCase):
 
     def test_graceful_malformed_json(self):
         """Resolver handles malformed JSON file."""
-        import tempfile
-        tmp = Path(tempfile.mktemp(suffix=".json"))
-        tmp.write_text("not valid json {{{")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write("not valid json {{{")
+            tmp = Path(f.name)
         try:
             with patch("contacts.CONTACTS_FILE", tmp):
                 resolver = ContactResolver()
@@ -131,9 +132,9 @@ class TestContactResolver(unittest.TestCase):
             "3105559876": {"email": "bad@entry.com"},  # Missing name
             "4155551111": "not a dict",  # Not even a dict
         }
-        import tempfile
-        tmp = Path(tempfile.mktemp(suffix=".json"))
-        tmp.write_text(json.dumps(data))
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(data))
+            tmp = Path(f.name)
         try:
             with patch("contacts.CONTACTS_FILE", tmp):
                 resolver = ContactResolver()
@@ -145,9 +146,9 @@ class TestContactResolver(unittest.TestCase):
 
     def test_schema_validation_rejects_non_dict_root(self):
         """contacts.json that is a list instead of dict is rejected."""
-        import tempfile
-        tmp = Path(tempfile.mktemp(suffix=".json"))
-        tmp.write_text('[{"name": "Alice"}]')
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write('[{"name": "Alice"}]')
+            tmp = Path(f.name)
         try:
             with patch("contacts.CONTACTS_FILE", tmp):
                 resolver = ContactResolver()
@@ -389,8 +390,9 @@ class TestImportScript(unittest.TestCase):
             "END:VCARD\n"
         )
 
-        tmp = Path("/tmp/test_contacts.vcf")
-        tmp.write_text(vcf_content)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as f:
+            f.write(vcf_content)
+            tmp = Path(f.name)
         try:
             result = parse_vcf(tmp)
             self.assertIn("2125551234", result)
@@ -412,8 +414,9 @@ class TestImportScript(unittest.TestCase):
             "TEL;TYPE=CELL:+1-212-555-1234\n"
             "END:VCARD\n"
         )
-        tmp = Path("/tmp/test_no_fn.vcf")
-        tmp.write_text(vcf_content)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as f:
+            f.write(vcf_content)
+            tmp = Path(f.name)
         try:
             result = parse_vcf(tmp)
             self.assertEqual(result, {})
@@ -430,8 +433,9 @@ class TestImportScript(unittest.TestCase):
             "EMAIL:email@only.com\n"
             "END:VCARD\n"
         )
-        tmp = Path("/tmp/test_no_tel.vcf")
-        tmp.write_text(vcf_content)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as f:
+            f.write(vcf_content)
+            tmp = Path(f.name)
         try:
             result = parse_vcf(tmp)
             self.assertEqual(result, {})
@@ -441,8 +445,9 @@ class TestImportScript(unittest.TestCase):
     def test_parse_vcf_empty_file(self):
         from scripts.import_contacts import parse_vcf
 
-        tmp = Path("/tmp/test_empty.vcf")
-        tmp.write_text("")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as f:
+            f.write("")
+            tmp = Path(f.name)
         try:
             result = parse_vcf(tmp)
             self.assertEqual(result, {})
@@ -462,8 +467,9 @@ class TestImportScript(unittest.TestCase):
             "TEL:+1-212-555-1234\n"
             "END:VCARD\n"
         )
-        tmp = Path("/tmp/test_dup.vcf")
-        tmp.write_text(vcf_content)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as f:
+            f.write(vcf_content)
+            tmp = Path(f.name)
         try:
             result = parse_vcf(tmp)
             # Last one wins
@@ -480,8 +486,9 @@ class TestImportScript(unittest.TestCase):
             "TEL:+1-212-555-9999\n"
             "END:VCARD\n"
         )
-        tmp = Path("/tmp/test_unicode.vcf")
-        tmp.write_text(vcf_content)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcf", delete=False) as f:
+            f.write(vcf_content)
+            tmp = Path(f.name)
         try:
             result = parse_vcf(tmp)
             self.assertEqual(result["2125559999"]["name"], "Jose Garcia")

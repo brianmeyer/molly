@@ -39,7 +39,7 @@ APPROVE_ALL_WORDS = frozenset({
 
 # Primary fallback for approvals from non-WhatsApp sessions.
 OWNER_PRIMARY_WHATSAPP_JID = os.getenv(
-    "MOLLY_OWNER_WHATSAPP_JID", "15550001234@s.whatsapp.net"
+    "MOLLY_OWNER_WHATSAPP_JID", ""
 )
 OWNER_APPROVAL_JID_FALLBACKS: tuple[str, ...] = (OWNER_PRIMARY_WHATSAPP_JID,)
 WHATSAPP_JID_SERVER_SUFFIX = ".whatsapp.net"

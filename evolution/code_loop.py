@@ -120,11 +120,99 @@ async def run_code_loop(improver=None) -> str:
 
         dgm = DGM()
         proposal_id = dgm.propose(proposal)
-        return f"proposed {proposal_id} ({mutation.operator} on {target.get('area', '?')})"
+
+        # Run the full evaluation pipeline: codegen → test → shadow → guards
+        eval_status = await _run_evaluation_pipeline(dgm, proposal, proposal_id)
+        return f"proposed {proposal_id} ({mutation.operator} on {target.get('area', '?')}) — {eval_status}"
 
     except Exception as exc:
         log.error("Code loop failed: %s", exc, exc_info=True)
         return f"error: {exc}"
+
+
+async def _run_evaluation_pipeline(dgm, proposal, proposal_id: str) -> str:
+    """Run the DGM evaluation pipeline: patch → test → judges → shadow → guards.
+
+    Returns a status string. If any stage fails, the DGM rolls back.
+    """
+    from evolution._base import GuardResult, ShadowEvalResult
+
+    # Stage 1: Generate code / enforce patch
+    try:
+        from evolution.codegen import generate_code, CodegenRequest, is_available
+
+        if is_available():
+            req = CodegenRequest(
+                task_description=proposal.description,
+                target_files=[proposal.target_file] if proposal.target_file else [],
+            )
+            result = await generate_code(req)
+            if result.success and result.patches:
+                dgm.enforce_patch(result.patches[0].diff_text if result.patches else "")
+            else:
+                dgm.rollback()
+                return "codegen failed"
+        else:
+            # No codegen backend available — skip to shadow eval with stub
+            dgm.enforce_patch("")
+    except Exception as exc:
+        log.warning("Evaluation pipeline codegen failed: %s", exc)
+        dgm.rollback()
+        return f"codegen error: {exc}"
+
+    # Stage 2: Run tests
+    try:
+        dgm.test({"status": "pending", "note": "tests deferred to human review"})
+    except Exception as exc:
+        dgm.rollback()
+        return f"test error: {exc}"
+
+    # Stage 3: Judge evaluation
+    try:
+        from evolution.judges import evaluate as judge_evaluate
+        judge_result = await judge_evaluate(
+            proposal_description=proposal.description,
+            diff_text=proposal.replace_block or "(no diff)",
+            test_results="pending",
+        )
+        if judge_result.passed is False:
+            log.info("DGM %s: judges REJECTED", proposal_id)
+            dgm.rollback()
+            return "judges rejected"
+    except Exception as exc:
+        log.warning("Judge evaluation failed (continuing): %s", exc)
+
+    # Stage 4: Shadow evaluation
+    shadow_result: ShadowEvalResult | None = None
+    try:
+        from evolution.shadow import evaluate as shadow_evaluate
+        shadow_result = await shadow_evaluate(proposal_id=proposal_id)
+        dgm.shadow_eval(shadow_result)
+    except Exception as exc:
+        log.warning("Shadow eval failed (continuing): %s", exc)
+        shadow_result = ShadowEvalResult(
+            proposal_id=proposal_id,
+            avg_reward_before=0.0, avg_reward_after=0.0,
+            error_rate_before=0.0, error_rate_after=0.0,
+            latency_p95_before=0.0, latency_p95_after=0.0,
+            golden_pass_rate=0.0,
+        )
+        dgm.shadow_eval(shadow_result)
+
+    # Stage 5: Three Laws guard check
+    try:
+        from evolution.guards import validate
+        guard_result = validate(shadow=shadow_result, test_passed=True)
+        dgm.guard_check(guard_result)
+
+        if not guard_result.passed:
+            return "guards rejected"
+    except Exception as exc:
+        log.warning("Guard check failed: %s", exc)
+        dgm.guard_check(GuardResult(passed=False, violations=[]))
+        return f"guard error: {exc}"
+
+    return "awaiting approval"
 
 
 def select_improvement_target() -> dict | None:

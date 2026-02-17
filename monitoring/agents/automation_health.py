@@ -119,7 +119,7 @@ def run_automation_health(molly=None) -> list[HealthCheck]:
         fu_status = "yellow"
         fu_detail = "followups.md missing"
     else:
-        age_days = (datetime.now() - datetime.fromtimestamp(followups.stat().st_mtime)).days
+        age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(followups.stat().st_mtime, tz=timezone.utc)).days
         fu_status = "green" if age_days <= 3 else ("yellow" if age_days <= 7 else "red")
         fu_detail = f"updated {age_days} day(s) ago"
     checks.append(

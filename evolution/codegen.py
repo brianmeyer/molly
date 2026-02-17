@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -21,6 +22,7 @@ log = logging.getLogger(__name__)
 _RATE_LIMIT = 5
 _RATE_WINDOW = 3600  # 1 hour
 _call_timestamps: list[float] = []
+_rate_lock = threading.Lock()
 
 
 @dataclass
@@ -69,14 +71,15 @@ def is_available(backend: str = "claude_code") -> bool:
 def _check_rate_limit() -> bool:
     """Return True if we're within the rate limit."""
     now = time.time()
-    # Prune old timestamps
-    _call_timestamps[:] = [t for t in _call_timestamps if now - t < _RATE_WINDOW]
-    return len(_call_timestamps) < _RATE_LIMIT
+    with _rate_lock:
+        _call_timestamps[:] = [t for t in _call_timestamps if now - t < _RATE_WINDOW]
+        return len(_call_timestamps) < _RATE_LIMIT
 
 
 def _record_call() -> None:
     """Record a codegen call for rate limiting."""
-    _call_timestamps.append(time.time())
+    with _rate_lock:
+        _call_timestamps.append(time.time())
 
 
 async def generate_code(
@@ -152,19 +155,61 @@ async def _run_claude_code(request: CodegenRequest) -> CodegenResult:
 
 
 async def _run_codex(request: CodegenRequest) -> CodegenResult:
-    """Run OpenAI Codex API call (stub — wired in Batch 8)."""
+    """Run OpenAI API call for code generation."""
     start = time.time()
 
-    # Stub: actual API call will be wired during integration
-    log.debug("Codex backend called (stub)")
-    elapsed = time.time() - start
+    try:
+        import config
+        import openai
 
-    return CodegenResult(
-        success=False,
-        stderr="codex backend not yet wired",
-        latency_seconds=elapsed,
-        backend_used="codex",
-    )
+        client = openai.AsyncOpenAI(api_key=getattr(config, "OPENAI_API_KEY", ""))
+        prompt = _build_prompt(request)
+
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o",
+                max_tokens=request.max_tokens,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a code generation assistant. Output ONLY unified diff patches "
+                            "that can be applied with `git apply`. Use standard diff format with "
+                            "--- a/file and +++ b/file headers."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            ),
+            timeout=request.timeout_seconds,
+        )
+
+        elapsed = time.time() - start
+        text = resp.choices[0].message.content or "" if resp.choices else ""
+        tokens_used = resp.usage.total_tokens if resp.usage else 0
+
+        patches = _parse_patches(text)
+
+        return CodegenResult(
+            success=bool(patches),
+            patches=patches,
+            stdout=text[:5000],
+            tokens_used=tokens_used,
+            latency_seconds=elapsed,
+            backend_used="codex",
+        )
+    except asyncio.TimeoutError:
+        return CodegenResult(
+            success=False, stderr="OpenAI timeout",
+            latency_seconds=request.timeout_seconds, backend_used="codex",
+        )
+    except Exception as exc:
+        elapsed = time.time() - start
+        log.debug("Codex backend failed: %s", exc, exc_info=True)
+        return CodegenResult(
+            success=False, stderr=str(exc)[:500],
+            latency_seconds=elapsed, backend_used="codex",
+        )
 
 
 def _build_prompt(request: CodegenRequest) -> str:
