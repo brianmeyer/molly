@@ -311,7 +311,7 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 return improver
             improver = getattr(molly, "self_improvement", None) if molly else None
             if improver is None:
-                from self_improve import SelfImprovementEngine
+                from evolution.skills import SelfImprovementEngine
                 improver = SelfImprovementEngine(molly=molly)
                 await improver.initialize()
             return improver
@@ -351,6 +351,7 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 else:
                     text, failed = str(value), False
             except Exception:
+                log.warning("Maintenance step %d '%s' failed", step_no, name, exc_info=True)
                 text, failed = "failed", True
             _record(name, text, failed=failed)
             _final(step_no)
@@ -438,7 +439,8 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
 
         async def _step_code_loop() -> str:
             from evolution.code_loop import run_code_loop  # LAZY — avoids circular import
-            return await run_code_loop(improver)
+            eng = await _ensure_improver()
+            return await run_code_loop(eng)
 
         async def _step_issue_registry() -> str:
             from monitoring.jobs.audit_jobs import record_maintenance_issues

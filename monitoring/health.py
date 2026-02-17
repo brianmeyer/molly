@@ -136,7 +136,8 @@ class HealthDoctor:
         markdown = "\n".join(lines).rstrip() + "\n"
 
         report_path = self.report_dir / f"{date.today().isoformat()}.md"
-        report_path.write_text(markdown)
+        from utils import atomic_write
+        atomic_write(report_path, markdown)
         self._prune_old_reports()
 
         # Sync issue registry (non-blocking — errors are swallowed)
@@ -145,7 +146,7 @@ class HealthDoctor:
                 from monitoring.agents.issue_sync import sync_issue_registry
                 sync_issue_registry(checks, self.report_dir)
             except Exception:
-                log.debug("Issue registry sync failed", exc_info=True)
+                log.warning("Issue registry sync failed", exc_info=True)
 
         return markdown
 
@@ -211,13 +212,27 @@ class HealthDoctor:
             if curr.get(cid) == "red" and prev.get(cid) == "green"
         ]
 
-    def compare_worsened_components(self, previous_text: str, current_text: str) -> list[str]:
-        """Return check_ids that worsened (any direction)."""
+    def compare_worsened_components(
+        self,
+        previous_text: str = "",
+        current_text: str = "",
+        *,
+        baseline_report: str = "",
+        candidate_report: str = "",
+    ) -> list[dict[str, str]]:
+        """Return dicts with ``id``, ``before``, ``after`` for worsened checks.
+
+        Accepts both positional (previous_text, current_text) and keyword
+        (baseline_report, candidate_report) call styles for backward compat.
+        """
+        prev_text = baseline_report or previous_text
+        curr_text = candidate_report or current_text
         severity = {"green": 0, "yellow": 1, "red": 2}
-        prev = self.extract_status_map(previous_text)
-        curr = self.extract_status_map(current_text)
+        prev = self.extract_status_map(prev_text)
+        curr = self.extract_status_map(curr_text)
         return [
-            cid for cid in curr
+            {"id": cid, "before": prev.get(cid, ""), "after": curr.get(cid, "")}
+            for cid in curr
             if severity.get(curr.get(cid, ""), 0) > severity.get(prev.get(cid, ""), 0)
         ]
 
@@ -228,12 +243,24 @@ class HealthDoctor:
     def _run_checks(self, abbreviated: bool) -> list[HealthCheck]:
         checks: list[HealthCheck] = []
 
+        def _crash_check(layer: str, label: str) -> HealthCheck:
+            """Return a red HealthCheck when an agent layer crashes."""
+            return HealthCheck(
+                check_id=f"meta.{label.replace(' ', '_').lower()}_crash",
+                layer=layer,
+                label=f"{label} agent",
+                status="red",
+                detail="Agent crashed during check execution",
+                action_required=True,
+            )
+
         # Layer 1: Component Heartbeats (always run)
         try:
             from monitoring.agents.component_heartbeats import run_component_heartbeats
             checks.extend(run_component_heartbeats(self.molly))
         except Exception:
             log.error("Component heartbeats failed", exc_info=True)
+            checks.append(_crash_check("Component Heartbeats", "Component Heartbeats"))
 
         if abbreviated:
             return checks
@@ -244,6 +271,7 @@ class HealthDoctor:
             checks.extend(run_pipeline_validation(self.molly))
         except Exception:
             log.error("Pipeline validation failed", exc_info=True)
+            checks.append(_crash_check("Pipeline Validation", "Pipeline Validation"))
 
         # Layer 3: Data Quality
         try:
@@ -251,6 +279,7 @@ class HealthDoctor:
             checks.extend(run_data_quality(self.molly, self.latest_report_path()))
         except Exception:
             log.error("Data quality checks failed", exc_info=True)
+            checks.append(_crash_check("Data Quality", "Data Quality"))
 
         # Layer 4: Automation Health
         try:
@@ -258,6 +287,7 @@ class HealthDoctor:
             checks.extend(run_automation_health(self.molly))
         except Exception:
             log.error("Automation health checks failed", exc_info=True)
+            checks.append(_crash_check("Automation Health", "Automation Health"))
 
         # Layer 5: Learning Loop
         try:
@@ -265,6 +295,7 @@ class HealthDoctor:
             checks.extend(run_learning_loop(self.molly))
         except Exception:
             log.error("Learning loop checks failed", exc_info=True)
+            checks.append(_crash_check("Learning & Self-Improvement", "Learning Loop"))
 
         # Layer 6: Retrieval Quality
         try:
@@ -272,6 +303,7 @@ class HealthDoctor:
             checks.extend(run_retrieval_quality(self.molly))
         except Exception:
             log.error("Retrieval quality checks failed", exc_info=True)
+            checks.append(_crash_check("Retrieval Quality", "Retrieval Quality"))
 
         # Layer 7: Track F Pre-Prod
         try:
@@ -279,6 +311,7 @@ class HealthDoctor:
             checks.extend(run_track_f_checks())
         except Exception:
             log.error("Track F checks failed", exc_info=True)
+            checks.append(_crash_check("Track F Pre-Prod", "Track F"))
 
         return checks
 

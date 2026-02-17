@@ -116,8 +116,11 @@ async def grok_reason(args: dict) -> dict:
     if search_x:
         try:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None, _run_x_search, query_text, system_context, days_back,
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, _run_x_search, query_text, system_context, days_back,
+                ),
+                timeout=60.0,
             )
             return result
         except Exception as e:

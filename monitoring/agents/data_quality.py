@@ -56,7 +56,7 @@ def run_data_quality(molly=None, latest_report_path: Path | None = None) -> list
             )
         )
     else:
-        age_days = (datetime.now() - datetime.fromtimestamp(memory_path.stat().st_mtime)).days
+        age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(memory_path.stat().st_mtime, tz=timezone.utc)).days
         freshness = "green" if age_days <= 7 else ("yellow" if age_days <= 14 else "red")
         checks.append(
             HealthCheck(
@@ -253,12 +253,12 @@ def _duplicate_entity_check() -> tuple[str, str]:
 
 
 def _chunk_retention_check() -> tuple[str, str]:
+    conn = None
     try:
         conn = db_pool.sqlite_connect(str(config.MOLLYGRAPH_PATH))
         row = conn.execute(
             "SELECT MIN(created_at), MAX(created_at), COUNT(*) FROM conversation_chunks"
         ).fetchone()
-        conn.close()
         oldest, newest, count = row
         if int(count or 0) == 0:
             return "red", "0 chunks"
@@ -272,6 +272,9 @@ def _chunk_retention_check() -> tuple[str, str]:
         return "green", f"oldest={oldest_dt.date()}, newest={newest_dt.date()}"
     except Exception as exc:
         return "red", f"retention check failed ({exc})"
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _maintenance_log_check() -> tuple[str, str]:

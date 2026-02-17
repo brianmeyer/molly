@@ -14,14 +14,14 @@ class TestWhatsAppJidGuard(unittest.TestCase):
         self.assertIsNotNone(jid)
 
     def test_parse_jid_accepts_lid_jids(self):
-        jid = WhatsAppClient._parse_jid("52660963176533@lid")
+        jid = WhatsAppClient._parse_jid("99900000000000@lid")
         self.assertIsNotNone(jid)
 
     def test_parse_jid_handles_required_formats_without_crashing(self):
         samples = (
             "web:8d94e06e",
-            "15857332025@s.whatsapp.net",
-            "52660963176533@lid",
+            "15551234567@s.whatsapp.net",
+            "99900000000000@lid",
         )
         for sample in samples:
             try:

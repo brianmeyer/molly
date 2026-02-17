@@ -60,6 +60,7 @@ def validate_patch(patch: EnforcedPatch) -> bool:
             ["git", "apply", "--check"],
             input=patch.diff_text.encode(),
             capture_output=True,
+            timeout=30,
         )
         return proc.returncode == 0
     except Exception:

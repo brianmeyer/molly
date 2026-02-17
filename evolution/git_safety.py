@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -20,15 +21,19 @@ _GIT_AUTHOR_ENV = {
 }
 
 
-async def _agit(args: list[str], cwd: str | Path | None = None, **kw) -> str:
+async def _agit(args: list[str], cwd: str | Path | None = None, timeout: int = 30, **kw) -> str:
     """Run a git command asynchronously and return stdout."""
     proc = await asyncio.create_subprocess_exec(
         "git", *args,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        cwd=cwd, env={**_GIT_AUTHOR_ENV},
+        cwd=cwd, env={**os.environ, **_GIT_AUTHOR_ENV},
         **kw,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout}s")
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {stderr.decode().strip()}")
     return stdout.decode().strip()
@@ -50,8 +55,11 @@ async def validate_patch(diff_text: str, cwd: str | Path | None = None) -> bool:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd,
         )
-        _, stderr = await proc.communicate(diff_text.encode())
+        _, stderr = await asyncio.wait_for(proc.communicate(diff_text.encode()), timeout=15)
         return proc.returncode == 0
+    except asyncio.TimeoutError:
+        log.warning("validate_patch timed out")
+        return False
     except Exception:
         log.warning("validate_patch failed", exc_info=True)
         return False
@@ -67,8 +75,11 @@ async def run_checks(cwd: str | Path | None = None) -> dict:
             "ruff", "check", ".",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
         )
-        await proc.communicate()
+        await asyncio.wait_for(proc.communicate(), timeout=30)
         results["ruff"] = proc.returncode == 0
+    except asyncio.TimeoutError:
+        log.warning("ruff check timed out")
+        results["ruff"] = False
     except FileNotFoundError:
         results["ruff"] = True  # ruff not installed — skip
 
@@ -78,9 +89,12 @@ async def run_checks(cwd: str | Path | None = None) -> dict:
             "python3", "-m", "pytest", "tests/", "-q", "--tb=no",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
         )
-        stdout, _ = await proc.communicate()
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
         results["pytest"] = proc.returncode == 0
         results["pytest_output"] = stdout.decode()[:2000]
+    except asyncio.TimeoutError:
+        log.warning("pytest timed out")
+        results["pytest"] = False
     except Exception:
         results["pytest"] = False
 

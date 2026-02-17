@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -10,6 +11,10 @@ from typing import Any
 from neo4j import GraphDatabase
 
 import config
+
+
+class GraphUnavailableError(RuntimeError):
+    """Raised when Neo4j is not reachable — callers should degrade gracefully."""
 
 log = logging.getLogger(__name__)
 
@@ -47,31 +52,39 @@ def _get_graph_write_lock() -> asyncio.Lock:
 
 
 def get_driver():
-    """Lazy-initialize the Neo4j driver and create indexes (thread-safe)."""
+    """Lazy-initialize the Neo4j driver and create indexes (thread-safe).
+
+    Raises GraphUnavailableError if Neo4j is unreachable, allowing callers
+    to degrade gracefully via their existing except-Exception handlers.
+    """
     global _driver
     if _driver is not None:
         return _driver
     with _driver_lock:
         if _driver is None:
-            drv = GraphDatabase.driver(
-                config.NEO4J_URI,
-                auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
-            )
-            with drv.session() as session:
-                session.run(
-                    "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
+            try:
+                drv = GraphDatabase.driver(
+                    config.NEO4J_URI,
+                    auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
                 )
-                session.run(
-                    "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)"
-                )
-                session.run(
-                    "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
-                )
-                session.run(
-                    "CREATE INDEX entity_phone IF NOT EXISTS FOR (e:Entity) ON (e.phone)"
-                )
-            _driver = drv
-            log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
+                with drv.session() as session:
+                    session.run(
+                        "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
+                    )
+                    session.run(
+                        "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)"
+                    )
+                    session.run(
+                        "CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)"
+                    )
+                    session.run(
+                        "CREATE INDEX entity_phone IF NOT EXISTS FOR (e:Entity) ON (e.phone)"
+                    )
+                _driver = drv
+                log.info("Neo4j driver initialized at %s", config.NEO4J_URI)
+            except Exception:
+                log.warning("Neo4j unavailable — graph layer disabled", exc_info=True)
+                raise GraphUnavailableError("Neo4j is not reachable")
     return _driver
 
 
@@ -226,12 +239,18 @@ async def upsert_entity(
         return await asyncio.to_thread(_upsert_entity_sync, name, entity_type, confidence)
 
 
+_SAFE_PROPERTY_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
 def set_entity_properties(name: str, properties: dict) -> None:
     """Set properties on an existing entity node."""
     if not properties:
         return
     driver = get_driver()
-    # Keys are validated by caller; values are parameterized.
+    # Validate property keys to prevent Cypher injection.
+    for k in properties:
+        if not _SAFE_PROPERTY_KEY.match(k):
+            raise ValueError(f"Unsafe Cypher property key: {k!r}")
     set_clauses = ", ".join(f"e.{k} = ${k}" for k in properties)
     with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
         session.run(

@@ -10,6 +10,8 @@ import logging
 import time
 from pathlib import Path
 
+from utils import atomic_write
+
 from evolution._base import (
     BASELINE_SAMPLES,
     MIN_REWARD_DELTA,
@@ -55,7 +57,7 @@ def add_golden_item(
     }
     filename = f"golden_{int(time.time() * 1000)}.json"
     path = GOLDEN_SET_DIR / filename
-    path.write_text(json.dumps(item, indent=2))
+    atomic_write(path, json.dumps(item, indent=2))
     log.info("Added golden item: %s", path.name)
     return path
 
@@ -105,17 +107,17 @@ async def evaluate(
         _store_result(result, is_improvement=False, guard_passed=False)
         return result
 
-    # Stub: when not yet wired, return conservative default
+    # Conservative default when evaluation functions not provided
     if patched_fn is None or baseline_fn is None:
-        log.debug("Shadow eval stub — no patched/baseline fn provided")
+        log.debug("Shadow eval skipped — no patched/baseline fn provided")
         result = ShadowEvalResult(
             proposal_id=proposal_id,
             avg_reward_before=0.0, avg_reward_after=0.0,
             error_rate_before=0.0, error_rate_after=0.0,
             latency_p95_before=0.0, latency_p95_after=0.0,
-            golden_pass_rate=1.0,
+            golden_pass_rate=0.0,
         )
-        _store_result(result, is_improvement=False, guard_passed=True)
+        _store_result(result, is_improvement=False, guard_passed=False)
         return result
 
     # Real evaluation (wired in Batch 8)

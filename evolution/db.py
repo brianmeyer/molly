@@ -134,6 +134,14 @@ CREATE TABLE IF NOT EXISTS guard_violations (
     actual_value REAL,
     severity TEXT DEFAULT 'warning'
 );
+
+-- Performance indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp);
+CREATE INDEX IF NOT EXISTS idx_trajectories_arm_id ON trajectories(arm_id);
+CREATE INDEX IF NOT EXISTS idx_experiences_task_hash ON experiences(task_hash);
+CREATE INDEX IF NOT EXISTS idx_experiences_reward ON experiences(reward);
+CREATE INDEX IF NOT EXISTS idx_shadow_results_proposal_id ON shadow_results(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_guard_violations_proposal_id ON guard_violations(proposal_id);
 """
 
 
@@ -142,6 +150,8 @@ def ensure_schema() -> None:
     _DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(_DB_PATH))
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(_SCHEMA_SQL)
         # Seed DGM state row if missing
         conn.execute(
@@ -159,5 +169,6 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
