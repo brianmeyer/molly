@@ -289,6 +289,20 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(
             patch.object(maintenance, "_run_opus_analysis", new=AsyncMock(return_value=""))
         )
+        stack.enter_context(
+            patch.object(
+                maintenance,
+                "run_contract_audits",
+                new=AsyncMock(return_value={
+                    "nightly_deterministic": {"status": "pass", "summary": "pass", "checks": []},
+                    "weekly_deterministic": {"status": "pass", "summary": "pass", "checks": []},
+                    "nightly_model": {"status": "disabled", "summary": "disabled", "route": "kimi", "output": ""},
+                    "weekly_model": {"status": "disabled", "summary": "disabled", "route": "opus", "output": ""},
+                    "artifacts": {"maintenance": "", "health": "", "error": ""},
+                    "markdown": "# audit\n",
+                }),
+            )
+        )
         molly = SimpleNamespace(self_improvement=improver, wa=None)
         return stack, molly
 

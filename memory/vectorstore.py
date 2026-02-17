@@ -493,10 +493,17 @@ class VectorStore:
 
         # Escape FTS5 special characters for safety
         # FTS5 special chars: " * ^ : ( ) AND OR NOT NEAR
-        # Strip double-quotes entirely (query is wrapped in quotes for phrase search)
         safe_query = query.replace('"', ' ')
         for ch in ('*', '^', ':', '(', ')'):
             safe_query = safe_query.replace(ch, ' ')
+
+        # Tokenize into individual terms and join with OR for broad matching.
+        # Previous approach wrapped in quotes for exact-phrase search which
+        # returned 0 results when the phrase didn't appear verbatim.
+        tokens = [t.strip() for t in safe_query.split() if t.strip()]
+        if not tokens:
+            return []
+        fts_expr = " OR ".join(f'"{t}"' for t in tokens)
 
         try:
             cursor = self.conn.execute(
@@ -516,7 +523,7 @@ class VectorStore:
                 ORDER BY cf.rank
                 LIMIT ?
                 """,
-                (f'"{safe_query}"', top_k),
+                (fts_expr, top_k),
             )
             rows = cursor.fetchall()
         except Exception:

@@ -11,7 +11,7 @@ Key design decisions:
   - NO response_format parameter (Moonshot doesn't support it — uses prompt-based JSON)
   - Thinking mode disabled for triage (speed over depth — extra_body not needed, just lower temp)
   - Every call logged to SQLite for observability
-  - Feature-flagged: ORCHESTRATOR_ENABLED = False by default
+  - Feature-flagged: ORCHESTRATOR_ENABLED = True by default
 """
 from __future__ import annotations
 

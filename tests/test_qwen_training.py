@@ -18,8 +18,8 @@ import config
 class TestQwenConfig(unittest.TestCase):
     """Test Qwen LoRA config values."""
 
-    def test_qwen_lora_disabled_by_default(self):
-        self.assertFalse(config.QWEN_LORA_ENABLED)
+    def test_qwen_lora_enabled_by_default(self):
+        self.assertTrue(config.QWEN_LORA_ENABLED)
 
     def test_min_examples(self):
         self.assertEqual(config.QWEN_LORA_MIN_EXAMPLES, 500)

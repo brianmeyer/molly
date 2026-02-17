@@ -25,12 +25,12 @@ def _error_result(msg: str) -> dict:
     return {"content": [{"type": "text", "text": msg}], "is_error": True}
 
 
-@track_latency("groq")
 @tool(
     "groq_reason",
     "Query Groq for fast reasoning, coding help, summarization, and fallback orchestration tasks.",
     {"query": str, "system_context": str, "model": str, "temperature": float},
 )
+@track_latency("groq")
 async def groq_reason(args: dict) -> dict:
     query_text = str(args.get("query", "")).strip()
     if not query_text:

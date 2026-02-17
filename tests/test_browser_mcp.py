@@ -18,8 +18,8 @@ import config
 class TestBrowserMCPConfig(unittest.TestCase):
     """Test browser MCP config values."""
 
-    def test_browser_mcp_disabled_by_default(self):
-        self.assertFalse(config.BROWSER_MCP_ENABLED)
+    def test_browser_mcp_enabled_by_default(self):
+        self.assertTrue(config.BROWSER_MCP_ENABLED)
 
     def test_browser_profile_dir(self):
         self.assertIsInstance(config.BROWSER_PROFILE_DIR, Path)
@@ -60,8 +60,8 @@ class TestBrowserMCPServerConfig(unittest.TestCase):
 
     def test_availability_check(self):
         from tools.browser_mcp import is_browser_available
-        # Should be False since BROWSER_MCP_ENABLED defaults to False
-        self.assertFalse(is_browser_available())
+        # BROWSER_MCP_ENABLED defaults to True
+        self.assertTrue(is_browser_available())
 
 
 class TestBrowserSafety(unittest.TestCase):

@@ -356,7 +356,7 @@ async def _execute_worker(
                 allowed_tools=allowed_tools,
                 mcp_servers=mcp_servers,
                 cwd=str(getattr(config, "WORKSPACE", ".")),
-                permission_mode="auto",
+                permission_mode="bypassPermissions",
                 max_turns=10,
             )
 
