@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 
 from evolution._base import EnforcedPatch
+from evolution.db import get_connection
 
 log = logging.getLogger(__name__)
 
@@ -82,17 +83,51 @@ def _record_call() -> None:
         _call_timestamps.append(time.time())
 
 
+def _log_codegen_result(
+    result: CodegenResult, proposal_id: str = "", patch_strategy: str = "",
+) -> None:
+    """Persist codegen result to evolution.db for backend success tracking."""
+    try:
+        conn = get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO codegen_results
+                   (proposal_id, backend, success, latency_seconds, tokens_used,
+                    patch_strategy, error, patch_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    proposal_id,
+                    result.backend_used,
+                    int(result.success),
+                    result.latency_seconds,
+                    result.tokens_used,
+                    patch_strategy,
+                    result.stderr[:500] if not result.success else "",
+                    len(result.patches),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("Failed to log codegen result", exc_info=True)
+
+
 async def generate_code(
     request: CodegenRequest,
     backend: str | None = None,
+    proposal_id: str = "",
 ) -> CodegenResult:
     """Generate code using the specified (or auto-selected) backend.
 
     All output goes through ``patch_enforcer`` for salvage.
+    Results are logged to ``codegen_results`` in evolution.db.
     """
     if not _check_rate_limit():
         log.warning("Codegen rate limit reached (%d/%d per hour)", _RATE_LIMIT, _RATE_LIMIT)
-        return CodegenResult(success=False, stderr="rate limit exceeded", backend_used="")
+        result = CodegenResult(success=False, stderr="rate limit exceeded", backend_used="")
+        _log_codegen_result(result, proposal_id)
+        return result
 
     # Auto-select backend
     if backend is None:
@@ -101,16 +136,21 @@ async def generate_code(
         elif is_available("codex"):
             backend = "codex"
         else:
-            return CodegenResult(success=False, stderr="no backend available", backend_used="")
+            result = CodegenResult(success=False, stderr="no backend available", backend_used="")
+            _log_codegen_result(result, proposal_id)
+            return result
 
     _record_call()
 
     if backend == "claude_code":
-        return await _run_claude_code(request)
+        result = await _run_claude_code(request)
     elif backend == "codex":
-        return await _run_codex(request)
+        result = await _run_codex(request)
     else:
-        return CodegenResult(success=False, stderr=f"unknown backend: {backend}", backend_used=backend)
+        result = CodegenResult(success=False, stderr=f"unknown backend: {backend}", backend_used=backend)
+
+    _log_codegen_result(result, proposal_id)
+    return result
 
 
 async def _run_claude_code(request: CodegenRequest) -> CodegenResult:
@@ -146,6 +186,7 @@ async def _run_claude_code(request: CodegenRequest) -> CodegenResult:
             backend_used="claude_code",
         )
     except asyncio.TimeoutError:
+        log.warning("Codegen timed out for backend=claude_code timeout=%ss", request.timeout_seconds)
         return CodegenResult(
             success=False, stderr="timeout", latency_seconds=request.timeout_seconds,
             backend_used="claude_code",
@@ -199,6 +240,7 @@ async def _run_codex(request: CodegenRequest) -> CodegenResult:
             backend_used="codex",
         )
     except asyncio.TimeoutError:
+        log.warning("Codegen timed out for backend=codex timeout=%ss", request.timeout_seconds)
         return CodegenResult(
             success=False, stderr="OpenAI timeout",
             latency_seconds=request.timeout_seconds, backend_used="codex",

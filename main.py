@@ -286,7 +286,7 @@ def _wait_for_neo4j(timeout: int = 30):
         except OSError:
             time.sleep(1)
 
-    log.error("Neo4j did not become ready within %ds", timeout)
+    log.error("Neo4j did not become ready within %ds", timeout, exc_info=True)
     sys.exit(1)
 
 
@@ -1905,6 +1905,7 @@ class Molly:
                 task.add_done_callback(_task_done_callback)
             except asyncio.TimeoutError:
                 # No message in queue — check scheduled tasks (run in background)
+                log.debug("Queue poll timed out, checking scheduled tasks")
                 if self.wa and self.wa.connected:
                     if (
                         self._automation_tick_task is None

@@ -135,6 +135,31 @@ CREATE TABLE IF NOT EXISTS guard_violations (
     severity TEXT DEFAULT 'warning'
 );
 
+-- Proposal lifecycle audit log (every state transition)
+CREATE TABLE IF NOT EXISTS proposal_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL DEFAULT (unixepoch()),
+    proposal_id TEXT,
+    old_state TEXT,
+    new_state TEXT,
+    note TEXT DEFAULT '',
+    proposal_json TEXT
+);
+
+-- Code generation results (per-request tracking)
+CREATE TABLE IF NOT EXISTS codegen_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL DEFAULT (unixepoch()),
+    proposal_id TEXT,
+    backend TEXT,
+    success INTEGER DEFAULT 0,
+    latency_seconds REAL,
+    tokens_used INTEGER DEFAULT 0,
+    patch_strategy TEXT,
+    error TEXT DEFAULT '',
+    patch_count INTEGER DEFAULT 0
+);
+
 -- Performance indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp);
 CREATE INDEX IF NOT EXISTS idx_trajectories_arm_id ON trajectories(arm_id);
@@ -142,6 +167,10 @@ CREATE INDEX IF NOT EXISTS idx_experiences_task_hash ON experiences(task_hash);
 CREATE INDEX IF NOT EXISTS idx_experiences_reward ON experiences(reward);
 CREATE INDEX IF NOT EXISTS idx_shadow_results_proposal_id ON shadow_results(proposal_id);
 CREATE INDEX IF NOT EXISTS idx_guard_violations_proposal_id ON guard_violations(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_proposal_history_proposal_id ON proposal_history(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_proposal_history_timestamp ON proposal_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_codegen_results_proposal_id ON codegen_results(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_codegen_results_backend ON codegen_results(backend);
 """
 
 

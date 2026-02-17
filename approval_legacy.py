@@ -1170,6 +1170,7 @@ class ApprovalManager:
                 preferred_chat_jid=approval.response_chat_jid,
                 text=f"Approval timed out for: {category}",
             )
+            log.info("Custom approval timed out: %s", category)
             return False
 
     # --- Resolution ---

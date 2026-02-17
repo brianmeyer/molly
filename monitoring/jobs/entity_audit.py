@@ -217,7 +217,7 @@ def _sample_entities_for_audit(batch_size: int = 50) -> list[dict]:
             )
             return [dict(r) for r in records]
     except Exception as exc:
-        log.error("Failed to sample entities for audit: %s", exc)
+        log.error("Failed to sample entities for audit: %s", exc, exc_info=True)
         return []
 
 
@@ -315,7 +315,7 @@ async def _kimi_audit_relationships(sample_size: int = 100) -> list[RelAuditVerd
             )
             rels = [dict(r) for r in records]
     except Exception as exc:
-        log.error("Failed to sample relationships: %s", exc)
+        log.error("Failed to sample relationships: %s", exc, exc_info=True)
         return []
 
     if not rels:
@@ -425,7 +425,7 @@ async def _kimi_discover_missing_entities(sample_size: int = 50) -> list[EntityP
                 ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), sample_size),
             ).fetchall()
         except Exception as exc:
-            log.error("Failed to sample chunks for discovery: %s", exc)
+            log.error("Failed to sample chunks for discovery: %s", exc, exc_info=True)
             return []
     finally:
         if conn is not None:
@@ -488,7 +488,7 @@ async def _kimi_discover_missing_relationships(sample_size: int = 50) -> list[Re
             )
             pairs = [dict(r) for r in records]
     except Exception as exc:
-        log.error("Failed to sample disconnected pairs: %s", exc)
+        log.error("Failed to sample disconnected pairs: %s", exc, exc_info=True)
         return []
 
     if not pairs:
@@ -604,7 +604,7 @@ def _tally_type_proposals(new_proposals: list[dict]) -> None:
 
         conn.commit()
     except Exception as exc:
-        log.error("Failed to tally type proposals: %s", exc)
+        log.error("Failed to tally type proposals: %s", exc, exc_info=True)
     finally:
         if conn is not None:
             conn.close()
@@ -640,11 +640,11 @@ async def _evaluate_type_adoption() -> dict[str, int]:
                 _log_schema_evolution(conn, category, name)
                 result["adopted"] += 1
             except Exception as exc:
-                log.error("Failed to adopt type %s/%s: %s", category, name, exc)
+                log.error("Failed to adopt type %s/%s: %s", category, name, exc, exc_info=True)
 
         conn.commit()
     except Exception as exc:
-        log.error("Type adoption evaluation failed: %s", exc)
+        log.error("Type adoption evaluation failed: %s", exc, exc_info=True)
     finally:
         if conn is not None:
             conn.close()

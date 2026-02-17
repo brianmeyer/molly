@@ -5,7 +5,10 @@ not in the orchestrator (dgm.py), to avoid circular imports.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

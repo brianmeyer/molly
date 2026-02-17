@@ -4,6 +4,7 @@ Extracted from automations_legacy.py during Phase 3 refactor.
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ import yaml
 
 import config
 from utils import normalize_timestamp
+
+log = logging.getLogger(__name__)
 
 _SEQUENCE_SPLIT_RE = re.compile(r"\s*->\s*")
 _WORD_TOKEN_RE = re.compile(r"[a-z0-9]+")

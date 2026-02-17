@@ -62,6 +62,19 @@ class TestExtractJson(unittest.TestCase):
         self.assertIsNotNone(data)
         self.assertEqual(len(data["subtasks"]), 1)
 
+    def test_stray_closing_brace_before_json(self):
+        """Regression: stray } before valid JSON should not prevent parsing."""
+        raw = 'foo } {"type":"simple","confidence":0.8}'
+        data = _extract_json(raw)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["type"], "simple")
+
+    def test_multiple_stray_braces(self):
+        raw = '}} text } {"type": "direct"}'
+        data = _extract_json(raw)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["type"], "direct")
+
 
 class TestParseTriageResponse(unittest.TestCase):
     """Test triage response parsing into TriageResult."""
@@ -101,6 +114,20 @@ class TestParseTriageResponse(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.classification, "complex")
         self.assertEqual(len(result.subtasks), 2)
+        self.assertEqual(result.subtasks[1].depends_on, ["t1"])
+
+    def test_depends_on_string_normalized_to_list(self):
+        """Regression: depends_on as string 't1' should become ['t1'] not ['t','1']."""
+        raw = json.dumps({
+            "type": "complex",
+            "confidence": 0.8,
+            "subtasks": [
+                {"id": "t1", "profile": "research", "description": "Research"},
+                {"id": "t2", "profile": "email", "description": "Email", "depends_on": "t1"},
+            ],
+        })
+        result = _parse_triage_response(raw)
+        self.assertIsNotNone(result)
         self.assertEqual(result.subtasks[1].depends_on, ["t1"])
 
     def test_unknown_type_normalizes(self):

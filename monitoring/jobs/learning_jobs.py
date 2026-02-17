@@ -80,6 +80,7 @@ def run_correction_patterns() -> str:
                 parts.append(f"  Molly: {molly_out}... -> User: {user_corr}...")
         return "\n".join(parts)
     except Exception as exc:
+        log.error("Correction patterns query failed: %s", exc, exc_info=True)
         return f"failed ({exc})"
     finally:
         if conn is not None:

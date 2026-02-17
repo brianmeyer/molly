@@ -32,6 +32,7 @@ async def _agit(args: list[str], cwd: str | Path | None = None, timeout: int = 3
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
+        log.warning("Git command timed out, killing process: git %s (timeout=%ss)", ' '.join(args), timeout)
         proc.kill()
         raise RuntimeError(f"git {' '.join(args)} timed out after {timeout}s")
     if proc.returncode != 0:

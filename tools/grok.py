@@ -21,6 +21,7 @@ import httpx
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ def _run_x_search(query_text: str, system_context: str, days_back: int) -> dict:
     return _text_result(content + meta)
 
 
+@track_latency("grok")
 @tool(
     "grok_reason",
     "Query Grok (xAI) for social intelligence, sentiment analysis, "

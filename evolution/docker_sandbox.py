@@ -242,7 +242,12 @@ class DockerSandbox:
                     continue
                 safe_reqs.append(shlex.quote(req))
             if safe_reqs:
-                install_cmd = f"pip install --quiet {' '.join(safe_reqs)} && "
+                # Install to /tmp/pip since rootfs is read-only;
+                # export PYTHONPATH so python script.py sees the packages.
+                install_cmd = (
+                    f"pip install --quiet --target /tmp/pip {' '.join(safe_reqs)} "
+                    f"&& export PYTHONPATH=/tmp/pip:$PYTHONPATH && "
+                )
             else:
                 install_cmd = ""
         else:
