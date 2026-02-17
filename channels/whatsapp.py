@@ -14,6 +14,7 @@ from typing import Any
 
 import config
 from channels.base import Channel, InboundMessage, OutboundMessage, registry
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ class WhatsAppChannel(Channel):
     # Send
     # ------------------------------------------------------------------
 
+    @track_latency("whatsapp", "send_message")
     async def send(self, message: OutboundMessage, transport: Any = None) -> str | list[str] | None:
         """Send through the WhatsApp client.
 

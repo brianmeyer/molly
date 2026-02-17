@@ -76,6 +76,10 @@ _MCP_SERVER_TOOL_NAMES = {
     "kimi": {"kimi_research"},
     "grok": {"grok_reason"},
     "groq": {"groq_reason"},
+    "browser-mcp": {
+        "browser_navigate", "browser_click", "browser_type",
+        "browser_screenshot", "browser_extract_text",
+    },
 }
 
 _CHAT_RUNTIME_LOCK = asyncio.Lock()

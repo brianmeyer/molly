@@ -232,9 +232,11 @@ def _load_mcp_servers_for_profile(profile_name: str) -> dict[str, object]:
     profile = WORKER_PROFILES.get(profile_name, WORKER_PROFILES["general"])
     server_names = profile.get("mcp_servers", [])
 
-    # General profile gets all servers
-    if profile_name == "general" or not server_names:
+    # General profile gets all servers; empty list means NO servers (e.g. writer)
+    if profile_name == "general":
         server_names = list(_MCP_SERVER_SPECS.keys())
+    elif not server_names:
+        return {}
 
     servers: dict[str, object] = {}
     for name in server_names:
@@ -271,9 +273,13 @@ def _get_allowed_tools(profile_name: str) -> list[str]:
     profile = WORKER_PROFILES.get(profile_name, WORKER_PROFILES["general"])
     server_names = profile.get("mcp_servers", [])
 
-    if profile_name == "general" or not server_names:
+    if profile_name == "general":
         # General gets all AUTO tools
         return sorted(t for t in auto_tools if t not in disabled_tools)
+
+    if not server_names:
+        # Profiles with explicitly empty mcp_servers (e.g. writer) get no tools
+        return []
 
     # Filter to tools from this profile's MCP servers
     profile_tools: set[str] = set()

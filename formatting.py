@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+log = logging.getLogger(__name__)
 
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")

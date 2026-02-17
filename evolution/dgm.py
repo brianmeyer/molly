@@ -64,7 +64,11 @@ class DGM:
             conn.close()
 
     def _transition(self, new_state: str, **updates: str) -> None:
-        """Transition to a new state with optional column updates."""
+        """Transition to a new state with optional column updates.
+
+        Every transition is recorded in ``proposal_history`` for full audit
+        trail — the single-row ``dgm_state`` only holds *current* state.
+        """
         if new_state not in _VALID_STATES:
             raise ValueError(f"Invalid state: {new_state}")
 
@@ -80,7 +84,40 @@ class DGM:
 
         conn = get_connection()
         try:
+            # Read old state for audit log
+            old_row = conn.execute("SELECT state, proposal_json FROM dgm_state WHERE id = 1").fetchone()
+            old_state = old_row["state"] if old_row else "unknown"
+            proposal_json = old_row["proposal_json"] if old_row else None
+
+            # Extract proposal_id from proposal_json if available
+            proposal_id = None
+            if proposal_json:
+                try:
+                    proposal_id = json.loads(proposal_json).get("id")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Check if new proposal_json is being set in this transition
+            if "proposal_json" in updates and updates["proposal_json"] != "null":
+                try:
+                    proposal_id = json.loads(updates["proposal_json"]).get("id") or proposal_id
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             conn.execute(sql, params)
+
+            # Write audit log entry
+            conn.execute(
+                """INSERT INTO proposal_history
+                   (proposal_id, old_state, new_state, note, proposal_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    proposal_id,
+                    old_state,
+                    new_state,
+                    updates.get("note", ""),
+                    updates.get("proposal_json", proposal_json),
+                ),
+            )
             conn.commit()
             log.info("DGM transition → %s%s", new_state,
                      f" ({updates.get('note', '')})" if 'note' in updates else "")

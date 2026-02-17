@@ -1,9 +1,16 @@
+import asyncio
+import contextlib
+import functools
 import json
+import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 _NUMERIC_TS_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 
@@ -75,3 +82,98 @@ def load_json(path: str | Path, default: Any = None) -> Any:
         return json.loads(target.read_text())
     except (json.JSONDecodeError, OSError):
         return {} if default is None else default
+
+
+# ---------------------------------------------------------------------------
+# Latency tracking utilities
+# ---------------------------------------------------------------------------
+
+class LatencyTracker:
+    """Context manager that measures wall-clock latency for a block of code.
+
+    Usage (sync)::
+
+        with LatencyTracker("neo4j", "resolve_entity") as lt:
+            result = session.run(query, params)
+        # lt.elapsed_ms is now set, log entry emitted at DEBUG level
+
+    Usage (async)::
+
+        async with LatencyTracker("google_calendar", "list_events") as lt:
+            events = await service.events().list(...).execute()
+    """
+
+    __slots__ = ("service", "operation", "elapsed_ms", "_start", "_logger")
+
+    def __init__(self, service: str, operation: str, *, logger: logging.Logger | None = None):
+        self.service = service
+        self.operation = operation
+        self.elapsed_ms: float = 0.0
+        self._start: float = 0.0
+        self._logger = logger or logging.getLogger(f"latency.{service}")
+
+    def _finish(self) -> None:
+        self.elapsed_ms = (time.monotonic() - self._start) * 1000
+        self._logger.debug(
+            "%s.%s latency=%.1fms",
+            self.service, self.operation, self.elapsed_ms,
+        )
+
+    def __enter__(self) -> "LatencyTracker":
+        self._start = time.monotonic()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._finish()
+
+    async def __aenter__(self) -> "LatencyTracker":
+        self._start = time.monotonic()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        self._finish()
+
+
+def track_latency(service: str, operation: str | None = None):
+    """Decorator that logs wall-clock latency for sync or async functions.
+
+    Usage::
+
+        @track_latency("google_calendar")
+        def calendar_list(args):
+            ...
+
+        @track_latency("neo4j", "query")
+        async def run_cypher(query, params):
+            ...
+
+    The *operation* defaults to the function name if not given.
+    Latency is logged at DEBUG to ``latency.<service>`` logger.
+    """
+
+    def decorator(fn: Any) -> Any:
+        op = operation or fn.__name__
+        _logger = logging.getLogger(f"latency.{service}")
+
+        if asyncio.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start = time.monotonic()
+                try:
+                    return await fn(*args, **kwargs)
+                finally:
+                    ms = (time.monotonic() - start) * 1000
+                    _logger.debug("%s.%s latency=%.1fms", service, op, ms)
+            return async_wrapper
+        else:
+            @functools.wraps(fn)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start = time.monotonic()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    ms = (time.monotonic() - start) * 1000
+                    _logger.debug("%s.%s latency=%.1fms", service, op, ms)
+            return sync_wrapper
+
+    return decorator

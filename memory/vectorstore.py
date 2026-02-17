@@ -11,6 +11,7 @@ import threading
 import sqlite_vec
 
 import db_pool
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -329,6 +330,7 @@ class VectorStore:
         log.debug("Batch stored %d chunks in single transaction", len(chunk_ids))
         return chunk_ids
 
+    @track_latency("vectorstore")
     def search(self, query_embedding: list[float], top_k: int = 5) -> list[dict]:
         """ANN search for the most similar conversation chunks."""
         cursor = self.conn.execute(
@@ -558,6 +560,7 @@ class VectorStore:
             for r in rows
         ]
 
+    @track_latency("vectorstore")
     def hybrid_search(
         self,
         query_text: str,

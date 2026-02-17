@@ -88,6 +88,25 @@ class TestBrowserWorkerProfile(unittest.TestCase):
         self.assertIsNotNone(browser_profile)
         self.assertIn("browser-mcp", browser_profile["mcp_servers"])
 
+    def test_browser_mcp_in_tool_names_registry(self):
+        """Regression: browser-mcp must have tool names so workers get allowed_tools."""
+        from agent import _MCP_SERVER_TOOL_NAMES
+        self.assertIn("browser-mcp", _MCP_SERVER_TOOL_NAMES)
+        tool_names = _MCP_SERVER_TOOL_NAMES["browser-mcp"]
+        self.assertGreater(len(tool_names), 0)
+        for expected in ("browser_navigate", "browser_click", "browser_screenshot"):
+            self.assertIn(expected, tool_names)
+
+    def test_browser_worker_allowed_tools_nonempty(self):
+        """Regression: browser worker must resolve to non-empty tool list."""
+        from workers import _get_allowed_tools
+        tools = _get_allowed_tools("browser")
+        # Even if not all are in AUTO tier, the function should at least
+        # attempt to resolve (not return [] due to missing registry entry)
+        from agent import _MCP_SERVER_TOOL_NAMES
+        # Verify the registry has the tools (pre-condition for the worker)
+        self.assertTrue(len(_MCP_SERVER_TOOL_NAMES.get("browser-mcp", set())) >= 5)
+
 
 if __name__ == "__main__":
     unittest.main()

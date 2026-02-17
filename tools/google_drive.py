@@ -12,6 +12,7 @@ import logging
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from tools.google_auth import get_drive_service
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ def _escape_drive_query(user_input: str) -> str:
     "by file name, or use Drive query syntax (e.g. \"mimeType='application/pdf'\").",
     {"query": str},
 )
+@track_latency("google_drive")
 async def drive_search(args: dict) -> dict:
     try:
         query = args["query"]
@@ -110,6 +112,7 @@ async def drive_search(args: dict) -> dict:
     "Get metadata for a specific Google Drive file by file ID.",
     {"file_id": str},
 )
+@track_latency("google_drive")
 async def drive_get(args: dict) -> dict:
     try:
         file_id = args["file_id"]
@@ -129,6 +132,7 @@ async def drive_get(args: dict) -> dict:
     "Binary files return metadata only. Max 100KB of content.",
     {"file_id": str},
 )
+@track_latency("google_drive")
 async def drive_read(args: dict) -> dict:
     try:
         file_id = args["file_id"]

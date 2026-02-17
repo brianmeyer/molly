@@ -11,6 +11,7 @@ from typing import Any
 from neo4j import GraphDatabase
 
 import config
+from utils import track_latency
 
 
 class GraphUnavailableError(RuntimeError):
@@ -121,6 +122,7 @@ def _fuzzy_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
+@track_latency("neo4j")
 def find_matching_entity(
     name: str,
     entity_type: str,
@@ -222,6 +224,7 @@ def _upsert_entity_sync(
             return name.strip()
 
 
+@track_latency("neo4j")
 def upsert_entity_sync(
     name: str,
     entity_type: str,
@@ -230,6 +233,7 @@ def upsert_entity_sync(
     return _upsert_entity_sync(name, entity_type, confidence)
 
 
+@track_latency("neo4j")
 async def upsert_entity(
     name: str,
     entity_type: str,
@@ -336,6 +340,7 @@ def _upsert_relationship_sync(
                 log.debug("graph suggestion hotspot logging failed", exc_info=True)
 
 
+@track_latency("neo4j")
 def upsert_relationship_sync(
     head_name: str,
     tail_name: str,
@@ -352,6 +357,7 @@ def upsert_relationship_sync(
     )
 
 
+@track_latency("neo4j")
 async def upsert_relationship(
     head_name: str,
     tail_name: str,
@@ -409,6 +415,7 @@ def _create_episode_sync(
     return episode_id
 
 
+@track_latency("neo4j")
 def create_episode_sync(
     content_preview: str,
     source: str,
@@ -417,6 +424,7 @@ def create_episode_sync(
     return _create_episode_sync(content_preview, source, entity_names)
 
 
+@track_latency("neo4j")
 async def create_episode(
     content_preview: str,
     source: str,
@@ -429,6 +437,7 @@ async def create_episode(
 # --- Retrieval ---
 
 
+@track_latency("neo4j")
 def query_entity(name: str) -> dict[str, Any] | None:
     """Look up an entity and its relationships for system prompt injection."""
     driver = get_driver()
@@ -489,6 +498,7 @@ def query_entity(name: str) -> dict[str, Any] | None:
         return entity
 
 
+@track_latency("neo4j")
 def query_entities_for_context(entity_names: list[str]) -> str:
     """Query Neo4j for multiple entities and format for system prompt injection.
 
@@ -591,6 +601,7 @@ def query_entities_for_context(entity_names: list[str]) -> str:
 # --- Deletion (for /forget) ---
 
 
+@track_latency("neo4j")
 def delete_entity(name: str) -> bool:
     """Delete an entity and all its relationships. Returns True if found."""
     driver = get_driver()
@@ -872,6 +883,7 @@ def relationship_count() -> int:
         return result.single()["c"]
 
 
+@track_latency("neo4j")
 def get_graph_summary() -> dict[str, Any]:
     """Return overall graph stats: counts, top entities by connections, most recent."""
     driver = get_driver()
@@ -910,6 +922,7 @@ def get_graph_summary() -> dict[str, Any]:
     }
 
 
+@track_latency("neo4j")
 def get_top_entities(limit: int = 20) -> list[dict[str, Any]]:
     """Return top entities ordered by strength (mentions * recency).
 

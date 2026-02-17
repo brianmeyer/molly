@@ -226,7 +226,7 @@ def _extract_json(text: str) -> dict | None:
             if brace_depth == 0:
                 start = i
             brace_depth += 1
-        elif ch == "}":
+        elif ch == "}" and brace_depth > 0:
             brace_depth -= 1
             if brace_depth == 0 and start >= 0:
                 try:
@@ -259,7 +259,11 @@ def _parse_triage_response(text: str) -> TriageResult | None:
             id=str(st.get("id", f"t{len(subtasks) + 1}")),
             profile=str(st.get("profile", "general")),
             description=str(st.get("description", "")),
-            depends_on=list(st.get("depends_on", [])),
+            depends_on=(
+                st["depends_on"] if isinstance(st.get("depends_on"), list)
+                else [st["depends_on"]] if isinstance(st.get("depends_on"), str)
+                else list(st.get("depends_on", []))
+            ),
         ))
 
     # Cap subtasks at 5

@@ -570,6 +570,7 @@ class ApprovalManager:
             result = await asyncio.wait_for(future, timeout=timeout_s if timeout_s is not None else config.APPROVAL_TIMEOUT)
             return True, result
         except asyncio.TimeoutError:
+            log.warning("Approval wait timed out for action_id=%s category=%s", approval.id, category)
             self._remove_pending(approval)
             if not future.done():
                 future.set_result(False)

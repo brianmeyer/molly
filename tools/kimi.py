@@ -14,6 +14,7 @@ import httpx
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ def _error_result(msg: str) -> dict:
     return {"content": [{"type": "text", "text": msg}], "is_error": True}
 
 
+@track_latency("kimi")
 @tool(
     "kimi_research",
     "Send a research query to Kimi K2.5 (Moonshot AI). "

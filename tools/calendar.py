@@ -17,6 +17,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import config
 from tools.google_auth import get_calendar_service
+from utils import track_latency
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ def _error_result(msg: str) -> dict:
     "Shows title, time, location, and attendees.",
     {"days": int},
 )
+@track_latency("google_calendar")
 async def calendar_list(args: dict) -> dict:
     try:
         days = args.get("days", 7)
@@ -96,6 +98,7 @@ async def calendar_list(args: dict) -> dict:
     "Get full details of a specific calendar event by its event ID.",
     {"event_id": str},
 )
+@track_latency("google_calendar")
 async def calendar_get(args: dict) -> dict:
     try:
         event_id = args["event_id"]
@@ -114,6 +117,7 @@ async def calendar_get(args: dict) -> dict:
     "and locations. Returns matching events from the past 30 days to 90 days ahead.",
     {"query": str},
 )
+@track_latency("google_calendar")
 async def calendar_search(args: dict) -> dict:
     try:
         query = args["query"]
@@ -159,6 +163,7 @@ async def calendar_search(args: dict) -> dict:
         "attendees": str,
     },
 )
+@track_latency("google_calendar")
 async def calendar_create(args: dict) -> dict:
     try:
         service = get_calendar_service()
@@ -207,6 +212,7 @@ async def calendar_create(args: dict) -> dict:
         "attendees": str,
     },
 )
+@track_latency("google_calendar")
 async def calendar_update(args: dict) -> dict:
     try:
         event_id = args["event_id"]
@@ -249,6 +255,7 @@ async def calendar_update(args: dict) -> dict:
     "Delete a calendar event by its event ID.",
     {"event_id": str},
 )
+@track_latency("google_calendar")
 async def calendar_delete(args: dict) -> dict:
     try:
         event_id = args["event_id"]

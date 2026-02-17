@@ -449,6 +449,7 @@ class VoiceLoop:
                 try:
                     await asyncio.wait_for(self._play_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    log.debug("Voice stream read timed out, continuing")
                     continue
             return
 
