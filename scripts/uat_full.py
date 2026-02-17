@@ -145,10 +145,12 @@ def check_identity_files():
     assert len(config.IDENTITY_FILES) >= 3, f"Expected >=3 identity files, got {len(config.IDENTITY_FILES)}"
 
 
-@_check("ANTHROPIC_API_KEY set in env", "config")
-def check_anthropic_key():
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    assert key, "ANTHROPIC_API_KEY is not set in environment"
+@_check("Judge pool API keys (Gemini + Groq)", "config")
+def check_judge_keys():
+    gemini = os.getenv("GEMINI_API_KEY", "")
+    groq = os.getenv("GROQ_API_KEY", "")
+    assert gemini or groq, "Neither GEMINI_API_KEY nor GROQ_API_KEY set — evolution judges need at least one"
+    # Agent SDK uses Max subscription — no ANTHROPIC_API_KEY needed
 
 
 @_check("config.COMMANDS populated", "config")

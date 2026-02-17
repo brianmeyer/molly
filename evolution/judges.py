@@ -1,8 +1,13 @@
 """Multi-model judge pool for pairwise evaluation.
 
-Uses up to 4 different models to prevent single-provider blind spots.
-Gracefully degrades when API keys are missing — falls back to available
-models.  If ALL fail, returns ``JudgeResult(passed=None)``.
+Uses Gemini + Groq as primary judges (+ Kimi tie-breaker) to prevent
+single-provider blind spots.  Gracefully degrades when API keys are
+missing — falls back to available models.  If ALL fail, returns
+``JudgeResult(passed=None)``.
+
+Note: Main Molly brain uses Claude Agent SDK via Max subscription.
+The judge pool intentionally uses *different* providers to avoid
+self-evaluation bias.
 """
 from __future__ import annotations
 
@@ -34,23 +39,20 @@ class JudgeResult:
 
 
 def _available_judges() -> list[dict]:
-    """Return judge configs for models whose API keys are present."""
+    """Return judge configs for models whose API keys are present.
+
+    Priority order: Gemini (primary), Groq (primary), Kimi (tie-breaker).
+    """
     import config
     judges = []
-    # Claude Haiku — always available (Anthropic key assumed present)
-    judges.append({
-        "model": "claude-haiku-4-5",
-        "provider": "anthropic",
-        "api_key": getattr(config, "ANTHROPIC_API_KEY", ""),
-    })
-    # Gemini Flash-Lite
+    # Gemini Flash-Lite — primary judge #1
     key = getattr(config, "GEMINI_API_KEY", "")
     if key:
         judges.append({"model": "gemini-2.5-flash-lite", "provider": "gemini", "api_key": key})
-    # GPT-OSS 120B
-    key = getattr(config, "OPENAI_API_KEY", "")
+    # Groq (GPT-OSS 120B) — primary judge #2
+    key = getattr(config, "GROQ_API_KEY", "")
     if key:
-        judges.append({"model": "openai/gpt-oss-120b", "provider": "openai", "api_key": key})
+        judges.append({"model": "openai/gpt-oss-120b", "provider": "groq", "api_key": key})
     # Kimi K2.5 (tie-breaker)
     key = getattr(config, "MOONSHOT_API_KEY", "")
     if key:
@@ -89,30 +91,6 @@ async def _call_provider(
     provider: str, model: str, api_key: str, system_msg: str, user_msg: str,
 ) -> str:
     """Route to the correct provider API. Returns response text."""
-    if provider == "anthropic":
-        import anthropic
-
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        resp = await client.messages.create(
-            model=model, max_tokens=256,
-            system=system_msg,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        return resp.content[0].text if resp.content else ""
-
-    if provider == "openai":
-        import openai
-
-        client = openai.AsyncOpenAI(api_key=api_key)
-        resp = await client.chat.completions.create(
-            model=model, max_tokens=256,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-        )
-        return resp.choices[0].message.content or "" if resp.choices else ""
-
     if provider == "gemini":
         import httpx
 
@@ -124,6 +102,24 @@ async def _call_provider(
             data = resp.json()
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         return parts[0].get("text", "") if parts else ""
+
+    if provider == "groq":
+        import httpx
+
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model, "max_tokens": 256,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        }
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
     if provider == "moonshot":
         import httpx

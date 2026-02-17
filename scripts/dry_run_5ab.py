@@ -560,7 +560,7 @@ def main():
         keys = {
             "MOONSHOT_API_KEY": bool(config.MOONSHOT_API_KEY),
             "GEMINI_API_KEY": bool(config.GEMINI_API_KEY),
-            "ANTHROPIC_API_KEY": bool(getattr(config, "ANTHROPIC_API_KEY", "")),
+            "GROQ_API_KEY": bool(config.GROQ_API_KEY),
         }
         print(f"\n  API keys: {', '.join(f'{k}={'set' if v else 'MISSING'}' for k,v in keys.items())}")
 
