@@ -86,7 +86,6 @@ def _run_x_search(query_text: str, system_context: str, days_back: int) -> dict:
     return _text_result(content + meta)
 
 
-@track_latency("grok")
 @tool(
     "grok_reason",
     "Query Grok (xAI) for social intelligence, sentiment analysis, "
@@ -96,6 +95,7 @@ def _run_x_search(query_text: str, system_context: str, days_back: int) -> dict:
     "Set search_x=false for general reasoning without live search.",
     {"query": str, "system_context": str, "search_x": bool, "days_back": int},
 )
+@track_latency("grok")
 async def grok_reason(args: dict) -> dict:
     query_text = args.get("query", "").strip()
     if not query_text:

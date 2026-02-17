@@ -52,7 +52,7 @@ _MCP_SERVER_SPECS = {
 if config.BROWSER_MCP_ENABLED:
     _MCP_SERVER_SPECS["browser-mcp"] = {
         "command": "npx",
-        "args": ["-y", "@anthropic-ai/browser-mcp@latest"],
+        "args": ["-y", "@playwright/mcp@latest"],
         "env": {
             "BROWSER_PROFILE_DIR": str(config.BROWSER_PROFILE_DIR),
         },
@@ -933,8 +933,11 @@ async def handle_message(
     # --- Orchestrator path (Phase 5A) ---
     # When enabled, route through Kimi K2.5 triage + parallel workers.
     # Falls back to serial Claude SDK path on ANY failure.
+    # Skip for internal sources (heartbeat, digest, etc.) — those are system
+    # prompts, not user messages that need routing/decomposition.
     orchestrator_handled = False
-    if getattr(config, "ORCHESTRATOR_ENABLED", False):
+    _skip_orchestrator = source in ("heartbeat", "digest", "system", "skill")
+    if getattr(config, "ORCHESTRATOR_ENABLED", False) and not _skip_orchestrator:
         try:
             from orchestrator import classify_message
             from workers import run_workers

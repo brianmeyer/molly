@@ -200,10 +200,10 @@ TOOL_GAP_MIN_FAILURES = _env_int("MOLLY_TOOL_GAP_MIN_FAILURES", 5, minimum=1)
 TOOL_GAP_WINDOW_DAYS = _env_int("MOLLY_TOOL_GAP_WINDOW_DAYS", 7, minimum=1)
 
 # Phase 4: Evolution Engine
-CODE_LOOP_ENABLED = _env_bool("MOLLY_CODE_LOOP_ENABLED", False)
+CODE_LOOP_ENABLED = _env_bool("MOLLY_CODE_LOOP_ENABLED", True)
 
 # Phase 5A: Orchestrator + Workers
-ORCHESTRATOR_ENABLED = _env_bool("MOLLY_ORCHESTRATOR_ENABLED", False)
+ORCHESTRATOR_ENABLED = _env_bool("MOLLY_ORCHESTRATOR_ENABLED", True)
 ORCHESTRATOR_TIMEOUT = _env_int("MOLLY_ORCHESTRATOR_TIMEOUT", 15, minimum=5)
 MAX_CONCURRENT_WORKERS = _env_int("MOLLY_MAX_CONCURRENT_WORKERS", 3, minimum=1)
 KIMI_TRIAGE_MODEL = os.getenv("MOLLY_KIMI_TRIAGE_MODEL", "kimi-k2.5").strip()
@@ -225,10 +225,10 @@ HEALTH_DUPLICATE_THRESHOLD = _env_int("MOLLY_HEALTH_DUPLICATE_THRESHOLD", 3)
 
 # Track F rollout guards (pre-prod audit). Defaults are report-only/safe.
 TRACK_F_REPORT_ONLY = _env_bool("MOLLY_TRACK_F_REPORT_ONLY", True)
-TRACK_F_ENFORCE_PARSER_COMPAT = _env_bool("MOLLY_TRACK_F_ENFORCE_PARSER_COMPAT", False)
-TRACK_F_ENFORCE_SKILL_TELEMETRY = _env_bool("MOLLY_TRACK_F_ENFORCE_SKILL_TELEMETRY", False)
-TRACK_F_ENFORCE_FOUNDRY_INGESTION = _env_bool("MOLLY_TRACK_F_ENFORCE_FOUNDRY_INGESTION", False)
-TRACK_F_ENFORCE_PROMOTION_DRIFT = _env_bool("MOLLY_TRACK_F_ENFORCE_PROMOTION_DRIFT", False)
+TRACK_F_ENFORCE_PARSER_COMPAT = _env_bool("MOLLY_TRACK_F_ENFORCE_PARSER_COMPAT", True)
+TRACK_F_ENFORCE_SKILL_TELEMETRY = _env_bool("MOLLY_TRACK_F_ENFORCE_SKILL_TELEMETRY", True)
+TRACK_F_ENFORCE_FOUNDRY_INGESTION = _env_bool("MOLLY_TRACK_F_ENFORCE_FOUNDRY_INGESTION", True)
+TRACK_F_ENFORCE_PROMOTION_DRIFT = _env_bool("MOLLY_TRACK_F_ENFORCE_PROMOTION_DRIFT", True)
 TRACK_F_AUDIT_DIR = Path(
     os.getenv(
         "MOLLY_TRACK_F_AUDIT_DIR",
@@ -258,40 +258,43 @@ TRACK_F_PROMOTION_DRIFT_MIN_RATE = min(
 # Approval system — three-tier action classification
 ACTION_TIERS = {
     "AUTO": {
-        # Read-only, local, safe — execute immediately
+        # Read-only, local, safe
         "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
-        # Google read-only (Phase 3B)
+        # Shell access, file modifications
+        "Bash", "Write", "Edit",
+        # Google read (Phase 3B)
         "calendar_list", "calendar_get", "calendar_search",
         "gmail_search", "gmail_read",
+        # Google write (Phase 3B)
+        "gmail_send", "gmail_draft", "gmail_reply",
+        "calendar_create", "calendar_update", "calendar_delete",
         # Google People (read-only)
         "people_search", "people_get", "people_list",
-        # Google Tasks (read + create)
+        # Google Tasks (full CRUD)
         "tasks_list", "tasks_list_tasks", "tasks_create",
+        "tasks_complete", "tasks_delete",
         # Google Drive (read-only)
         "drive_search", "drive_get", "drive_read",
         # Google Meet (read-only)
         "meet_list", "meet_get", "meet_transcripts", "meet_recordings",
-        # Apple read-only (Phase 3C)
-        "contacts",
+        # Apple MCP tools (Phase 3C)
+        "contacts", "reminders", "notes", "messages", "mail", "calendar", "maps",
         "imessage_search", "imessage_recent", "imessage_thread", "imessage_unread",
         # WhatsApp history (Phase 4)
         "whatsapp_search",
         # External models (Phase 5)
         "kimi_research", "grok_reason", "groq_reason",
+        # Browser MCP (Phase 5C) — mostly AUTO for reservations, lookups, etc.
+        "browser_navigate", "browser_snapshot", "browser_take_screenshot",
+        "browser_click", "browser_type", "browser_fill_form",
+        "browser_select_option", "browser_hover", "browser_drag",
+        "browser_press_key", "browser_evaluate", "browser_run_code",
+        "browser_navigate_back", "browser_wait_for",
+        "browser_console_messages", "browser_network_requests",
+        "browser_tabs", "browser_resize", "browser_handle_dialog",
+        "browser_file_upload", "browser_close", "browser_install",
     },
-    "CONFIRM": {
-        # Shell access — requires Brian's approval
-        "Bash",
-        # External writes, file modifications
-        "Write", "Edit",
-        # Google writes (Phase 3B)
-        "gmail_send", "gmail_draft", "gmail_reply",
-        "calendar_create", "calendar_update", "calendar_delete",
-        # Google Tasks writes
-        "tasks_complete", "tasks_delete",
-        # Apple MCP tools (mixed read/write operations)
-        "reminders", "notes", "messages", "mail", "calendar", "maps",
-    },
+    "CONFIRM": set(),
     "BLOCKED": {
         "gmail_delete", "account_settings", "credential_access",
         "share_document",
@@ -359,8 +362,8 @@ GEMINI_BASE_URL = os.getenv(
 )
 
 # Contract audit layer (Track D)
-CONTRACT_AUDIT_LLM_ENABLED = _env_bool("MOLLY_CONTRACT_AUDIT_LLM_ENABLED", False)
-CONTRACT_AUDIT_LLM_BLOCKING = _env_bool("MOLLY_CONTRACT_AUDIT_LLM_BLOCKING", False)
+CONTRACT_AUDIT_LLM_ENABLED = _env_bool("MOLLY_CONTRACT_AUDIT_LLM_ENABLED", True)
+CONTRACT_AUDIT_LLM_BLOCKING = _env_bool("MOLLY_CONTRACT_AUDIT_LLM_BLOCKING", True)
 CONTRACT_AUDIT_NIGHTLY_MODEL = os.getenv(
     "MOLLY_CONTRACT_AUDIT_NIGHTLY_MODEL", "kimi"
 ).strip().lower()
@@ -378,7 +381,7 @@ CONTRACT_AUDIT_GEMINI_MODEL = os.getenv(
 ).strip()
 
 # Relationship quality audit (nightly Step 4b)
-REL_AUDIT_MODEL_ENABLED = _env_bool("MOLLY_REL_AUDIT_MODEL_ENABLED", False)
+REL_AUDIT_MODEL_ENABLED = _env_bool("MOLLY_REL_AUDIT_MODEL_ENABLED", True)
 REL_AUDIT_KIMI_MODEL = os.getenv("MOLLY_REL_AUDIT_KIMI_MODEL", "kimi-k2.5").strip()
 REL_AUDIT_LOW_CONFIDENCE_THRESHOLD = _env_float(
     "MOLLY_REL_AUDIT_LOW_CONFIDENCE_THRESHOLD", 0.35
@@ -405,7 +408,7 @@ TRIAGE_N_CTX = _env_int("TRIAGE_N_CTX", 4096)
 TRIAGE_N_THREADS = _env_int("TRIAGE_N_THREADS", os.cpu_count() or 8)
 
 # Phase 5C: Voice loop (Porcupine wakeword + Gemini Live)
-VOICE_ENABLED = _env_bool("MOLLY_VOICE_ENABLED", False)
+VOICE_ENABLED = _env_bool("MOLLY_VOICE_ENABLED", True)
 PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY", "")
 PORCUPINE_MODEL_PATH = os.getenv(
     "MOLLY_PORCUPINE_MODEL_PATH",
@@ -422,13 +425,13 @@ VOICE_SENSITIVITY = _env_float("MOLLY_VOICE_SENSITIVITY", 0.5)
 VOICE_PRELOAD_ENABLED = _env_bool("MOLLY_VOICE_PRELOAD_ENABLED", True)
 
 # Phase 5C: Browser MCP
-BROWSER_MCP_ENABLED = _env_bool("MOLLY_BROWSER_MCP_ENABLED", False)
+BROWSER_MCP_ENABLED = _env_bool("MOLLY_BROWSER_MCP_ENABLED", True)
 BROWSER_PROFILE_DIR = Path(
     os.getenv("MOLLY_BROWSER_PROFILE_DIR", str(Path.home() / ".molly" / "browser_profile"))
 ).expanduser()
 
 # Phase 5C: Qwen3 LoRA fine-tuning (triage + email classification)
-QWEN_LORA_ENABLED = _env_bool("MOLLY_QWEN_LORA_ENABLED", False)
+QWEN_LORA_ENABLED = _env_bool("MOLLY_QWEN_LORA_ENABLED", True)
 QWEN_LORA_MIN_EXAMPLES = _env_int("MOLLY_QWEN_LORA_MIN_EXAMPLES", 500)
 
 # Phase 5C: Plugin architecture
@@ -436,7 +439,7 @@ PLUGIN_DIR = Path(os.getenv("MOLLY_PLUGIN_DIR", str(PROJECT_ROOT / "plugins"))).
 PLUGIN_ENABLED = _env_bool("MOLLY_PLUGIN_ENABLED", True)
 
 # Phase 5C: Docker sandbox
-DOCKER_SANDBOX_ENABLED = _env_bool("MOLLY_DOCKER_SANDBOX_ENABLED", False)
+DOCKER_SANDBOX_ENABLED = _env_bool("MOLLY_DOCKER_SANDBOX_ENABLED", True)
 DOCKER_SANDBOX_IMAGE = os.getenv("MOLLY_DOCKER_SANDBOX_IMAGE", "python:3.12-slim")
 DOCKER_SANDBOX_TIMEOUT = _env_int("MOLLY_DOCKER_SANDBOX_TIMEOUT", 60, minimum=10)
 DOCKER_SANDBOX_MEMORY = os.getenv("MOLLY_DOCKER_SANDBOX_MEMORY", "256m")

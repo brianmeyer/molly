@@ -23,7 +23,7 @@ class TestVoiceLoopConfig(unittest.TestCase):
     """Test voice loop config values."""
 
     def test_voice_enabled_default(self):
-        self.assertFalse(config.VOICE_ENABLED)
+        self.assertTrue(config.VOICE_ENABLED)
 
     def test_picovoice_access_key_set(self):
         # Key should be set from .env

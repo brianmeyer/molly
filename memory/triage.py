@@ -4,6 +4,7 @@ Runs Qwen3-4B GGUF in-process via llama-cpp-python to classify group messages
 into: urgent, relevant, background, or noise.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -30,6 +31,7 @@ except Exception:  # pragma: no cover - import failure handled at runtime
 # executor (which Neo4j and other async tasks may share). Single worker ensures
 # sequential model inference.
 _TRIAGE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="triage")
+_TRIAGE_SEMAPHORE = asyncio.Semaphore(1)
 
 _TRIAGE_MODEL = None
 _MODEL_LOCK = Lock()
@@ -401,8 +403,23 @@ def _load_model() -> object | None:
 
 
 def preload_model() -> bool:
-    """Preload the triage model at startup."""
-    return _load_model() is not None
+    """Preload the triage model and run a warm-up inference."""
+    model = _load_model()
+    if model is None:
+        return False
+    try:
+        model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "Classify as noise."},
+                {"role": "user", "content": "test"},
+            ],
+            temperature=0.0,
+            max_tokens=16,
+        )
+        log.info("Triage model warm-up inference complete")
+    except Exception:
+        log.warning("Triage warm-up inference failed (non-fatal)", exc_info=True)
+    return True
 
 
 def _build_context(
@@ -1084,31 +1101,33 @@ async def triage_message(
     if not message.strip():
         return TriageResult(classification="noise", score=0.0, reason="Empty message")
 
-    # Very short messages are almost always noise
     if len(message.strip()) < 5:
         return TriageResult(classification="noise", score=0.0, reason="Too short")
 
     use_think = _should_use_think(message)
-
-    # Run ALL blocking work (Neo4j context query + model inference) in a
-    # dedicated executor thread. This prevents two issues:
-    # 1. Neo4j sync I/O blocking the event loop
-    # 2. Default executor contention causing subsequent triage calls to hang
-    import asyncio
     loop = asyncio.get_running_loop()
+    timeout = getattr(config, "TRIAGE_TIMEOUT", 30)
 
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                _TRIAGE_EXECUTOR,
-                _sync_triage, message, sender_name, group_name, use_think, chat_jid,
-            ),
-            timeout=45.0,
-        )
-        return result
-    except Exception:
-        log.error("Triage failed", exc_info=True)
-        return None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            async with _TRIAGE_SEMAPHORE:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _TRIAGE_EXECUTOR,
+                        _sync_triage, message, sender_name, group_name, use_think, chat_jid,
+                    ),
+                    timeout=timeout,
+                )
+                return result
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0:
+                log.warning("Triage attempt 1 failed (%s), retrying in 2s", type(exc).__name__)
+                await asyncio.sleep(2)
+
+    log.error("Triage failed after 2 attempts", exc_info=last_exc)
+    return None
 
 
 def _sync_triage(

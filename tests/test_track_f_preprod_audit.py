@@ -91,12 +91,12 @@ def _insert_self_improvement_events(db_path: Path, rows: list[tuple[str, str]]):
 
 
 class TestTrackFConfigDefaults(unittest.TestCase):
-    def test_defaults_are_report_only_and_non_enforcing(self):
+    def test_defaults_are_enforcing(self):
         self.assertTrue(config.TRACK_F_REPORT_ONLY)
-        self.assertFalse(config.TRACK_F_ENFORCE_PARSER_COMPAT)
-        self.assertFalse(config.TRACK_F_ENFORCE_SKILL_TELEMETRY)
-        self.assertFalse(config.TRACK_F_ENFORCE_FOUNDRY_INGESTION)
-        self.assertFalse(config.TRACK_F_ENFORCE_PROMOTION_DRIFT)
+        self.assertTrue(config.TRACK_F_ENFORCE_PARSER_COMPAT)
+        self.assertTrue(config.TRACK_F_ENFORCE_SKILL_TELEMETRY)
+        self.assertTrue(config.TRACK_F_ENFORCE_FOUNDRY_INGESTION)
+        self.assertTrue(config.TRACK_F_ENFORCE_PROMOTION_DRIFT)
 
 
 class TestTrackFPreprodAuditChecks(unittest.TestCase):

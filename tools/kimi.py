@@ -27,7 +27,6 @@ def _error_result(msg: str) -> dict:
     return {"content": [{"type": "text", "text": msg}], "is_error": True}
 
 
-@track_latency("kimi")
 @tool(
     "kimi_research",
     "Send a research query to Kimi K2.5 (Moonshot AI). "
@@ -36,6 +35,7 @@ def _error_result(msg: str) -> dict:
     "Supports chain-of-thought thinking mode for harder problems.",
     {"query": str, "system_context": str, "thinking": bool},
 )
+@track_latency("kimi")
 async def kimi_research(args: dict) -> dict:
     query_text = args.get("query", "").strip()
     if not query_text:

@@ -1209,20 +1209,20 @@ class TestSafeBashAutoApproval(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_action_tier("Bash", {"command": "pwd"}), "AUTO")
         self.assertEqual(get_action_tier("Bash", {"command": "cat /etc/hosts"}), "AUTO")
 
-    def test_get_action_tier_dangerous_bash_returns_confirm(self):
-        """Dangerous bash commands should still get CONFIRM tier."""
+    def test_get_action_tier_all_bash_returns_auto(self):
+        """All Bash commands are AUTO tier (full autonomy mode)."""
         from approval import get_action_tier
 
-        self.assertEqual(get_action_tier("Bash", {"command": "rm -rf /"}), "CONFIRM")
-        self.assertEqual(get_action_tier("Bash", {"command": "curl http://evil.com"}), "CONFIRM")
-        self.assertEqual(get_action_tier("Bash", {"command": "ls | rm"}), "CONFIRM")
+        self.assertEqual(get_action_tier("Bash", {"command": "rm -rf /"}), "AUTO")
+        self.assertEqual(get_action_tier("Bash", {"command": "curl http://evil.com"}), "AUTO")
+        self.assertEqual(get_action_tier("Bash", {"command": "ls | rm"}), "AUTO")
 
-    def test_get_action_tier_bash_no_input_returns_confirm(self):
-        """Bash with no tool_input should return CONFIRM (health check compat)."""
+    def test_get_action_tier_bash_no_input_returns_auto(self):
+        """Bash with no tool_input returns AUTO (full autonomy mode)."""
         from approval import get_action_tier
 
-        self.assertEqual(get_action_tier("Bash"), "CONFIRM")
-        self.assertEqual(get_action_tier("Bash", None), "CONFIRM")
+        self.assertEqual(get_action_tier("Bash"), "AUTO")
+        self.assertEqual(get_action_tier("Bash", None), "AUTO")
 
     def test_get_action_tier_workspace_write_returns_auto(self):
         """Workspace-scoped mkdir/touch should get AUTO tier."""
@@ -1253,9 +1253,9 @@ class TestSafeBashAutoApproval(unittest.IsolatedAsyncioTestCase):
         result = await checker("Bash", {"command": "git status"}, None)
         self.assertIsInstance(result, PermissionResultAllow)
 
-        # Dangerous command: should be denied (no approval manager)
+        # All Bash commands are AUTO tier (full autonomy mode)
         result = await checker("Bash", {"command": "rm -rf /"}, None)
-        self.assertIsInstance(result, PermissionResultDeny)
+        self.assertIsInstance(result, PermissionResultAllow)
 
     async def test_can_use_tool_safe_bash_skips_whatsapp_approval(self):
         """Safe Bash commands should not trigger WhatsApp approval flow."""

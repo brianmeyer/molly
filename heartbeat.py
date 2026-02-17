@@ -757,6 +757,9 @@ async def _check_email(molly):
             if isinstance(triage_result, Exception):
                 log.debug("Triage failed for email %d", i, exc_info=triage_result)
                 continue
+            if triage_result is None:
+                log.debug("Triage returned None for email %d (likely timeout)", i)
+                continue
 
             (
                 msg_id,
