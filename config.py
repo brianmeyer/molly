@@ -344,8 +344,8 @@ CONTACTS_DB = Path.home() / "Library" / "Application Support" / "AddressBook" / 
 IMESSAGE_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
 # External model APIs (Phase 5)
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # Optional: for Claude Haiku judge
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: for GPT-OSS 120B judge
+# Note: Claude Agent SDK uses Max subscription — no ANTHROPIC_API_KEY needed
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: codegen backend
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
 MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
