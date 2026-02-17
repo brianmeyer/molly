@@ -98,7 +98,7 @@ WORKER_PROFILES: dict[str, dict[str, Any]] = {
     "files": {
         "model_key": "WORKER_MODEL_DEFAULT",
         "mcp_servers": ["google-drive"],
-        "timeout": "WORKER_TIMEOUT_DEFAULT",
+        "timeout": "WORKER_TIMEOUT_RESEARCH",
         "prompt": (
             "You are a file assistant. Read, search, and navigate files "
             "in Google Drive and local storage."
