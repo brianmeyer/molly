@@ -254,13 +254,38 @@ async def _run_codex(request: CodegenRequest) -> CodegenResult:
         )
 
 
+def _read_file_safe(path: str, max_lines: int = 300) -> str:
+    """Read a file's contents, truncating at max_lines. Returns empty string on failure."""
+    try:
+        from pathlib import Path as _Path
+        p = _Path(path)
+        if not p.is_file():
+            return ""
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + [f"... ({len(lines) - max_lines} more lines truncated)"]
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def _build_prompt(request: CodegenRequest) -> str:
-    """Build a prompt for the codegen backend."""
+    """Build a prompt for the codegen backend, including file contents when available."""
     parts = [f"Task: {request.task_description}"]
     if request.target_files:
         parts.append(f"Target files: {', '.join(request.target_files)}")
     if request.constraints:
         parts.append(f"Constraints: {'; '.join(request.constraints)}")
+
+    if request.context_files:
+        parts.append("\n--- File Contents ---")
+        for fpath in request.context_files:
+            content = _read_file_safe(fpath)
+            if content:
+                parts.append(f"\n### {fpath}\n```\n{content}\n```")
+            else:
+                parts.append(f"\n### {fpath}\n(file not readable)")
+
     return "\n".join(parts)
 
 

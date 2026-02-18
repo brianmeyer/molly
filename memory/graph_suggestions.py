@@ -188,3 +188,122 @@ def build_suggestion_digest() -> str:
         lines.append(f"- {head} -> {tail}: RELATED_TO {mentions}x -> specific type?")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Auto-adoption pipeline: adopt suggestions seen 3+ distinct nights
+# ---------------------------------------------------------------------------
+
+_ADOPTION_HISTORY_PATH = SUGGESTIONS_DIR / "adoption_history.jsonl"
+_ADOPTION_THRESHOLD = 3  # distinct nights before auto-adopt
+
+
+def _load_adoption_history() -> dict[str, dict]:
+    """Load {suggestion_key: {nights: set[str], type: str, ...}} from history file."""
+    history: dict[str, dict] = {}
+    if not _ADOPTION_HISTORY_PATH.exists():
+        return history
+    for line in _ADOPTION_HISTORY_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            key = entry.get("key", "")
+            if key:
+                if key not in history:
+                    history[key] = {"nights": set(), "entry": entry}
+                for n in entry.get("nights", []):
+                    history[key]["nights"].add(n)
+        except json.JSONDecodeError:
+            continue
+    return history
+
+
+def _save_adoption_history(history: dict[str, dict]) -> None:
+    """Persist adoption history (one JSONL line per unique suggestion)."""
+    SUGGESTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for key, data in history.items():
+        entry = dict(data.get("entry", {}))
+        entry["key"] = key
+        entry["nights"] = sorted(data["nights"])
+        lines.append(json.dumps(entry, ensure_ascii=True))
+    _ADOPTION_HISTORY_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_auto_adoption() -> str:
+    """Check suggestion history and auto-adopt mature suggestions.
+
+    Called from nightly maintenance. Returns a summary string.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_suggestions = get_suggestions()
+    hotspots = get_related_to_hotspots()
+
+    # Build today's suggestion keys
+    todays_keys: dict[str, dict] = {}
+    for entry in today_suggestions:
+        if entry.get("type") == "relationship_fallback":
+            original = entry.get("original_type", "").strip().upper().replace(" ", "_")
+            if original:
+                key = f"rel_type:{original}"
+                todays_keys[key] = {"action": "add_rel_type", "rel_type": original, "entry": entry}
+    for h in hotspots:
+        head = h.get("head", "").strip()
+        tail = h.get("tail", "").strip()
+        if head and tail:
+            key = f"reclassify:{head.lower()}->{tail.lower()}"
+            todays_keys[key] = {
+                "action": "reclassify", "head": head, "tail": tail,
+                "mentions": h.get("mentions", 0), "entry": h,
+            }
+
+    if not todays_keys:
+        return "no suggestions to track"
+
+    # Update history with today's observations
+    history = _load_adoption_history()
+    for key, data in todays_keys.items():
+        if key not in history:
+            history[key] = {"nights": set(), "entry": data}
+        history[key]["nights"].add(today)
+
+    # Check for mature suggestions (3+ distinct nights)
+    adopted = []
+    for key, data in list(history.items()):
+        if len(data["nights"]) >= _ADOPTION_THRESHOLD:
+            entry = data.get("entry", {})
+            action = entry.get("action", "")
+            if action == "add_rel_type":
+                rel_type = entry.get("rel_type", "")
+                if rel_type and _adopt_rel_type(rel_type):
+                    adopted.append(f"Added rel type: {rel_type}")
+                    del history[key]
+            elif action == "reclassify":
+                # Don't auto-reclassify — just report for Kimi audit to handle
+                adopted.append(f"Flagged for reclassify: {entry.get('head')} -> {entry.get('tail')}")
+
+    _save_adoption_history(history)
+
+    tracked = len(todays_keys)
+    mature = len(adopted)
+    parts = [f"tracked {tracked} suggestions"]
+    if mature:
+        parts.append(f"adopted {mature}: " + "; ".join(adopted))
+    return ", ".join(parts)
+
+
+def _adopt_rel_type(rel_type: str) -> bool:
+    """Add a new relationship type to VALID_REL_TYPES and persist to schema."""
+    try:
+        from memory import graph
+        normalized = rel_type.strip().upper().replace(" ", "_")
+        if normalized in graph.VALID_REL_TYPES:
+            return False
+        graph.VALID_REL_TYPES.add(normalized)
+        log.info("Auto-adopted new relationship type: %s", normalized)
+        return True
+    except Exception:
+        log.error("Failed to adopt rel type: %s", rel_type, exc_info=True)
+        return False

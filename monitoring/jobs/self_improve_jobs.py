@@ -28,6 +28,12 @@ async def run_gliner_loop(improver) -> str:
     return str(gliner_cycle.get("message") or gliner_cycle.get("status", "unknown"))
 
 
+async def run_qwen_loop(improver) -> str:
+    """Run the nightly Qwen LoRA training/evaluation cycle."""
+    qwen_cycle = await improver.run_qwen_nightly_cycle()
+    return str(qwen_cycle.get("message") or qwen_cycle.get("status", "unknown"))
+
+
 async def run_weekly_assessment(improver, now_local: datetime) -> tuple[bool, str]:
     """Run the weekly assessment if due. Returns (ran, result_description)."""
     import config

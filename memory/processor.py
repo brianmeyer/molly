@@ -60,6 +60,22 @@ def _filter_relations(relations: list[dict]) -> list[dict]:
     return filtered
 
 
+_URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$")
+_HEARTBEAT_PREFIX = "HEARTBEAT CHECK"
+
+
+def _is_junk_chunk(content: str) -> bool:
+    """Return True if content is noise that shouldn't be embedded."""
+    text = content.strip()
+    if len(text) < 20:
+        return True
+    if _URL_ONLY_RE.match(text):
+        return True
+    if text.startswith(_HEARTBEAT_PREFIX) or text.startswith(f"User: {_HEARTBEAT_PREFIX}"):
+        return True
+    return False
+
+
 async def embed_and_store(
     content: str,
     chat_jid: str,
@@ -69,7 +85,11 @@ async def embed_and_store(
 
     Used for both passive processing (all messages) and
     active conversations (combined user+assistant chunks).
+    Skips junk content (bare URLs, heartbeats, very short messages).
     """
+    if _is_junk_chunk(content):
+        log.debug("Skipping junk chunk (%d chars)", len(content))
+        return
     try:
         loop = asyncio.get_running_loop()
         vec = await asyncio.wait_for(

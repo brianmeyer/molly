@@ -18,10 +18,12 @@ VOICE_ENABLED=False by default.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import struct
 import time
+from contextlib import suppress
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -41,11 +43,6 @@ class VoiceState(str, Enum):
 class VoiceLoop:
     """Porcupine wakeword → Gemini Live conversation loop."""
 
-    # Approved voice tools (read-only, safe to call without confirmation)
-    VOICE_APPROVED_TOOLS = {"check_calendar", "search_memory"}
-    # Tools requiring owner confirmation (cannot auto-execute via voice)
-    VOICE_CONFIRM_TOOLS = {"send_message", "create_task"}
-
     def __init__(self, molly: Any = None):
         self.molly = molly
         self.state = VoiceState.LISTENING
@@ -56,6 +53,11 @@ class VoiceLoop:
         self._session_handle: str | None = None  # for session resumption
         self._client: Any = None
         self._running = True
+        self._end_session = False  # set by end_conversation tool
+
+        # Dynamic tool registry (loaded once, cached)
+        self._tool_declarations: list[dict] | None = None
+        self._tool_handlers: dict[str, Any] | None = None
 
         # Budget tracking (persisted to disk)
         self._daily_minutes_used = 0.0
@@ -70,6 +72,9 @@ class VoiceLoop:
         self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self._play_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
+        # Transcript collection for memory storage
+        self._transcript: list[dict] = []  # [{"role": "user"|"model", "text": "..."}]
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -83,19 +88,35 @@ class VoiceLoop:
             log.warning("Voice loop disabled: GEMINI_API_KEY not set")
             return
 
-        try:
-            self._init_porcupine()
-        except Exception:
-            log.error("Failed to initialize Porcupine wakeword engine", exc_info=True)
-            return
+        # Initialize Porcupine wakeword engine (retry if audio device unavailable)
+        initialized = False
+        for attempt in range(5):
+            try:
+                self._init_porcupine()
+                initialized = True
+                break
+            except Exception:
+                if attempt == 0:
+                    log.warning(
+                        "Porcupine init failed (attempt %d/5) — "
+                        "audio device may be unavailable, retrying in 10s",
+                        attempt + 1, exc_info=True,
+                    )
+                else:
+                    log.info("Porcupine init retry %d/5 failed", attempt + 1)
+                await asyncio.sleep(10.0)
+
+        if not initialized:
+            log.error("Porcupine init failed after 5 attempts — voice loop entering wait mode")
 
         self._init_gemini_client()
 
         log.info(
-            "Voice loop started: wakeword=%s, model=%s, budget=%dmin/day",
+            "Voice loop started: wakeword=%s, model=%s, budget=%dmin/day, audio=%s",
             config.PORCUPINE_MODEL_PATH,
             config.GEMINI_LIVE_MODEL,
             config.VOICE_DAILY_BUDGET_MINUTES,
+            "ready" if initialized else "waiting for device",
         )
 
         try:
@@ -145,8 +166,51 @@ class VoiceLoop:
             self.porcupine.sample_rate,
         )
 
+    def _reinit_recorder(self) -> bool:
+        """Reinitialize PvRecorder after audio device change (e.g. AirPods removed).
+
+        Returns True if successful, False otherwise.
+        """
+        try:
+            if self.recorder is not None:
+                with suppress(Exception):
+                    self.recorder.stop()
+                with suppress(Exception):
+                    self.recorder.delete()
+                self.recorder = None
+
+            from pvrecorder import PvRecorder
+            device_index = config.VOICE_DEVICE_INDEX
+            self.recorder = PvRecorder(
+                frame_length=self.porcupine.frame_length,
+                device_index=device_index if device_index >= 0 else -1,
+            )
+            self.recorder.start()
+            log.info("PvRecorder reinitialized after audio device change")
+            return True
+        except Exception:
+            log.warning("Failed to reinitialize PvRecorder", exc_info=True)
+            self.recorder = None
+            return False
+
     async def _listen_for_wakeword(self):
         """Block on mic → check for wakeword keyword."""
+        if self.porcupine is None:
+            # Porcupine not initialized — try full init periodically
+            await asyncio.sleep(5.0)
+            try:
+                self._init_porcupine()
+                log.info("Porcupine initialized (deferred)")
+            except Exception:
+                pass  # will retry next cycle
+            return
+
+        if self.recorder is None:
+            # Audio device unavailable — try to reinitialize periodically
+            await asyncio.sleep(3.0)
+            self._reinit_recorder()
+            return
+
         try:
             pcm = await asyncio.wait_for(asyncio.to_thread(self.recorder.read), timeout=5.0)
             result = self.porcupine.process(pcm)
@@ -155,8 +219,9 @@ class VoiceLoop:
                 async with self._state_lock:
                     self.state = VoiceState.CONNECTING
         except Exception:
-            log.error("Wakeword detection error", exc_info=True)
-            await asyncio.sleep(0.5)
+            log.warning("Audio device error — attempting to reinitialize recorder")
+            if not self._reinit_recorder():
+                await asyncio.sleep(3.0)  # wait before retry
 
     # ------------------------------------------------------------------
     # Gemini Live session management
@@ -166,7 +231,10 @@ class VoiceLoop:
         """Initialize Google GenAI client for Gemini Live."""
         try:
             from google import genai
-            self._client = genai.Client(api_key=config.GEMINI_API_KEY)
+            self._client = genai.Client(
+                api_key=config.GEMINI_API_KEY,
+                http_options={"api_version": "v1alpha"},
+            )
         except Exception:
             log.error("Failed to initialize Gemini client", exc_info=True)
 
@@ -196,11 +264,13 @@ class VoiceLoop:
         # System instruction from identity files
         system_instruction = self._load_system_context()
 
-        # Tool declarations so Gemini can invoke local tools
-        tool_decls = get_voice_tool_declarations()
+        # Dynamically load all MCP tools on first use
+        self._ensure_tools_loaded()
+        tool_decls = self._tool_declarations
 
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
+            proactivity={"proactive_audio": True},
             tools=[types.Tool(function_declarations=tool_decls)] if tool_decls else None,
             system_instruction=types.Content(
                 parts=[types.Part(text=system_instruction)]
@@ -216,7 +286,7 @@ class VoiceLoop:
         return live_config
 
     def _load_system_context(self) -> str:
-        """Load SOUL.md + USER.md for session preloading."""
+        """Load SOUL.md + USER.md + voice-specific conversation instructions."""
         parts = []
         for identity_path in config.IDENTITY_FILES[:2]:  # SOUL.md + USER.md
             if identity_path.exists():
@@ -226,7 +296,31 @@ class VoiceLoop:
                         parts.append(content)
                 except Exception:
                     pass
+
+        # Voice-specific instructions for multi-turn conversation
+        parts.append(
+            "VOICE CONVERSATION RULES:\n"
+            "- You are in a live voice conversation activated by a wakeword.\n"
+            "- IMMEDIATELY greet Brian warmly (e.g. 'Hey Brian! What's up?'). "
+            "Do not wait for him to speak first — you start the conversation.\n"
+            "- Keep responses concise and conversational — this is spoken audio, "
+            "not text. Avoid long lists or dense information.\n"
+            "- After responding, wait for the user to speak. Do NOT end the "
+            "conversation on your own.\n"
+            "- The conversation continues back and forth until the user says "
+            "they're done (e.g. 'I'm done', 'goodbye', 'that's all', 'see ya').\n"
+            "- When the user indicates they're done, say a brief goodbye and "
+            "then call the end_conversation tool to close the session.\n"
+            "- Do NOT call end_conversation unless the user explicitly says "
+            "they want to stop talking."
+        )
+
         return "\n\n".join(parts) if parts else ""
+
+    def _ensure_tools_loaded(self):
+        """Load all MCP tools once, then cache on the instance."""
+        if self._tool_declarations is None:
+            self._tool_declarations, self._tool_handlers = _load_all_tools()
 
     # ------------------------------------------------------------------
     # Conversation (4-task pattern from Gemini Live cookbook)
@@ -235,16 +329,21 @@ class VoiceLoop:
     async def _run_conversation(self):
         """Run a Gemini Live conversation session.
 
-        4 concurrent async tasks (official cookbook pattern):
-        1. listen_audio()  → mic → send queue
-        2. send_audio()    → send queue → session.send_realtime_input()
-        3. receive_audio() → session.receive() → play queue + tool calls
-        4. play_audio()    → play queue → speaker (PyAudio, 24kHz output)
+        session.receive() yields messages for ONE model turn then breaks
+        (by design — see googleapis/python-genai live.py).  The WebSocket
+        stays open.  We call receive() again in a while-loop for multi-turn.
+
+        Official pattern from google-gemini/cookbook:
+          while True:
+              async for response in session.receive():
+                  ...  # one turn
         """
         if self._client is None:
             async with self._state_lock:
                 self.state = VoiceState.LISTENING
             return
+
+        self._end_session = False
 
         try:
             live_config = self._build_live_config()
@@ -254,11 +353,12 @@ class VoiceLoop:
             ) as session:
                 self._session = session
 
-                # Pre-warm with memory context if enabled
-                if config.VOICE_PRELOAD_ENABLED:
-                    await self._preload_context(session)
+                # Identity context (SOUL.md, USER.md) is in the system
+                # instruction.  Memory preload uses send_client_content which
+                # must not be mixed with send_realtime_input per the docs.
+                # proactive_audio + system instruction handles the greeting.
 
-                # Run 4 concurrent tasks
+                # Run concurrent tasks
                 tasks = [
                     asyncio.create_task(self._listen_audio(), name="voice-listen"),
                     asyncio.create_task(self._send_audio(session), name="voice-send"),
@@ -266,7 +366,6 @@ class VoiceLoop:
                     asyncio.create_task(self._play_audio(), name="voice-play"),
                 ]
 
-                # Also run a timeout watchdog
                 max_seconds = config.VOICE_MAX_SESSION_MINUTES * 60
                 tasks.append(
                     asyncio.create_task(
@@ -279,19 +378,19 @@ class VoiceLoop:
                     tasks, return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                # Cancel remaining tasks
+                for t in done:
+                    exc = t.exception()
+                    if exc:
+                        log.warning(
+                            "Voice task '%s' failed: %s: %s",
+                            t.get_name(), type(exc).__name__, exc,
+                        )
+                    else:
+                        log.info("Voice task '%s' completed first", t.get_name())
+
                 for t in pending:
                     t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-
-                # Check for errors in completed tasks
-                for t in done:
-                    if t.exception():
-                        log.error(
-                            "Voice task %s failed: %s",
-                            t.get_name(),
-                            t.exception(),
-                        )
 
         except Exception:
             log.error("Gemini Live session error", exc_info=True)
@@ -308,10 +407,15 @@ class VoiceLoop:
                     config.VOICE_DAILY_BUDGET_MINUTES,
                 )
             else:
-                log.warning("Voice session ended without valid start time — budget not updated")
+                log.warning("Voice session ended without valid start time")
             self._session_start_time = 0.0
 
-            # Clear queues (exception-based exit, not check-then-act)
+            # Save voice transcript to memory (full pipeline)
+            if self._transcript:
+                await self._save_transcript_to_memory()
+            self._transcript = []
+
+            # Clear queues
             for q in (self._send_queue, self._play_queue):
                 while True:
                     try:
@@ -322,44 +426,77 @@ class VoiceLoop:
             async with self._state_lock:
                 self.state = VoiceState.LISTENING
 
-    async def _preload_context(self, session):
-        """Pre-warm the session with memory context."""
+    async def _save_transcript_to_memory(self):
+        """Save the voice conversation transcript through the full memory pipeline.
+
+        Uses process_conversation (L2 vectorstore + L3 graph + daily log)
+        for each user→model exchange, same as WhatsApp conversations.
+        """
         try:
-            from memory.retriever import retrieve_context
-            context = await retrieve_context("voice conversation starting", top_k=3)
-            if context:
-                from google.genai import types
-                await session.send_client_content(
-                    turns=types.Content(
-                        role="user",
-                        parts=[types.Part(text=f"Context from memory:\n{context}")],
-                    ),
-                    turn_complete=True,
+            from memory.processor import process_conversation
+
+            # Group transcript into user→model pairs
+            pairs: list[tuple[str, str]] = []
+            user_buf: list[str] = []
+            for entry in self._transcript:
+                if entry["role"] == "user":
+                    user_buf.append(entry["text"])
+                elif entry["role"] == "model":
+                    user_text = " ".join(user_buf) if user_buf else "(voice)"
+                    pairs.append((user_text, entry["text"]))
+                    user_buf = []
+
+            if not pairs:
+                return
+
+            for user_text, model_text in pairs:
+                await process_conversation(
+                    user_msg=user_text,
+                    assistant_msg=model_text,
+                    chat_jid="voice",
+                    source="voice",
                 )
-                log.debug("Voice session preloaded with %d chars of context", len(context))
+            log.info(
+                "Voice transcript saved to memory (%d exchanges, full pipeline)",
+                len(pairs),
+            )
         except Exception:
-            log.debug("Voice context preload failed", exc_info=True)
+            log.warning("Failed to save voice transcript to memory", exc_info=True)
 
     async def _listen_audio(self):
         """Read mic frames and push to send queue (drop if full)."""
-        while self._running and self.state == VoiceState.CONVERSING:
+        consecutive_errors = 0
+        while self._running and self.state == VoiceState.CONVERSING and not self._end_session:
+            if self.recorder is None:
+                log.warning("Audio device lost during conversation — ending session")
+                break
             try:
                 pcm = await asyncio.wait_for(asyncio.to_thread(self.recorder.read), timeout=5.0)
+                consecutive_errors = 0
                 # Convert int16 PCM list to bytes for Gemini
                 audio_bytes = struct.pack(f"{len(pcm)}h", *pcm)
                 try:
                     self._send_queue.put_nowait(audio_bytes)
                 except asyncio.QueueFull:
                     pass  # Audio frames are ephemeral — OK to drop
+            except asyncio.TimeoutError:
+                continue
             except Exception:
-                log.debug("Listen audio error", exc_info=True)
-                break
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    log.warning("Audio device error (%dx) — ending conversation", consecutive_errors)
+                    # Try to reinit for next wakeword session
+                    self._reinit_recorder()
+                    break
+                log.debug("Listen audio error (%d/3)", consecutive_errors)
+                await asyncio.sleep(0.2)
 
     async def _send_audio(self, session):
         """Pull from send queue and stream to Gemini Live."""
         from google.genai import types
 
-        while self._running and self.state == VoiceState.CONVERSING:
+        chunks_sent = 0
+        while self._running and self.state == VoiceState.CONVERSING and not self._end_session:
             try:
                 audio_bytes = await asyncio.wait_for(
                     self._send_queue.get(), timeout=0.5
@@ -367,17 +504,38 @@ class VoiceLoop:
                 await session.send_realtime_input(
                     audio=types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000"),
                 )
+                chunks_sent += 1
+                if chunks_sent == 1:
+                    log.info("First audio chunk sent to Gemini (%d bytes)", len(audio_bytes))
+                elif chunks_sent % 500 == 0:
+                    log.debug("Audio chunks sent: %d", chunks_sent)
             except asyncio.TimeoutError:
                 continue
             except Exception:
-                log.debug("Send audio error", exc_info=True)
+                log.info("Send audio error after %d chunks", chunks_sent, exc_info=True)
                 break
+        log.info("Send audio loop exiting after %d chunks", chunks_sent)
 
     async def _receive_audio(self, session):
-        """Receive responses from Gemini Live (audio + tool calls)."""
-        while self._running and self.state == VoiceState.CONVERSING:
+        """Receive responses from Gemini Live (audio + tool calls).
+
+        session.receive() yields messages for ONE model turn, then the
+        iterator breaks (by design — see google/genai/live.py).  The
+        WebSocket stays open.  We call receive() again for each turn.
+
+        Official pattern from google-gemini/cookbook:
+          while True:
+              async for response in session.receive():
+                  ...
+        """
+        turns = 0
+        while self._running and self.state == VoiceState.CONVERSING and not self._end_session:
             try:
                 async for response in session.receive():
+                    if self._end_session:
+                        log.info("end_conversation flag — exiting receive")
+                        return
+
                     server_content = getattr(response, "server_content", None)
                     if server_content:
                         model_turn = getattr(server_content, "model_turn", None)
@@ -387,28 +545,39 @@ class VoiceLoop:
                                 if inline_data and hasattr(inline_data, "data"):
                                     await self._play_queue.put(inline_data.data)
 
-                        # Check for turn completion
                         turn_complete = getattr(server_content, "turn_complete", False)
                         if turn_complete:
-                            # Signal end of audio with sentinel
                             await self._play_queue.put(None)
+                            turns += 1
+                            log.info("Gemini turn %d complete", turns)
 
-                        # Check for interruption
                         interrupted = getattr(server_content, "interrupted", False)
                         if interrupted:
-                            # Clear play queue on interruption
-                            while True:
+                            log.debug("Gemini interrupted at turn %d", turns)
+                            while not self._play_queue.empty():
                                 try:
                                     self._play_queue.get_nowait()
                                 except asyncio.QueueEmpty:
                                     break
 
-                    # Handle tool calls
+                        # Capture transcriptions for memory
+                        for tx_field, role in [
+                            ("output_transcription", "model"),
+                            ("input_transcription", "user"),
+                        ]:
+                            tx = getattr(server_content, tx_field, None)
+                            if tx:
+                                text = getattr(tx, "text", "") or ""
+                                if text.strip():
+                                    self._transcript.append({"role": role, "text": text.strip()})
+
                     tool_call = getattr(response, "tool_call", None)
                     if tool_call:
                         await self._handle_tool_call(session, tool_call)
+                        if self._end_session:
+                            log.info("end_conversation handled — exiting receive")
+                            return
 
-                    # Handle session resumption
                     session_resumption = getattr(
                         response, "session_resumption_update", None
                     )
@@ -416,18 +585,15 @@ class VoiceLoop:
                         new_handle = getattr(session_resumption, "new_handle", None)
                         if new_handle:
                             self._session_handle = new_handle
-                            log.debug("Session handle updated for resumption")
-                        else:
-                            # Resumption update without a handle → clear stale handle
-                            self._session_handle = None
-                            log.debug("Session handle cleared (no new handle in update)")
 
-                # Session ended naturally
+                # Turn complete — receive() broke out. Loop back for next turn.
+                log.debug("Turn %d iterator done, calling receive() for next turn", turns)
+
+            except Exception as exc:
+                log.info("Receive loop ended after %d turns: %s", turns, exc)
                 break
 
-            except Exception:
-                log.debug("Receive audio error", exc_info=True)
-                break
+        log.info("Receive loop exiting after %d turns (end_session=%s)", turns, self._end_session)
 
     async def _play_audio(self):
         """Pull audio from play queue and output to speaker."""
@@ -511,75 +677,46 @@ class VoiceLoop:
                 log.error("Failed to send tool response to Gemini", exc_info=True)
 
     async def _execute_tool(self, tool_name: str, args: dict) -> dict:
-        """Execute a tool by name, respecting approval tiers.
+        """Execute a tool by name — all MCP tools available, same as text channels."""
+        # Voice-only tools
+        if tool_name == "end_conversation":
+            log.info("end_conversation tool called — ending voice session")
+            self._end_session = True
+            return {"status": "ending"}
 
-        Only VOICE_APPROVED_TOOLS (read-only) execute directly.
-        VOICE_CONFIRM_TOOLS require owner confirmation (currently denied via voice).
-        """
-        # Tier check: only allow pre-approved read-only tools via voice
-        if tool_name in self.VOICE_CONFIRM_TOOLS:
-            log.warning(
-                "Voice tool '%s' requires confirmation — denied (no approval channel in voice)",
-                tool_name,
-            )
-            return {
-                "error": f"Tool '{tool_name}' requires confirmation. "
-                "Please use WhatsApp or web chat to execute this action."
-            }
-        if tool_name not in self.VOICE_APPROVED_TOOLS:
-            log.warning("Voice tool '%s' not in approved list — denied", tool_name)
-            return {"error": f"Tool '{tool_name}' is not available via voice."}
+        if tool_name == "search_memory":
+            try:
+                from memory.retriever import retrieve_context
+                query = args.get("query", "")
+                context = await retrieve_context(query, top_k=5)
+                return {"result": context or "No relevant memories found."}
+            except Exception as exc:
+                return {"error": str(exc)}
 
-        tool_map = {
-            "check_calendar": self._tool_check_calendar,
-            "search_memory": self._tool_search_memory,
-        }
+        # Dynamic MCP tool dispatch
+        self._ensure_tools_loaded()
+        handler = self._tool_handlers.get(tool_name)
+        if not handler:
+            return {"error": f"Unknown tool: {tool_name}"}
 
-        handler = tool_map.get(tool_name)
-        if handler:
-            return await handler(args)
-        return {"error": f"Unknown tool: {tool_name}"}
-
-    async def _tool_check_calendar(self, args: dict) -> dict:
-        """Check calendar events."""
         try:
-            from tools.calendar import calendar_search
-            result = await calendar_search(args)
-            return result if isinstance(result, dict) else {"result": str(result)}
+            result = await handler(args)
         except Exception as exc:
+            log.error("Voice tool '%s' execution error: %s", tool_name, exc, exc_info=True)
             return {"error": str(exc)}
 
-    async def _tool_send_message(self, args: dict) -> dict:
-        """Send a WhatsApp message."""
-        if self.molly and self.molly.wa:
-            recipient = args.get("recipient", "")
-            text = args.get("text", "")
-            if recipient and text:
-                owner_jid = self.molly._get_owner_dm_jid()
-                if owner_jid:
-                    msg_id = self.molly.wa.send_message(owner_jid, text)
-                    self.molly._track_send(msg_id)
-                    return {"status": "sent", "msg_id": str(msg_id)}
-        return {"error": "messaging not available"}
-
-    async def _tool_create_task(self, args: dict) -> dict:
-        """Create a Google Task."""
-        try:
-            from tools.google_tasks import tasks_create
-            result = await tasks_create(args)
-            return result if isinstance(result, dict) else {"result": str(result)}
-        except Exception as exc:
-            return {"error": str(exc)}
-
-    async def _tool_search_memory(self, args: dict) -> dict:
-        """Search memory for relevant context."""
-        try:
-            from memory.retriever import retrieve_context
-            query = args.get("query", "")
-            context = await retrieve_context(query, top_k=3)
-            return {"context": context or "No relevant memories found."}
-        except Exception as exc:
-            return {"error": str(exc)}
+        # Convert MCP response format {"content": [{"type":"text","text":"..."}]}
+        # to a simple dict for Gemini function response
+        if isinstance(result, dict) and "content" in result:
+            texts = []
+            for block in result.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+            text = "\n".join(texts)
+            if result.get("is_error"):
+                return {"error": text}
+            return {"result": text}
+        return result if isinstance(result, dict) else {"result": str(result)}
 
     async def _session_watchdog(self, max_seconds: int):
         """End session after max duration."""
@@ -686,84 +823,117 @@ class VoiceLoop:
 
 
 # ---------------------------------------------------------------------------
-# Gemini Live tool declarations (for session config)
+# Dynamic MCP tool bridge — same tools as text channels
 # ---------------------------------------------------------------------------
 
-def get_voice_tool_declarations() -> list[dict]:
-    """Return function declarations for Gemini Live tool calling."""
-    return [
-        {
-            "name": "check_calendar",
-            "description": "Check Google Calendar for upcoming events or search for specific events.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query for calendar events",
-                    },
-                    "time_min": {
-                        "type": "string",
-                        "description": "Start time in ISO format",
-                    },
-                    "time_max": {
-                        "type": "string",
-                        "description": "End time in ISO format",
-                    },
+# Python MCP tool modules to load for voice
+_VOICE_TOOL_MODULES = [
+    "tools.calendar",
+    "tools.gmail",
+    "tools.google_people",
+    "tools.google_tasks",
+    "tools.google_drive",
+    "tools.google_meet",
+    "tools.imessage",
+    "tools.whatsapp",
+    "tools.kimi",
+    "tools.grok",
+    "tools.groq",
+]
+
+# Python type → JSON Schema type for Gemini function declarations
+_TYPE_MAP = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+}
+
+
+def _load_all_tools() -> tuple[list[dict], dict[str, Any]]:
+    """Import all MCP tool modules and extract SdkMcpTool instances.
+
+    Returns (declarations, handlers) where declarations are Gemini Live
+    function declarations and handlers maps tool_name → async callable.
+    """
+    from claude_agent_sdk import SdkMcpTool
+
+    declarations: list[dict] = []
+    handlers: dict[str, Any] = {}
+
+    for module_path in _VOICE_TOOL_MODULES:
+        try:
+            mod = importlib.import_module(module_path)
+        except Exception:
+            log.warning("Voice: failed to import %s", module_path, exc_info=True)
+            continue
+
+        for attr_name in dir(mod):
+            obj = getattr(mod, attr_name, None)
+            if not isinstance(obj, SdkMcpTool):
+                continue
+            if obj.name in config.DISABLED_TOOL_NAMES:
+                continue
+
+            # Convert input_schema {param: type} → Gemini properties
+            properties = {}
+            schema = obj.input_schema
+            if isinstance(schema, dict):
+                for param, ptype in schema.items():
+                    properties[param] = {
+                        "type": _TYPE_MAP.get(ptype, "string"),
+                        "description": param.replace("_", " "),
+                    }
+
+            declarations.append({
+                "name": obj.name,
+                "description": obj.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                },
+            })
+            handlers[obj.name] = obj.handler
+
+    # Voice-only tools (not from MCP servers)
+    declarations.append({
+        "name": "search_memory",
+        "description": (
+            "Search Molly's memory for relevant past conversations, facts, "
+            "and knowledge about Brian. Use this to recall things discussed "
+            "before, preferences, events, people, or any stored context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search for in memory",
                 },
             },
+            "required": ["query"],
         },
-        {
-            "name": "send_message",
-            "description": "Send a WhatsApp message to Brian.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Message text to send",
-                    },
-                    "recipient": {
-                        "type": "string",
-                        "description": "Recipient name or ID",
-                    },
-                },
-                "required": ["text"],
-            },
+    })
+
+    declarations.append({
+        "name": "end_conversation",
+        "description": (
+            "End the voice conversation. Call this ONLY when the user "
+            "explicitly says they're done talking (e.g. 'I'm done', "
+            "'goodbye', 'that's all', 'see ya'). Say a brief goodbye "
+            "before calling this."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
         },
-        {
-            "name": "create_task",
-            "description": "Create a new task in Google Tasks.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Task title",
-                    },
-                    "due": {
-                        "type": "string",
-                        "description": "Due date in ISO format",
-                    },
-                },
-                "required": ["title"],
-            },
-        },
-        {
-            "name": "search_memory",
-            "description": "Search Molly's memory for relevant past conversations and knowledge.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to search for in memory",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    ]
+    })
+
+    log.info(
+        "Voice tools loaded: %d declarations (%d MCP + 2 voice-only)",
+        len(declarations), len(handlers),
+    )
+    return declarations, handlers
 
 
 # ---------------------------------------------------------------------------

@@ -121,26 +121,38 @@ class TestVoiceLoopContext(unittest.TestCase):
 
 
 class TestVoiceToolDeclarations(unittest.TestCase):
-    """Test Gemini Live tool declarations."""
+    """Test dynamic Gemini Live tool declarations."""
 
-    def test_get_declarations(self):
-        from voice_loop import get_voice_tool_declarations
-        decls = get_voice_tool_declarations()
+    def test_load_all_tools(self):
+        from voice_loop import _load_all_tools
+        decls, handlers = _load_all_tools()
         self.assertIsInstance(decls, list)
-        self.assertGreater(len(decls), 0)
+        self.assertGreater(len(decls), 5)
         names = {d["name"] for d in decls}
-        self.assertIn("check_calendar", names)
-        self.assertIn("send_message", names)
-        self.assertIn("create_task", names)
+        # MCP tools (iMessage doesn't depend on google_auth, always loads)
+        self.assertIn("imessage_search", names)
+        # Voice-only tools always present
         self.assertIn("search_memory", names)
+        self.assertIn("end_conversation", names)
+        # Handlers should exist for MCP tools
+        self.assertGreater(len(handlers), 0)
 
     def test_declaration_schema(self):
-        from voice_loop import get_voice_tool_declarations
-        for decl in get_voice_tool_declarations():
+        from voice_loop import _load_all_tools
+        decls, _ = _load_all_tools()
+        for decl in decls:
             self.assertIn("name", decl)
             self.assertIn("description", decl)
             self.assertIn("parameters", decl)
             self.assertEqual(decl["parameters"]["type"], "object")
+
+    def test_handlers_match_declarations(self):
+        from voice_loop import _load_all_tools
+        decls, handlers = _load_all_tools()
+        decl_names = {d["name"] for d in decls}
+        # Every handler should have a declaration
+        for name in handlers:
+            self.assertIn(name, decl_names)
 
 
 class TestVoiceToolBridge(unittest.TestCase):
@@ -153,8 +165,8 @@ class TestVoiceToolBridge(unittest.TestCase):
         async def _test():
             with patch("memory.retriever.retrieve_context", new_callable=AsyncMock) as mock_retrieve:
                 mock_retrieve.return_value = "Found context about calendar"
-                result = await vl._tool_search_memory({"query": "calendar"})
-                self.assertIn("context", result)
+                result = await vl._execute_tool("search_memory", {"query": "calendar"})
+                self.assertIn("result", result)
 
         try:
             import memory.retriever  # noqa: F401
@@ -169,19 +181,19 @@ class TestVoiceToolBridge(unittest.TestCase):
         async def _test():
             result = await vl._execute_tool("nonexistent_tool", {})
             self.assertIn("error", result)
-            self.assertIn("not available via voice", result["error"])
+            self.assertIn("Unknown tool", result["error"])
 
         asyncio.run(_test())
 
-    def test_confirm_tool_denied_via_voice(self):
-        """Verify VOICE_CONFIRM_TOOLS are denied without approval channel."""
+    def test_end_conversation_sets_flag(self):
         from voice_loop import VoiceLoop
         vl = VoiceLoop()
 
         async def _test():
-            result = await vl._execute_tool("send_message", {"text": "hi"})
-            self.assertIn("error", result)
-            self.assertIn("requires confirmation", result["error"])
+            self.assertFalse(vl._end_session)
+            result = await vl._execute_tool("end_conversation", {})
+            self.assertEqual(result["status"], "ending")
+            self.assertTrue(vl._end_session)
 
         asyncio.run(_test())
 

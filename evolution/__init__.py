@@ -55,6 +55,7 @@ __all__ = [
     "SkillGapsService",
     "ToolGapsService",
     "GLiNERTrainingService",
+    "QwenTrainingService",
 ]
 
 
@@ -135,5 +136,8 @@ def __getattr__(name: str):  # noqa: C901
     if name == "GLiNERTrainingService":
         from evolution.gliner_training import GLiNERTrainingService
         return GLiNERTrainingService
+    if name == "QwenTrainingService":
+        from evolution.qwen_training import QwenTrainingService
+        return QwenTrainingService
 
     raise AttributeError(f"module 'evolution' has no attribute {name!r}")

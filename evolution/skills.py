@@ -56,6 +56,7 @@ from evolution.skill_lifecycle import SkillLifecycleService
 from evolution.skill_gaps import SkillGapsService
 from evolution.tool_gaps import ToolGapsService
 from evolution.gliner_training import GLiNERTrainingService
+from evolution.qwen_training import QwenTrainingService
 
 
 class SelfImprovementEngine:
@@ -84,6 +85,7 @@ class SelfImprovementEngine:
         self.skill_gaps = SkillGapsService(self.ctx, self.infra, self.comms, self.skill_lifecycle)
         self.tool_gaps = ToolGapsService(self.ctx, self.infra, self.comms, self.skill_gaps)
         self.gliner = GLiNERTrainingService(self.ctx, self.infra, self.comms)
+        self.qwen = QwenTrainingService(self.ctx, self.infra, self.comms)
 
         self._initialized = False
         self._last_tick_at: datetime | None = None
@@ -106,6 +108,9 @@ class SelfImprovementEngine:
 
     async def run_gliner_nightly_cycle(self):
         return await self.gliner.run_gliner_nightly_cycle()
+
+    async def run_qwen_nightly_cycle(self):
+        return await self.qwen.run_nightly_cycle()
 
     async def run_gliner_finetune_pipeline(self):
         return await self.gliner.run_gliner_finetune_pipeline()

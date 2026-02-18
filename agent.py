@@ -943,6 +943,8 @@ async def handle_message(
             from workers import run_workers
 
             triage = await classify_message(user_message)
+            # "direct" messages (greetings, chitchat) fall through to serial
+            # Opus which has memory, conversation history, and full context.
             if triage.classification in ("simple", "complex") and triage.subtasks:
                 response_text = await run_workers(triage, original_message=user_message)
                 if response_text:

@@ -23,22 +23,43 @@ def _format_memory_context(
     memories: list,
     guidelines: list[str],
     graph_context: str = "",
+    arm_id: str = "baseline",
 ) -> str:
     """Format memories, guidelines, and graph context for injection into agent context.
+
+    Each bandit arm varies the context budget:
+      baseline:        3 memories, 5 guidelines, 500 chars graph (default)
+      concise_prompt:  0 memories, 2 guidelines, no graph
+      thorough_prompt: 3 memories, 5 guidelines, 500 chars graph + instruction prefix
+      memory_heavy:    5 memories, 7 guidelines, 500 chars graph
+      graph_context:   3 memories, 5 guidelines, 1000 chars graph
 
     Returns a formatted string suitable for appending to the system prompt.
     Returns empty string if no relevant context available.
     """
+    # Arm-specific budgets
+    arm_config = {
+        "baseline":        {"mem": 3, "guide": 5, "graph": 500,  "prefix": ""},
+        "concise_prompt":  {"mem": 0, "guide": 2, "graph": 0,    "prefix": ""},
+        "thorough_prompt": {"mem": 3, "guide": 5, "graph": 500,  "prefix": "Be thorough and detailed in your response.\n\n"},
+        "memory_heavy":    {"mem": 5, "guide": 7, "graph": 500,  "prefix": ""},
+        "graph_context":   {"mem": 3, "guide": 5, "graph": 1000, "prefix": ""},
+    }
+    cfg = arm_config.get(arm_id, arm_config["baseline"])
+
     parts: list[str] = []
 
-    if guidelines:
+    if cfg["prefix"]:
+        parts.append(cfg["prefix"])
+
+    if guidelines and cfg["guide"] > 0:
         parts.append("## Applicable Guidelines")
-        for g in guidelines[:5]:
+        for g in guidelines[:cfg["guide"]]:
             parts.append(f"- {g}")
 
-    if memories:
+    if memories and cfg["mem"] > 0:
         parts.append("\n## Relevant Past Experiences")
-        for mem in memories[:3]:
+        for mem in memories[:cfg["mem"]]:
             tc = getattr(mem, "task_class", "") or ""
             reward = getattr(mem, "reward", 0.0) or 0.0
             content = getattr(mem, "content", {}) or {}
@@ -48,8 +69,8 @@ def _format_memory_context(
                 line += f": {summary[:120]}"
             parts.append(line)
 
-    if graph_context:
-        parts.append(f"\n## Entity Context\n{graph_context[:500]}")
+    if graph_context and cfg["graph"] > 0:
+        parts.append(f"\n## Entity Context\n{graph_context[:cfg['graph']]}")
 
     return "\n".join(parts) if parts else ""
 
@@ -83,12 +104,13 @@ def pre_execution_hook(
     }
 
     try:
-        from evolution.bandit import ThompsonBandit
+        from evolution.bandit import BANDIT_ARMS, ThompsonBandit, register_default_arms
         from evolution.db import ensure_schema
 
         ensure_schema()
+        register_default_arms()
         bandit = ThompsonBandit()
-        arm = bandit.select_arm()
+        arm = bandit.select_arm(arm_ids=BANDIT_ARMS)
         result["arm_id"] = arm
     except Exception:
         log.debug("pre_execution_hook: bandit selection failed", exc_info=True)
@@ -127,6 +149,7 @@ def pre_execution_hook(
     # Build formatted context injection string
     result["context_injection"] = _format_memory_context(
         result["memories"], guidelines, graph_context,
+        arm_id=result["arm_id"],
     )
 
     return result

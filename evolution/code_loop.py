@@ -130,6 +130,36 @@ async def run_code_loop(improver=None) -> str:
         return f"error: {exc}"
 
 
+def _find_context_files(target_file: str, max_files: int = 5) -> list[str]:
+    """Find context files for codegen: the target itself + matching test files.
+
+    Returns up to *max_files* paths (strings).
+    """
+    from pathlib import Path as _Path
+
+    files: list[str] = []
+    if not target_file:
+        return files
+
+    target = _Path(target_file)
+    if target.is_file():
+        files.append(str(target))
+
+    # Look for a matching test file (test_<name>.py in same or tests/ dir)
+    if target.suffix == ".py":
+        stem = target.stem
+        candidates = [
+            target.parent / f"test_{stem}.py",
+            target.parent / "tests" / f"test_{stem}.py",
+            target.parent.parent / "tests" / f"test_{stem}.py",
+        ]
+        for c in candidates:
+            if c.is_file() and str(c) not in files:
+                files.append(str(c))
+
+    return files[:max_files]
+
+
 async def _run_evaluation_pipeline(dgm, proposal, proposal_id: str) -> str:
     """Run the DGM evaluation pipeline: patch → test → judges → shadow → guards.
 
@@ -142,9 +172,11 @@ async def _run_evaluation_pipeline(dgm, proposal, proposal_id: str) -> str:
         from evolution.codegen import generate_code, CodegenRequest, is_available
 
         if is_available():
+            context_files = _find_context_files(proposal.target_file) if proposal.target_file else []
             req = CodegenRequest(
                 task_description=proposal.description,
                 target_files=[proposal.target_file] if proposal.target_file else [],
+                context_files=context_files,
             )
             result = await generate_code(req)
             if result.success and result.patches:

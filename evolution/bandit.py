@@ -15,6 +15,15 @@ log = logging.getLogger(__name__)
 
 _WARM_START_PULLS = 3  # round-robin first N pulls per arm
 
+BANDIT_ARMS = ["baseline", "concise_prompt", "thorough_prompt", "memory_heavy", "graph_context"]
+
+
+def register_default_arms() -> None:
+    """Ensure all standard arms exist in the database."""
+    bandit = ThompsonBandit()
+    for arm_id in BANDIT_ARMS:
+        bandit.ensure_arm(arm_id)
+
 
 class ThompsonBandit:
     """Thompson Sampling with Beta posteriors, backed by evolution.db."""
