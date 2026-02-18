@@ -102,6 +102,52 @@ class QwenTrainingService:
 
         return True
 
+    # -- nightly cycle (mirrors GLiNER pattern) ----------------------------
+
+    async def run_nightly_cycle(self) -> dict[str, Any]:
+        """Nightly cycle: accumulate data, check readiness, run training if ready."""
+        accumulation = await asyncio.to_thread(self.accumulate_data, 2000)
+        total_examples = int(accumulation.get("total_examples", 0))
+        required = config.QWEN_LORA_MIN_EXAMPLES
+        progress_line = f"Qwen LoRA training data: {total_examples}/{required} examples accumulated"
+        log.info(progress_line)
+
+        self.ctx.state["qwen_training_examples"] = total_examples
+        self.ctx.state["qwen_last_result"] = progress_line
+        self.ctx.state["qwen_last_cycle_status"] = "accumulated"
+        self.ctx.save_state()
+
+        if not self.should_run():
+            self.comms.log_improvement_event(
+                event_type="model",
+                category="qwen",
+                title="Qwen LoRA nightly cycle",
+                payload=json.dumps(accumulation, ensure_ascii=True),
+                status="skipped",
+            )
+            return {
+                "status": "skipped",
+                "count": total_examples,
+                "required": required,
+                "accumulation": accumulation,
+                "message": progress_line,
+            }
+
+        # Run full training pipeline
+        result = await self.run_training()
+        self.comms.log_improvement_event(
+            event_type="model",
+            category="qwen",
+            title="Qwen LoRA training",
+            payload=json.dumps(
+                {k: v for k, v in result.items() if not isinstance(v, (bytes, memoryview))},
+                ensure_ascii=True,
+                default=str,
+            ),
+            status=str(result.get("status", "unknown")),
+        )
+        return result
+
     # -- accumulation -------------------------------------------------------
 
     def accumulate_data(self, limit: int = 2000) -> dict[str, Any]:

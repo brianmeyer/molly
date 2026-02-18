@@ -390,6 +390,15 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
 
         async def _step_memory_optimization() -> str:
             from monitoring.jobs.self_improve_jobs import run_memory_optimization
+            # Purge junk chunks (bare URLs, heartbeats, short messages)
+            try:
+                from memory.retriever import get_vectorstore
+                vs = get_vectorstore()
+                purged = vs.purge_junk_chunks()
+                if purged:
+                    log.info("Purged %d junk chunks during memory optimization", purged)
+            except Exception:
+                log.debug("Junk purge failed (non-fatal)", exc_info=True)
             return await run_memory_optimization(await _ensure_improver())
 
         async def _step_gliner_loop() -> str:
@@ -435,12 +444,22 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
 
         async def _step_graph_suggestions() -> str:
             from monitoring.jobs.analysis_jobs import run_graph_suggestions_digest
-            return run_graph_suggestions_digest()
+            digest = run_graph_suggestions_digest()
+            try:
+                from memory.graph_suggestions import run_auto_adoption
+                adoption = run_auto_adoption()
+            except Exception:
+                adoption = "skipped"
+            return f"{digest} | adoption: {adoption}"
 
         async def _step_code_loop() -> str:
             from evolution.code_loop import run_code_loop  # LAZY — avoids circular import
             eng = await _ensure_improver()
             return await run_code_loop(eng)
+
+        async def _step_qwen_loop() -> str:
+            from monitoring.jobs.self_improve_jobs import run_qwen_loop
+            return await run_qwen_loop(await _ensure_improver())
 
         async def _step_issue_registry() -> str:
             from monitoring.jobs.audit_jobs import record_maintenance_issues
@@ -598,11 +617,11 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                         f"Entities: {summary['entity_count']}, Relationships: {summary['relationship_count']}\n"
                         f"Top connected: {summary['top_connected']}\nRecent: {summary['recent']}"
                     )
-                    analysis = await _run_opus_analysis(
-                        _build_maintenance_report(results, run_status=_status(), failed_steps=failed_steps),
-                        graph_text,
-                        today,
-                    )
+                    report_text = _build_maintenance_report(results, run_status=_status(), failed_steps=failed_steps)
+                    log.info("Step 19: Running Opus analysis (report=%d chars, graph=%d chars)",
+                             len(report_text), len(graph_text))
+                    analysis = await _run_opus_analysis(report_text, graph_text, today)
+                    log.info("Step 19: Opus analysis returned %d chars", len(analysis))
                     if "---WHATSAPP---" in analysis:
                         analysis_text, whatsapp_summary = [
                             part.strip() for part in analysis.split("---WHATSAPP---", 1)
@@ -614,9 +633,11 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                         memory_path = config.WORKSPACE / "MEMORY.md"
                         existing = memory_path.read_text() if memory_path.exists() else ""
                         atomic_write(memory_path, (existing.rstrip() + "\n\n" + analysis_text + "\n").lstrip())
-                        _record("Analysis", "MEMORY.md updated")
+                        _record("Analysis", f"MEMORY.md updated ({len(analysis_text)} chars)")
+                        log.info("Step 19: MEMORY.md updated with %d chars", len(analysis_text))
                     else:
-                        _record("Analysis", "empty response")
+                        _record("Analysis", "empty response from Opus")
+                        log.warning("Step 19: Opus analysis returned empty — MEMORY.md NOT updated")
                     # Cache analysis text for checkpoint resume recovery
                     try:
                         import json as _json
@@ -627,6 +648,7 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                     except Exception:
                         pass
                 except Exception:
+                    log.error("Step 19: Analysis failed", exc_info=True)
                     _record("Analysis", "failed", failed=True)
                 finally:
                     _final(19)
@@ -645,17 +667,20 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
             # Step 21: Code loop (evolution engine proposals)
             await _run_step(21, "Code loop", _step_code_loop)
 
-            # Step 22: Report
-            if not _is_done(22, "Report"):
+            # Step 22: Qwen LoRA loop
+            await _run_step(22, "Qwen LoRA loop", _step_qwen_loop)
+
+            # Step 23: Report
+            if not _is_done(23, "Report"):
                 report = _build_maintenance_report(results, run_status=_status(), failed_steps=failed_steps)
                 if analysis_text.strip():
                     report = report.rstrip() + f"\n\n## Analysis\n\n{analysis_text.strip()}\n"
                 atomic_write(report_path, report)
                 _record("Report", "written")
-                _final(22)
+                _final(23)
 
-            # Step 23: Summary
-            if not _is_done(23, "Summary"):
+            # Step 24: Summary
+            if not _is_done(24, "Summary"):
                 try:
                     from memory.graph import entity_count, relationship_count
 
@@ -673,7 +698,7 @@ async def run_maintenance(molly=None) -> dict[str, Any]:
                 except Exception:
                     _record("Summary", "failed", failed=True)
                 finally:
-                    _final(23)
+                    _final(24)
 
             _RUN_STATE.status = _status()
             _RUN_STATE.last_error = ""

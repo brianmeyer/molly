@@ -37,6 +37,9 @@ class _ImmediateImprover:
     async def run_gliner_nightly_cycle(self):
         return {"status": "insufficient_examples", "message": "not-ready"}
 
+    async def run_qwen_nightly_cycle(self):
+        return {"status": "skipped", "message": "not-ready"}
+
     async def run_weekly_assessment(self):
         return "2026-02-08.md"
 
@@ -229,6 +232,12 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
 
         fake_self_improve.run_gliner_loop = _fake_gliner
 
+        async def _fake_qwen(impr):
+            qwen_cycle = await impr.run_qwen_nightly_cycle()
+            return str(qwen_cycle.get("message") or qwen_cycle.get("status", "unknown"))
+
+        fake_self_improve.run_qwen_loop = _fake_qwen
+
         async def _fake_weekly(impr, now_local):
             return False, "not due"
 
@@ -259,6 +268,9 @@ class TestMaintenanceRunContracts(unittest.IsolatedAsyncioTestCase):
         )
         stack.enter_context(
             patch.object(maintenance, "MAINTENANCE_DIR", temp_root / "memory" / "maintenance")
+        )
+        stack.enter_context(
+            patch.object(config, "MAINTENANCE_STATE_FILE", temp_root / "store" / "maintenance_state.json")
         )
         stack.enter_context(
             patch.object(

@@ -231,7 +231,11 @@ def get_action_tier(tool_name: str, tool_input: dict[str, Any] | None = None) ->
     for tier in ("AUTO", "CONFIRM", "BLOCKED"):
         if tool_name in config.ACTION_TIERS.get(tier, set()):
             return tier
-    return "BLOCKED"
+    # Unknown tools default to CONFIRM (not BLOCKED) so new MCP tools
+    # and self-built tools can be used with Brian's approval rather than
+    # being silently blocked.  Truly dangerous tools must be explicitly
+    # listed in BLOCKED.
+    return "CONFIRM"
 
 
 def is_auto_approved_path(tool_name: str, tool_input: dict) -> bool:

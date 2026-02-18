@@ -82,10 +82,13 @@ Respond ONLY with a JSON object (no markdown, no explanation). Schema:
 }
 
 Classification rules:
-- "direct": Greetings, chitchat, simple Q&A, acknowledgments. No tools needed. \
+- "direct": ONLY pure greetings or farewells with NO substantive content \
+(e.g. "hi", "hey", "good morning", "thanks", "ok", "bye"). If the message \
+mentions ANY topic, person, task, question, or context, it is NOT direct. \
 subtasks = [].
-- "simple": Single-domain tasks (check calendar, send email, create task). \
-1 subtask.
+- "simple": Single-domain tasks OR questions that reference specific context, \
+people, or information (check calendar, send email, task updates, questions \
+about something). 1 subtask.
 - "complex": Multi-step or cross-domain tasks (schedule meeting + email attendees, \
 research + summarize + create task). 2+ subtasks.
 
@@ -298,15 +301,15 @@ async def _call_kimi(message: str, timeout: float = 15.0) -> tuple[str, str]:
     # Kimi K2.5 enforces fixed parameter values:
     #   thinking enabled: temperature=1.0, top_p=0.95
     #   thinking disabled: temperature=0.6, top_p=0.95
-    # Any other values will ERROR. We disable thinking for triage (speed)
-    # which locks temperature at 0.6.
+    # Any other values will ERROR. Thinking is enabled for quality triage
+    # classification (budget=4096 keeps it fast while allowing reasoning).
     body: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": ORCHESTRATOR_PROMPT},
             {"role": "user", "content": message},
         ],
-        "thinking": {"type": "disabled"},  # Instant mode for fast triage
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
     }
 
     headers = {
@@ -345,6 +348,64 @@ async def _call_kimi(message: str, timeout: float = 15.0) -> tuple[str, str]:
             raise
 
     raise last_exc or RuntimeError("Kimi triage failed")
+
+
+async def _kimi_direct_response(message: str, timeout: float = 15.0) -> str | None:
+    """Generate a conversational Kimi response for direct-classified messages.
+
+    Uses thinking mode (budget_tokens=8192) for quality responses at ~$0.002/turn
+    instead of falling through to serial Opus (~$0.15/turn).
+
+    Returns the response text, or None on any failure (caller falls back to Opus).
+    """
+    import httpx
+
+    api_key = config.MOONSHOT_API_KEY
+    if not api_key:
+        return None
+
+    model = getattr(config, "KIMI_TRIAGE_MODEL", "kimi-k2.5")
+    base_url = config.MOONSHOT_BASE_URL
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are Molly, a friendly and helpful personal AI assistant. "
+                    "Respond naturally and conversationally. Keep responses concise "
+                    "but warm. You can use emoji sparingly."
+                ),
+            },
+            {"role": "user", "content": message},
+        ],
+        "thinking": {"type": "enabled", "budget_tokens": 8192},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(str(chunk) for chunk in content)
+        text = str(content).strip()
+        return text if text else None
+    except Exception as exc:
+        log.warning("Kimi direct response failed: %s", exc)
+        return None
 
 
 async def _call_gemini(message: str, timeout: float = 12.0) -> tuple[str, str]:

@@ -474,7 +474,8 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
                 patch("agent._disconnect_runtime", new=AsyncMock()) as disconnect_mock, \
                 patch("agent._query_with_client", side_effect=fake_query), \
-                patch("agent.process_conversation", new=AsyncMock()):
+                patch("agent.process_conversation", new=AsyncMock()), \
+                patch("config.ORCHESTRATOR_ENABLED", False):
             response, session_id = await agent.handle_message(
                 "hello",
                 "chat-retry",
@@ -508,7 +509,8 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
                 patch("agent._disconnect_runtime", new=AsyncMock()), \
                 patch("agent._query_with_client", side_effect=fake_query), \
-                patch("agent.process_conversation", new=AsyncMock()):
+                patch("agent.process_conversation", new=AsyncMock()), \
+                patch("config.ORCHESTRATOR_ENABLED", False):
             first_task = asyncio.create_task(agent.handle_message("msg-1", "chat-queue"))
             await asyncio.wait_for(first_started.wait(), timeout=1)
 
@@ -540,7 +542,8 @@ class TestAgentRuntimeAndRetry(unittest.IsolatedAsyncioTestCase):
                 patch("agent._ensure_connected_runtime", new=AsyncMock()), \
                 patch("agent._disconnect_runtime", new=AsyncMock()), \
                 patch("agent._query_with_client", side_effect=fake_query), \
-                patch("agent.process_conversation", new=AsyncMock()):
+                patch("agent.process_conversation", new=AsyncMock()), \
+                patch("config.ORCHESTRATOR_ENABLED", False):
             response, session_id = await agent.handle_message("retry", "chat-denied-reset")
 
         self.assertEqual(response, "Recovered")
@@ -567,7 +570,8 @@ class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
                 patch("agent._disconnect_runtime", new=AsyncMock()), \
                 patch("agent._query_with_client", return_value=("ok", "session-skills")), \
                 patch("agent.process_conversation", new=AsyncMock()), \
-                patch("memory.retriever.get_vectorstore", return_value=fake_vs):
+                patch("memory.retriever.get_vectorstore", return_value=fake_vs), \
+                patch("config.ORCHESTRATOR_ENABLED", False):
             response, session_id = await agent.handle_message(
                 "what's on today?",
                 "chat-skill-success",
@@ -596,7 +600,8 @@ class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
                 patch("agent._disconnect_runtime", new=AsyncMock()), \
                 patch("agent._query_with_client", side_effect=RuntimeError("boom")), \
                 patch("agent.process_conversation", new=AsyncMock()), \
-                patch("memory.retriever.get_vectorstore", return_value=fake_vs):
+                patch("memory.retriever.get_vectorstore", return_value=fake_vs), \
+                patch("config.ORCHESTRATOR_ENABLED", False):
             response, _session_id = await agent.handle_message(
                 "run digest",
                 "chat-skill-failure",
@@ -622,7 +627,8 @@ class TestSkillExecutionObservability(unittest.IsolatedAsyncioTestCase):
                 patch("agent._disconnect_runtime", new=AsyncMock()), \
                 patch("agent._query_with_client", return_value=("Recovered", "session-ok")), \
                 patch("agent.process_conversation", new=AsyncMock()), \
-                patch("memory.retriever.get_vectorstore", return_value=fake_vs):
+                patch("memory.retriever.get_vectorstore", return_value=fake_vs), \
+                patch("config.ORCHESTRATOR_ENABLED", False):
             response, session_id = await agent.handle_message(
                 "what's on today?",
                 "chat-skill-log-failure",

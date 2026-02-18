@@ -222,13 +222,8 @@ class VectorStore:
         ensure_issue_registry_tables(self.conn)
 
         # Create virtual vec table (separate statement — can't be in executescript)
-        self.conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec
-            USING vec0(
-                id TEXT PRIMARY KEY,
-                embedding float[{EMBEDDING_DIM}]
-            )
-        """)
+        # Use cosine distance for correct similarity scoring with normalized embeddings.
+        self._ensure_vec_table_cosine()
 
         # Phase 5B: FTS5 full-text search index for BM25 keyword matching.
         # content= uses external content (conversation_chunks) to avoid
@@ -253,6 +248,67 @@ class VectorStore:
                 self.conn.execute(
                     f"ALTER TABLE preference_signals ADD COLUMN {column} {col_type}"
                 )
+
+    def _ensure_vec_table_cosine(self):
+        """Create or migrate chunks_vec to use cosine distance metric.
+
+        sqlite-vec defaults to L2 distance which gives misleading similarity
+        scores for normalized embeddings.  Cosine distance returns values in
+        [0, 2] where 0 = identical and similarity = 1 - distance is correct.
+        """
+        # Check if chunks_vec already exists
+        row = self.conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='chunks_vec'"
+        ).fetchone()
+        table_exists = row[0] > 0
+
+        if not table_exists:
+            # Fresh database — create directly with cosine
+            self.conn.execute(f"""
+                CREATE VIRTUAL TABLE chunks_vec
+                USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[{EMBEDDING_DIM}] distance_metric=cosine
+                )
+            """)
+            log.info("Created chunks_vec with cosine distance metric")
+            return
+
+        # Table exists — check if it already uses cosine by looking at the SQL
+        schema_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'"
+        ).fetchone()
+        schema_sql = str(schema_row[0]) if schema_row else ""
+
+        if "cosine" in schema_sql.lower():
+            return  # Already migrated
+
+        # Migration: L2 → cosine.  Read all embeddings, recreate table, re-insert.
+        log.info("Migrating chunks_vec from L2 to cosine distance metric...")
+        existing_rows = self.conn.execute(
+            "SELECT id, embedding FROM chunks_vec"
+        ).fetchall()
+        count = len(existing_rows)
+        log.info("Read %d embeddings for migration", count)
+
+        # Drop old table and recreate with cosine
+        self.conn.execute("DROP TABLE chunks_vec")
+        self.conn.execute(f"""
+            CREATE VIRTUAL TABLE chunks_vec
+            USING vec0(
+                id TEXT PRIMARY KEY,
+                embedding float[{EMBEDDING_DIM}] distance_metric=cosine
+            )
+        """)
+
+        # Re-insert all embeddings
+        for row in existing_rows:
+            self.conn.execute(
+                "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                (row[0], row[1]),
+            )
+        self.conn.commit()
+        log.info("Migrated %d embeddings to cosine distance metric", count)
 
     def store_chunk(
         self,
@@ -329,6 +385,40 @@ class VectorStore:
             self.conn.commit()
         log.debug("Batch stored %d chunks in single transaction", len(chunk_ids))
         return chunk_ids
+
+    def purge_junk_chunks(self) -> int:
+        """Remove junk chunks (bare URLs, heartbeats, very short content).
+
+        Returns count of purged chunks.
+        """
+        import re
+        url_re = re.compile(r"^\s*https?://\S+\s*$")
+
+        rows = self.conn.execute(
+            "SELECT id, content FROM conversation_chunks"
+        ).fetchall()
+        junk_ids = []
+        for row in rows:
+            content = row["content"].strip()
+            if len(content) < 20:
+                junk_ids.append(row["id"])
+            elif url_re.match(content):
+                junk_ids.append(row["id"])
+            elif content.startswith("HEARTBEAT CHECK") or content.startswith("User: HEARTBEAT CHECK"):
+                junk_ids.append(row["id"])
+
+        if not junk_ids:
+            return 0
+
+        with self._write_lock:
+            for cid in junk_ids:
+                self.conn.execute("DELETE FROM conversation_chunks WHERE id = ?", (cid,))
+                self.conn.execute("DELETE FROM chunks_vec WHERE id = ?", (cid,))
+                self.conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (cid,))
+            self.conn.commit()
+
+        log.info("Purged %d junk chunks from vectorstore", len(junk_ids))
+        return len(junk_ids)
 
     @track_latency("vectorstore")
     def search(self, query_embedding: list[float], top_k: int = 5) -> list[dict]:
@@ -602,7 +692,7 @@ class VectorStore:
         fts_results = self.search_fts(query_text, top_k=vec_k)
 
         # Build score maps keyed by chunk ID
-        # Vector: distance → similarity (1 - distance), clamp to [0, 1]
+        # Cosine distance: similarity = 1 - distance (correct for cosine metric)
         vec_scores: dict[str, float] = {}
         vec_data: dict[str, dict] = {}
         for r in vec_results:

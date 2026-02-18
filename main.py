@@ -482,6 +482,16 @@ def prewarm_ml_models():
                 return
 
     log.info("Prewarming ML models (embedding + GLiNER2)...")
+
+    # Prime transformers lazy-import system in the main thread first.
+    # Both models depend on `transformers` which uses __getattr__-based lazy
+    # module loading that isn't thread-safe — concurrent first-imports cause
+    # KeyError on internal module registry.
+    try:
+        import transformers  # noqa: F401
+    except Exception:
+        pass  # will degrade to lazy-load per model
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="prewarm") as pool:
         futures = [pool.submit(_load_embedding), pool.submit(_load_gliner)]
         concurrent.futures.wait(futures, timeout=120)
@@ -1367,9 +1377,11 @@ class Molly:
                 return
 
         # Determine if Molly should respond
+        is_dm = not msg_data.get("is_group", False)
         should_respond = (
             chat_mode == "owner_dm"  # Self-chat: always respond
             or (chat_mode == "respond" and has_trigger)  # Registered group + @Molly
+            or (is_owner and is_dm and has_trigger)  # Owner DMs another person + @Molly
         )
 
         if not should_respond or not clean_content:

@@ -213,11 +213,12 @@ class TestClassifyMessageFallback(unittest.TestCase):
         """When all API models fail, falls back to hardcoded regex."""
         with patch.object(config, "ORCHESTRATOR_ENABLED", True), \
              patch.object(config, "MOONSHOT_API_KEY", ""), \
-             patch.object(config, "GEMINI_API_KEY", ""):
+             patch.object(config, "GEMINI_API_KEY", ""), \
+             patch("orchestrator._call_qwen_local", side_effect=RuntimeError("no model")):
             result = asyncio.run(
                 classify_message("Check my calendar")
             )
-            # Should fall through to hardcoded since both API keys are empty
+            # Should fall through to hardcoded since all models fail
             self.assertEqual(result.model_used, "hardcoded")
             self.assertEqual(result.classification, "simple")
             self.assertEqual(result.subtasks[0].profile, "calendar")

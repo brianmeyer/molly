@@ -27,7 +27,13 @@ def run_dedup_sweep() -> str:
 
 
 def run_orphan_cleanup() -> str:
-    """Delete low-signal orphaned entities, self-referencing rels, and blocklisted entities."""
+    """Delete low-signal orphaned entities, self-referencing rels, and blocklisted entities.
+
+    Uses graduated tiers for broader cleanup:
+      Tier 1: Zero mentions AND no relationships (junk)
+      Tier 2: mention_count <= 1 AND strength < 0.5 AND no relationships
+      Tier 3: mention_count <= 3 AND strength < 0.2 AND no relationships
+    """
     from memory.graph import (
         delete_blocklisted_entities,
         delete_self_referencing_rels,
@@ -36,20 +42,48 @@ def run_orphan_cleanup() -> str:
     from memory.processor import _ENTITY_BLOCKLIST
 
     driver = get_driver()
+    tier1 = tier2 = tier3 = 0
+
     with driver.session() as session:
+        # Tier 1: Zero mentions AND no relationships (junk)
+        result = session.run(
+            """MATCH (e:Entity)
+               WHERE NOT (e)--()
+                 AND (e.mention_count IS NULL OR e.mention_count = 0)
+               DELETE e
+               RETURN count(e) AS deleted"""
+        )
+        tier1 = int(result.single()["deleted"])
+
+        # Tier 2: mention_count <= 1 AND strength < 0.5 AND no relationships
         result = session.run(
             """MATCH (e:Entity)
                WHERE NOT (e)--()
                  AND e.mention_count <= 1
-                 AND (e.strength IS NULL OR e.strength < 0.3)
+                 AND (e.strength IS NULL OR e.strength < 0.5)
                DELETE e
                RETURN count(e) AS deleted"""
         )
-        orphans = int(result.single()["deleted"])
+        tier2 = int(result.single()["deleted"])
 
+        # Tier 3: mention_count <= 3 AND strength < 0.2 AND no relationships
+        result = session.run(
+            """MATCH (e:Entity)
+               WHERE NOT (e)--()
+                 AND e.mention_count <= 3
+                 AND (e.strength IS NULL OR e.strength < 0.2)
+               DELETE e
+               RETURN count(e) AS deleted"""
+        )
+        tier3 = int(result.single()["deleted"])
+
+    orphans = tier1 + tier2 + tier3
     self_refs = int(delete_self_referencing_rels())
     blocklisted = int(delete_blocklisted_entities(_ENTITY_BLOCKLIST))
-    return f"orphans={orphans}, self_refs={self_refs}, blocklisted={blocklisted}"
+    return (
+        f"orphans={orphans} (tier1={tier1}, tier2={tier2}, tier3={tier3}), "
+        f"self_refs={self_refs}, blocklisted={blocklisted}"
+    )
 
 
 def run_neo4j_checkpoint() -> str:

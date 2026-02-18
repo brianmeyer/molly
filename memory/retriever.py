@@ -104,22 +104,38 @@ def _retrieve_semantic(message: str, top_k: int = 5) -> dict:
     if not results:
         return empty
 
+    # Filter by similarity threshold (cosine distance: similarity = 1 - distance).
+    # Drop chunks below 0.35 cosine similarity — they add noise, not context.
+    MIN_SIMILARITY = 0.35
     lines = ["<!-- Memory Context (hybrid search: semantic + BM25) -->"]
     lines.append("Relevant past conversations (most relevant first):\n")
     distances = []
     sources = []
+    filtered_count = 0
     for r in results:
+        dist = float(r.get("distance", 1.0))
+        similarity = max(0.0, 1.0 - dist)
+        if similarity < MIN_SIMILARITY:
+            filtered_count += 1
+            continue
         created = r["created_at"][:10]
         source = r["source"]
         lines.append(f"[{created}, {source}] {r['content']}")
-        distances.append(float(r.get("distance", 0.0)))
+        distances.append(dist)
         sources.append(source)
 
+    if filtered_count:
+        log.debug("Filtered %d/%d chunks below %.2f similarity threshold",
+                   filtered_count, len(results), MIN_SIMILARITY)
+
+    if len(distances) == 0:
+        return empty
+
     context = "\n".join(lines)
-    log.debug("Retrieved %d memory chunks (hybrid)", len(results))
+    log.debug("Retrieved %d memory chunks (hybrid, %d filtered)", len(distances), filtered_count)
     return {
         "context": context,
-        "result_count": len(results),
+        "result_count": len(distances),
         "distances": distances,
         "sources": sources,
     }
@@ -186,7 +202,7 @@ def _log_retrieval_stats(
                 )
                 _retrieval_stats_table_ensured = True
 
-        # Convert distances to similarity scores (1 - distance for cosine)
+        # Cosine distance: similarity = 1 - distance (range 0..1 for normalized vecs)
         similarities = [max(0.0, 1.0 - d) for d in distances] if distances else []
         avg_sim = sum(similarities) / len(similarities) if similarities else 0.0
         max_sim = max(similarities) if similarities else 0.0
