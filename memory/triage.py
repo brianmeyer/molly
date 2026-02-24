@@ -187,7 +187,7 @@ SYSTEM_PROMPT_EMAIL = (
     "- Smart home / IoT: device alerts, energy reports, sensor notifications = ALWAYS noise\n"
     "- Shipping / delivery: tracking, delivery status, package updates = ALWAYS noise\n"
     "- Security: password resets, login alerts, verification codes = ALWAYS noise\n"
-    "- If an email from a known school (Guidepost, Montessori), childcare provider, doctor's office, or personal service contains dates, events, deadlines, or RSVPs, classify as relevant even if it looks like a newsletter. Brian's child's school events are personally relevant.\n"
+    "- If an email from a known school, childcare provider, doctor's office, or personal service contains dates, events, deadlines, or RSVPs, classify as relevant even if it looks like a newsletter. Child school events are personally relevant.\n"
     "- If EVENT_PATTERNS-like signals are present in the body and the sender is not muted, bias toward relevant (not noise).\n"
     "- Only classify as relevant/urgent if a REAL PERSON Brian knows is writing to him directly about something that requires his response or action\n"
     "- Meeting invites from a real person = relevant\n"

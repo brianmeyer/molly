@@ -144,7 +144,7 @@ class TestFTS5Search(unittest.TestCase):
         """Searching 'Brian Meyer' should find the exact content."""
         results = self.vs.search_fts("Brian Meyer", top_k=3)
         self.assertGreaterEqual(len(results), 1)
-        self.assertIn("Portland", results[0]["content"])
+        self.assertIn("City State", results[0]["content"])
 
     def test_keyword_match(self):
         """Keyword search for 'meeting' should find relevant content."""
